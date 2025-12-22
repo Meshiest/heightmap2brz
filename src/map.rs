@@ -56,7 +56,7 @@ impl HeightmapPNG {
             if let Ok(img) = image::open(file) {
                 maps.push(img.to_rgba8());
             } else {
-                return Err(format!("Could not open PNG {}", file.display()));
+                return Err(format!("Could not open image {}", file.display()));
             }
         }
 
@@ -129,7 +129,7 @@ impl ColormapPNG {
                 lrgb,
             })
         } else {
-            Err(format!("Could not open PNG {}", file.as_ref().display()))
+            Err(format!("Could not open image {}", file.as_ref().display()))
         }
     }
 }

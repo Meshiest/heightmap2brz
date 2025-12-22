@@ -19,30 +19,31 @@ Compile or download from releases.
 `heightmap.exe --help` for usage instructions:
 
     USAGE:
-        heightmap.exe [FLAGS] [OPTIONS] <INPUT>
+        heightmap.exe [FLAGS] [OPTIONS] <INPUT>...
 
     FLAGS:
-            --cull       Automatically remove bottom level bricks and fully transparent bricks
-        -h, --help       Prints help information
-            --hdmap      Using a high detail rgb color encoded heightmap
-            --lrgb       Use linear rgb input color instead of sRGB
-            --micro      Render bricks as micro bricks
-            --nocollide  Disable brick collision
-            --old        Use old unoptimized heightmap code
-            --snap       Snap bricks to the brick grid
-            --tile       Render bricks as tiles
-            --stud       Render bricks as stud cubes
-        -i  --img        Make heightmap flat (use as img2brick)
-        -V, --version    Prints version information
+            --cull         Automatically remove bottom level bricks and fully transparent bricks
+            --glow         Make the heightmap glow at 0 intensity
+            --greedy       Use greedy optimization
+        -h, --help         Prints help information
+            --hdmap        Using a high detail rgb color encoded heightmap
+        -i, --img          Make the heightmap flat and render an image
+            --lrgb         Use linear rgb input color instead of sRGB
+            --micro        Render bricks as micro bricks
+            --nocollide    Disable brick collision
+            --snap         Snap bricks to the brick grid
+            --stud         Render bricks as stud cubes
+            --tile         Render bricks as tiles
+        -V, --version      Prints version information
 
     OPTIONS:
-        -c, --colormap <colormap>    Input colormap PNG image
-        -o, --output <output>        Output BRZ file
+        -c, --colormap <colormap>    Input colormap image (PNG/JPG)
+        -o, --output <output>        Output file (BRDB, BRZ)
         -s, --size <size>            Brick stud size (default 1)
         -v, --vertical <vertical>    Vertical scale multiplier (default 1)
 
     ARGS:
-        <INPUT>...    Input heightmap PNG images
+        <INPUT>...    Input heightmap image files (PNG/JPG)
 
 ###  Examples
 

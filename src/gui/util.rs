@@ -20,8 +20,11 @@ pub fn maps_from_files(
     let colormap_file = colormap_file.unwrap_or(first_heightmap);
 
     // colormap file parsing
-    let colormap = match file_ext(&colormap_file) {
-        Some("png") => ColormapPNG::new(&colormap_file, options.lrgb)
+    let colormap = match file_ext(&colormap_file)
+        .map(|s| s.to_lowercase())
+        .as_deref()
+    {
+        Some("png") | Some("jpg") | Some("jpeg") => ColormapPNG::new(&colormap_file, options.lrgb)
             .map_err(|e| format!("Error reading colormap: {:?}", e))?,
         Some(ext) => {
             return Err(format!("Unsupported colormap format '{}'", ext));
@@ -35,21 +38,25 @@ pub fn maps_from_files(
     };
 
     // heightmap file parsing
-    let heightmap: Box<dyn Heightmap> =
-        if heightmap_files.iter().all(|f| file_ext(f) == Some("png")) {
-            if options.img {
-                Box::new(HeightmapFlat::new(colormap.size()).unwrap())
-            } else {
-                match HeightmapPNG::new(heightmap_files.iter().collect(), options.hdmap) {
-                    Ok(map) => Box::new(map),
-                    Err(error) => {
-                        return Err(format!("Error reading heightmap: {:?}", error));
-                    }
+    let heightmap: Box<dyn Heightmap> = if heightmap_files.iter().all(|f| {
+        matches!(
+            file_ext(f).map(|s| s.to_lowercase()).as_deref(),
+            Some("png") | Some("jpg") | Some("jpeg")
+        )
+    }) {
+        if options.img {
+            Box::new(HeightmapFlat::new(colormap.size()).unwrap())
+        } else {
+            match HeightmapPNG::new(heightmap_files.iter().collect(), options.hdmap) {
+                Ok(map) => Box::new(map),
+                Err(error) => {
+                    return Err(format!("Error reading heightmap: {:?}", error));
                 }
             }
-        } else {
-            return Err("Unsupported heightmap format".to_string());
-        };
+        }
+    } else {
+        return Err("Unsupported heightmap format".to_string());
+    };
 
     Ok((heightmap, Box::new(colormap)))
 }

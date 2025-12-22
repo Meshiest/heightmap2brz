@@ -268,7 +268,9 @@ impl HeightmapApp {
             ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
         });
         ui.hyperlink("https://github.com/brickadia-community/heightmap2brz");
-        ui.label("Converts heightmap png files to Brickadia save files, also works as img2brick");
+        ui.label(
+            "Converts heightmap images (PNG/JPG) to Brickadia save files, also works as img2brick",
+        );
         egui::warn_if_debug_build(ui);
     }
 
@@ -376,7 +378,7 @@ impl HeightmapApp {
         // handle heightmap multiple file selection
         if ui.button("Select heightmaps").clicked() {
             let result = native_dialog::DialogBuilder::file()
-                .add_filter("PNG Image", ["png"])
+                .add_filter("Image Files", ["png", "jpg", "jpeg"])
                 .open_multiple_file()
                 .show();
 
@@ -419,7 +421,7 @@ impl HeightmapApp {
             .clicked()
         {
             let result = native_dialog::DialogBuilder::file()
-                .add_filter("PNG Image", ["png"])
+                .add_filter("Image Files", ["png", "jpg", "jpeg"])
                 .open_single_file()
                 .show();
 
