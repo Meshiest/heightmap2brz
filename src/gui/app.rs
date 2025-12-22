@@ -231,21 +231,30 @@ impl HeightmapApp {
                     // lowercase the first letter
                     full_path.get_mut(0..1).map(|s| s.make_ascii_lowercase());
 
-                    if let Err(e) = clipboard_win::raw::open() {
-                        error!("failed to open clipboard: {e}");
-                        return sender.send(Err(format!("failed to open clipboard: {e}")));
+                    #[cfg(target_os = "windows")]
+                    {
+                        if let Err(e) = clipboard_win::raw::open() {
+                            error!("failed to open clipboard: {e}");
+                            return sender.send(Err(format!("failed to open clipboard: {e}")));
+                        }
+
+                        if let Err(e) = clipboard_win::raw::set_file_list(&[full_path.clone()]) {
+                            error!("failed to open clipboard: {e}");
+                            return sender.send(Err(format!("failed to open clipboard: {e}")));
+                        } else {
+                            info!("Wrote path {full_path} to clipboard");
+                        }
+
+                        if let Err(e) = clipboard_win::raw::close() {
+                            error!("failed to close clipboard: {e}");
+                            return sender.send(Err(format!("failed to close clipboard: {e}")));
+                        }
                     }
 
-                    if let Err(e) = clipboard_win::raw::set_file_list(&[full_path.clone()]) {
-                        error!("failed to open clipboard: {e}");
-                        return sender.send(Err(format!("failed to open clipboard: {e}")));
-                    } else {
-                        info!("Wrote path {full_path} to clipboard");
-                    }
-
-                    if let Err(e) = clipboard_win::raw::close() {
-                        error!("failed to close clipboard: {e}");
-                        return sender.send(Err(format!("failed to close clipboard: {e}")));
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        info!("Clipboard file path support is only available on Windows");
+                        info!("File saved to: {}", full_path);
                     }
                 }
 
