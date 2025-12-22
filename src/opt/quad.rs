@@ -4,7 +4,6 @@ use brdb::{
     Brick, BrickSize, BrickType, Collision, Color, Position,
     assets::materials::{GLOW, PLASTIC},
 };
-use log::info;
 use std::{
     cmp::{max, min},
     collections::HashSet,
@@ -257,7 +256,11 @@ impl QuadTree {
     }
 
     // convert quadtree state into bricks
-    pub fn into_bricks(&self, options: GenOptions) -> Vec<Brick> {
+    pub fn into_bricks(&self, options: GenOptions, width: u32, height: u32) -> Vec<Brick> {
+        // Calculate offsets to center the bricks
+        let offset_x = -(width as i32 * options.size as i32);
+        let offset_y = -(height as i32 * options.size as i32);
+
         self.tiles
             .iter()
             .flat_map(|t| {
@@ -304,9 +307,12 @@ impl QuadTree {
                             ),
                         },
                         position: Position::new(
-                            (t.center.0 as i32 * 2 + t.size.0 as i32) * options.size as i32,
-                            (t.center.1 as i32 * 2 + t.size.1 as i32) * options.size as i32,
-                            z - height as i32 + 2,
+                            (t.center.0 as i32 * 2 + t.size.0 as i32) * options.size as i32
+                                + offset_x,
+                            (t.center.1 as i32 * 2 + t.size.1 as i32) * options.size as i32
+                                + offset_y,
+                            options.base_height() - 5
+                                + if options.img { 0 } else { z - height as i32 },
                         ),
                         collision: Collision {
                             player: !options.nocollide,
@@ -333,78 +339,4 @@ impl QuadTree {
             })
             .collect()
     }
-}
-
-// Generate a heightmap with brick conservation optimizations
-pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
-    heightmap: &dyn Heightmap,
-    colormap: &dyn Colormap,
-    options: GenOptions,
-    progress_f: F,
-) -> Result<Vec<Brick>, String> {
-    macro_rules! progress {
-        ($e:expr) => {
-            if !progress_f($e) {
-                return Err("Stopped by user".to_string());
-            }
-        };
-    }
-    progress!(0.0);
-
-    info!("Building initial quadtree");
-    let (width, height) = heightmap.size();
-    let area = width * height;
-    let mut quad = QuadTree::new(heightmap, colormap)?;
-    progress!(0.2);
-
-    let (prog_offset, prog_scale) = if options.quadtree {
-        info!("Optimizing quadtree");
-        let mut scale = 0;
-
-        // loop until the bricks would be too wide or we stop optimizing bricks
-        while 2_i32.pow(scale + 1) * (options.size as i32) < 500 {
-            progress!(0.2 + 0.5 * (scale as f32 / (500.0 / (options.size as f32)).log2()));
-            let count = quad.quad_optimize_level(scale);
-            if count == 0 {
-                break;
-            } else {
-                info!("  Removed {:?} {}x bricks", count, 2_i32.pow(scale));
-            }
-            scale += 1;
-        }
-        progress!(0.7);
-
-        (0.7, 0.25)
-    } else {
-        (0.2, 0.75)
-    };
-
-    info!("Optimizing linear");
-    let mut i = 0;
-    loop {
-        i += 1;
-
-        let count = quad.line_optimize(options.size as u32);
-        progress!(prog_offset + prog_scale * (i as f32 / 5.0).min(1.0));
-
-        if count == 0 {
-            break;
-        }
-        info!("  Removed {} bricks", count);
-    }
-
-    progress!(0.95);
-
-    let bricks = quad.into_bricks(options);
-    let brick_count = bricks.len();
-    info!(
-        "Reduced {} to {} ({}%; -{} bricks)",
-        area,
-        brick_count,
-        (100. - brick_count as f64 / area as f64 * 100.).floor(),
-        area as i32 - brick_count as i32,
-    );
-
-    progress!(1.0);
-    Ok(bricks)
 }

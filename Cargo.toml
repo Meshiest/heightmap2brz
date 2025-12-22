@@ -14,7 +14,6 @@ env_logger = "0.10.0"
 eframe = { version = "0.32.3", optional = true }
 poll-promise = { version = "0.2.0", optional = true }
 brdb = "0.4.0"
-clippers = "0.1.2"
 egui = { version = "0.32.3", optional = true }
 native-dialog = { version = "0.9.0", optional = true }
 clipboard-win = { version = "5.4.1", features = [
@@ -24,6 +23,7 @@ egui_extras = { version = "0.32.3", features = [
   "file",
   "image",
 ], optional = true }
+rayon = "1.11.0"
 
 [features]
 default = ["gui"]

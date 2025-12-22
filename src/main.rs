@@ -1,8 +1,8 @@
 pub mod map;
-pub mod quad;
+pub mod opt;
 pub mod util;
 
-use crate::{map::*, quad::*, util::*};
+use crate::{map::*, opt::*, util::*};
 use brdb::assets::bricks::{
     PB_DEFAULT_BRICK, PB_DEFAULT_MICRO_BRICK, PB_DEFAULT_STUDDED, PB_DEFAULT_TILE,
 };
@@ -36,6 +36,7 @@ fn main() {
         (@arg glow: --glow "Make the heightmap glow at 0 intensity")
         (@arg hdmap: --hdmap "Using a high detail rgb color encoded heightmap")
         (@arg nocollide: --nocollide "Disable brick collision")
+        (@arg greedy: --greedy "Use greedy optimization")
     )
     .get_matches();
 
@@ -79,6 +80,7 @@ fn main() {
         lrgb: matches.is_present("lrgb"),
         nocollide: matches.is_present("nocollide"),
         quadtree: true,
+        greedy: matches.is_present("greedy"),
     };
 
     if options.tile {

@@ -9,7 +9,7 @@ use std::{
 };
 
 use super::logger;
-use crate::{gui::util::maps_from_files, quad::*, util::bricks_to_save, util::*};
+use crate::{gui::util::maps_from_files, opt::*, util::bricks_to_save, util::*};
 use brdb::assets::bricks::{
     PB_DEFAULT_BRICK, PB_DEFAULT_MICRO_BRICK, PB_DEFAULT_STUDDED, PB_DEFAULT_TILE,
 };
@@ -30,6 +30,13 @@ enum BrickMode {
     Micro,
 }
 
+#[derive(PartialEq, Clone)]
+enum OptimizationMode {
+    None,
+    Quad,
+    Greedy,
+}
+
 type Progress = (&'static str, f32);
 
 pub struct HeightmapApp {
@@ -40,7 +47,7 @@ pub struct HeightmapApp {
     out_clipboard: bool,
     vertical_scale: u32,
     horizontal_size: u16,
-    opt_quad: bool,
+    optimization: OptimizationMode,
     opt_cull: bool,
     opt_nocollide: bool,
     opt_lrgb: bool,
@@ -64,14 +71,14 @@ impl Default for HeightmapApp {
             out_clipboard: true,
             vertical_scale: 1,
             horizontal_size: 1,
-            opt_quad: true,
+            optimization: OptimizationMode::Quad,
             opt_cull: false,
             opt_nocollide: false,
             opt_lrgb: false,
             opt_snap: false,
             opt_glow: false,
             opt_hdmap: false,
-            mode: BrickMode::Default,
+            mode: BrickMode::Micro,
             promise: None,
             progress: ("Pending", 0.),
             progress_channel: mpsc::channel(),
@@ -81,6 +88,19 @@ impl Default for HeightmapApp {
 }
 
 impl HeightmapApp {
+    fn has_large_image(&self) -> bool {
+        // Check if any heightmap or colormap is larger than 1024px in either dimension
+        let check_image = |path: &PathBuf| -> bool {
+            if let Ok(img) = image::open(path) {
+                img.width() > 1024 || img.height() > 1024
+            } else {
+                false
+            }
+        };
+
+        self.heightmaps.iter().any(check_image) || self.colormap.as_ref().map_or(false, check_image)
+    }
+
     fn options(&self) -> GenOptions {
         // output options
         let mut options = GenOptions {
@@ -97,7 +117,8 @@ impl HeightmapApp {
             hdmap: self.opt_hdmap,
             lrgb: self.opt_lrgb,
             nocollide: self.opt_nocollide,
-            quadtree: self.opt_quad,
+            quadtree: self.optimization == OptimizationMode::Quad,
+            greedy: self.optimization == OptimizationMode::Greedy,
         };
 
         if options.tile {
@@ -286,6 +307,31 @@ impl HeightmapApp {
                 ui.add(egui::Slider::new(&mut self.vertical_scale, 1..=100).text("units"));
                 ui.end_row();
 
+                ui.label("Optimization")
+                    .on_hover_text("Algorithm used to reduce brick count");
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.optimization, OptimizationMode::None, "None")
+                            .on_hover_text("No optimization (~one brick per pixel)");
+                        ui.radio_value(&mut self.optimization, OptimizationMode::Quad, "Quadtree")
+                        .on_hover_text("Use quadtree based optimization. Looks prettier. May use more bricks. Uses a lot of memory for larger maps");
+                        ui.radio_value(&mut self.optimization, OptimizationMode::Greedy, "Greedy")
+                            .on_hover_text("Use greedy mesh for each height level. Uses fewer bricks but slower for images with many colors/heights");
+                    });
+                    if self.optimization == OptimizationMode::Greedy && !self.heightmaps.is_empty() {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 200, 100),
+                            "Note: Greedy meshing does not properly calculate brick heights based on neighbor heights"
+                        );
+                    }
+                    if self.optimization == OptimizationMode::Greedy && self.has_large_image() {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 100, 100),
+                            "Warning: Large images (>1024px) may use excessive memory with greedy optimization"
+                        );
+                    }});
+                ui.end_row();
+
                 ui.label("Options")
                     .on_hover_text("A list of options for modifying how the generator works");
                 ui.horizontal(|ui| {
@@ -299,13 +345,10 @@ impl HeightmapApp {
                         .on_hover_text("Disable brick collision");
                     ui.checkbox(&mut self.opt_lrgb, "LRGB")
                         .on_hover_text("Use linear rgb input color instead of sRGB");
-                    ui.checkbox(&mut self.opt_hdmap, "HD Map")
-                        .on_hover_text("Using a high detail rgb color encoded heightmap");
                     ui.checkbox(&mut self.opt_glow, "Glow")
                         .on_hover_text("Glow bricks at lowest intensity");
-                    ui.checkbox(&mut self.opt_quad, "Quadtree").on_hover_text(
-                        "Run quadtree optimization (looks much better but has a few more bricks)",
-                    );
+                    ui.checkbox(&mut self.opt_hdmap, "HD Map")
+                        .on_hover_text("Using a high detail rgb color encoded heightmap");
                 });
                 ui.end_row();
 

@@ -17,6 +17,19 @@ pub struct GenOptions {
     pub lrgb: bool,
     pub nocollide: bool,
     pub quadtree: bool,
+    pub greedy: bool,
+}
+
+impl GenOptions {
+    pub fn base_height(&self) -> i32 {
+        if self.stud {
+            5
+        } else if self.micro {
+            1
+        } else {
+            2
+        }
+    }
 }
 
 // convert gamma to linear gamma

@@ -1,5 +1,5 @@
 pub mod map;
-pub mod quad;
+pub mod opt;
 pub mod util;
 
 #[cfg(feature = "gui")]
