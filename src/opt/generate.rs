@@ -6,9 +6,26 @@ use brdb::{
     assets::materials::{GLOW, PLASTIC},
 };
 use log::info;
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+
+/// `std::time::Instant` panics on wasm; a no-op stand-in keeps the timing
+/// logs harmless there.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+struct Instant;
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+    fn now() -> Self {
+        Instant
+    }
+    fn elapsed(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+}
 
 /// Generate a heightmap with brick conservation optimizations
 pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
@@ -228,8 +245,12 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     let brick_scale = if options.micro { 2 } else { 10 };
     let max_quad_size = 1000 / brick_scale;
     let greedy_mesh_start = Instant::now();
-    let all_quads: Vec<_> = planes_with_metadata
-        .into_par_iter()
+    // no thread pool on wasm: fall back to the sequential iterator there
+    #[cfg(not(target_arch = "wasm32"))]
+    let planes_iter = planes_with_metadata.into_par_iter();
+    #[cfg(target_arch = "wasm32")]
+    let planes_iter = planes_with_metadata.into_iter();
+    let all_quads: Vec<_> = planes_iter
         .flat_map(|(plane, h, color)| {
             let quads = greedy_mesh_binary_plane(plane, width, height, max_quad_size);
             quads

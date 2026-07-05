@@ -3,17 +3,29 @@ pub mod opt;
 pub mod util;
 pub mod text;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::{map::*, opt::*, text::*, util::*};
+#[cfg(not(target_arch = "wasm32"))]
 use brdb::World;
+#[cfg(not(target_arch = "wasm32"))]
 use brdb::assets::bricks::{
     PB_DEFAULT_BRICK, PB_DEFAULT_MICRO_BRICK, PB_DEFAULT_SMOOTH_TILE, PB_DEFAULT_STUDDED,
     PB_DEFAULT_TILE,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use clap::clap_app;
+#[cfg(not(target_arch = "wasm32"))]
 use env_logger::Builder;
+#[cfg(not(target_arch = "wasm32"))]
 use log::{LevelFilter, error, info, warn};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{boxed::Box, io::Write, path::PathBuf};
 
+/// The CLI is native-only; the web build ships only the GUI bin.
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     Builder::new()
         .format(|buf, record| writeln!(buf, "{}", record.args()))
@@ -48,6 +60,10 @@ fn main() {
         (@arg alphathreshold: --("alpha-threshold") +takes_value "Text mode: alpha below this is transparent (default 128)")
         (@arg lineheight: --("line-height-world") +takes_value "Text mode: world units per pixel row / pixel size (default 1)")
         (@arg font: --font +takes_value "Text mode: font preset (monaspace, iosevka, orbitron; default monaspace)")
+        (@arg braille: --braille "Text mode: monochrome braille glyphs (8 pixels per character)")
+        (@arg blocks: --blocks "Text mode: monochrome quadrant-block glyphs (4 pixels per character)")
+        (@arg lumathreshold: --("luma-threshold") +takes_value "Braille/blocks: pixels at least this bright are drawn (default 128)")
+        (@arg invert: --invert "Braille/blocks: draw dark pixels instead of bright ones")
     )
     .get_matches();
 
@@ -105,6 +121,18 @@ fn main() {
                 .value_of("alphathreshold")
                 .map(|s| s.parse::<u8>().expect("alpha-threshold must be 0-255"))
                 .unwrap_or(d.alpha_threshold),
+            mode: if matches.is_present("braille") {
+                PixelMode::Braille
+            } else if matches.is_present("blocks") {
+                PixelMode::Blocks
+            } else {
+                PixelMode::Color
+            },
+            luma_threshold: matches
+                .value_of("lumathreshold")
+                .map(|s| s.parse::<u8>().expect("luma-threshold must be 0-255"))
+                .unwrap_or(d.luma_threshold),
+            invert: matches.is_present("invert"),
             ..d
         };
         if text_opts.char_repeat == 0 {
@@ -236,6 +264,7 @@ fn main() {
 }
 
 // first char of an arg's value, or the default when absent/empty
+#[cfg(not(target_arch = "wasm32"))]
 fn char_arg(matches: &clap::ArgMatches, name: &str, default: char) -> char {
     matches
         .value_of(name)

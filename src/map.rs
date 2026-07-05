@@ -46,11 +46,6 @@ impl Heightmap for HeightmapPNG {
 // Heightmap image input
 impl HeightmapPNG {
     pub fn new(images: Vec<&PathBuf>, rgba_encoded: bool) -> Result<Self, String> {
-        if images.is_empty() {
-            return Err("HeightmapPNG requires at least one image".to_string());
-        }
-
-        // read in the maps
         let mut maps: Vec<RgbaImage> = vec![];
         for file in images {
             if let Ok(img) = image::open(file) {
@@ -58,6 +53,14 @@ impl HeightmapPNG {
             } else {
                 return Err(format!("Could not open image {}", file.display()));
             }
+        }
+        Self::from_images(maps, rgba_encoded)
+    }
+
+    /// Construct from already-decoded images (web builds have no filesystem).
+    pub fn from_images(maps: Vec<RgbaImage>, rgba_encoded: bool) -> Result<Self, String> {
+        if maps.is_empty() {
+            return Err("HeightmapPNG requires at least one image".to_string());
         }
 
         // check to ensure all images have the same dimensions
@@ -124,12 +127,14 @@ impl Colormap for ColormapPNG {
 impl ColormapPNG {
     pub fn new(file: impl AsRef<Path>, lrgb: bool) -> Result<Self, String> {
         if let Ok(img) = image::open(&file) {
-            Ok(ColormapPNG {
-                source: img.to_rgba8(),
-                lrgb,
-            })
+            Ok(Self::from_image(img.to_rgba8(), lrgb))
         } else {
             Err(format!("Could not open image {}", file.as_ref().display()))
         }
+    }
+
+    /// Construct from an already-decoded image (web builds have no filesystem).
+    pub fn from_image(source: RgbaImage, lrgb: bool) -> Self {
+        ColormapPNG { source, lrgb }
     }
 }

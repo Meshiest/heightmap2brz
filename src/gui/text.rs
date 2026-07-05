@@ -1,23 +1,22 @@
-use std::path::{Path, PathBuf};
-
 use crate::{
     gui::{
         SharedOptions,
-        util::{copy_path_to_clipboard, thumb},
+        util::{PickedImage, deliver_save, pick_images, thumb},
     },
     text::{
-        FontMetrics, FontPreset, TextOptions, add_text_tiles, build_measuring_world, encode_tiles,
-        make_text_prefab,
+        FontMetrics, FontPreset, PixelMode, TextOptions, add_text_tiles, build_measuring_world,
+        encode_tiles, make_text_prefab,
     },
-    util::write_world,
 };
 use brdb::World;
 use egui::{Button, Color32, Ui};
 use log::{error, info};
+use poll_promise::Promise;
 use std::collections::HashMap;
 
 pub struct TextApp {
-    image: Option<PathBuf>,
+    image: Option<PickedImage>,
+    pending_pick: Option<Promise<Vec<PickedImage>>>,
     preset: FontPreset,
     fill_char: String,
     empty_char: String,
@@ -32,6 +31,9 @@ pub struct TextApp {
     offset_y: f32,
     offset_z: f32,
     pitch_scale: f32,
+    mode: PixelMode,
+    luma_threshold: u8,
+    invert: bool,
     // measured spans of the measuring block (world units) and per-font
     // metrics solved from them
     measured_v: f32,
@@ -45,6 +47,7 @@ impl Default for TextApp {
         let d = preset.options(1.0);
         Self {
             image: None,
+            pending_pick: None,
             preset,
             fill_char: d.fill_char.to_string(),
             empty_char: d.empty_char.to_string(),
@@ -58,6 +61,9 @@ impl Default for TextApp {
             offset_y: d.offset_y,
             offset_z: d.offset_z,
             pitch_scale: d.pitch_scale,
+            mode: d.mode,
+            luma_threshold: d.luma_threshold,
+            invert: d.invert,
             measured_v: 0.0,
             measured_h: 0.0,
             metrics: HashMap::new(),
@@ -80,6 +86,9 @@ impl TextApp {
             offset_y: self.offset_y,
             offset_z: self.offset_z,
             pitch_scale: self.pitch_scale,
+            mode: self.mode,
+            luma_threshold: self.luma_threshold,
+            invert: self.invert,
             ..d
         }
     }
@@ -131,13 +140,12 @@ impl TextApp {
         let world = build_measuring_world(&self.options());
         let out_file = "measure.brz";
         info!("Writing measuring save to {out_file}");
-        if let Err(e) = write_world(&world, out_file) {
+        let data = match world.to_brz_vec() {
+            Ok(d) => d,
+            Err(e) => return error!("failed to encode brz: {e}"),
+        };
+        if let Err(e) = deliver_save(data, out_file, shared.out_clipboard) {
             return error!("{e}");
-        }
-        if shared.out_clipboard {
-            if let Err(e) = copy_path_to_clipboard(out_file) {
-                return error!("{e}");
-            }
         }
         info!("Paste it: read the 10x10 block's V/H spans off the rulers,");
         info!("enter them below and Apply; the sweeps verify the result.");
@@ -145,12 +153,8 @@ impl TextApp {
 
     /// Encoding and writing are fast enough to run on the UI thread.
     fn generate(&self, shared: &SharedOptions) {
-        let Some(image) = &self.image else { return };
-        info!("Reading image file {}", image.display());
-        let img = match image::open(image) {
-            Ok(i) => i.to_rgba8(),
-            Err(e) => return error!("Error reading image: {e:?}"),
-        };
+        let Some(picked) = &self.image else { return };
+        let img = (*picked.image).clone();
         let opts = self.options();
         let tiles = match encode_tiles(&img, &opts) {
             Ok(t) => t,
@@ -171,13 +175,12 @@ impl TextApp {
         make_text_prefab(&mut world, img_w, img_h, &opts);
 
         info!("Writing Save to {}", shared.out_file);
-        if let Err(e) = write_world(&world, &shared.out_file) {
+        let data = match world.to_brz_vec() {
+            Ok(d) => d,
+            Err(e) => return error!("failed to encode brz: {e}"),
+        };
+        if let Err(e) = deliver_save(data, &shared.out_file, shared.out_clipboard) {
             return error!("{e}");
-        }
-        if shared.out_clipboard {
-            if let Err(e) = copy_path_to_clipboard(&shared.out_file) {
-                return error!("{e}");
-            }
         }
         info!("Done!");
     }
@@ -247,6 +250,23 @@ impl TextApp {
                 });
                 ui.end_row();
 
+                ui.label("Mode").on_hover_text(
+                    "Color: one colored glyph run per pixel. Braille: monochrome, 8 pixels per character. Blocks: monochrome quadrants, 4 per character",
+                );
+                ui.horizontal(|ui| {
+                    for m in PixelMode::ALL {
+                        ui.radio_value(&mut self.mode, m, m.name());
+                    }
+                    if self.mode != PixelMode::Color {
+                        ui.label("Luma");
+                        ui.add(egui::Slider::new(&mut self.luma_threshold, 0..=255))
+                            .on_hover_text("Pixels at least this bright are drawn");
+                        ui.checkbox(&mut self.invert, "Invert")
+                            .on_hover_text("Draw dark pixels instead of bright ones");
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Alpha Threshold")
                     .on_hover_text("Pixels with alpha below this are rendered as transparent");
                 ui.add(egui::Slider::new(&mut self.alpha_threshold, 0..=255));
@@ -255,7 +275,7 @@ impl TextApp {
                 ui.label("Pixel Size")
                     .on_hover_text("World units per pixel row (1.0 = calibrated glyph fit)");
                 if ui
-                    .add(egui::Slider::new(&mut self.pixel_size, 0.25..=8.0).text("units"))
+                    .add(egui::Slider::new(&mut self.pixel_size, 0.01..=8.0).text("units"))
                     .changed()
                 {
                     self.load_preset();
@@ -284,12 +304,12 @@ impl TextApp {
                         ui.label("Grid Scale");
                         ui.add(egui::DragValue::new(&mut self.pitch_scale).speed(0.002))
                             .on_hover_text(
-                                "Brick-grid spacing as a fraction of the nominal pixel                                  size, matching the font's actual rendered size. Tile                                  gaps = lower it, overlaps = raise it",
+                                "Brick-grid spacing as a fraction of the nominal pixel size, matching the font's actual rendered size. Tile gaps = lower it, overlaps = raise it",
                             );
                         ui.label("Offset Z");
                         ui.add(egui::DragValue::new(&mut self.offset_z).speed(0.1))
                             .on_hover_text(
-                                "Out-of-plane: pushes the text off the anchor wall's                                  face so the cubes hide behind the image",
+                                "Out-of-plane: pushes the text off the anchor wall's face so the cubes hide behind the image",
                             );
                     });
                     ui.horizontal(|ui| {
@@ -334,35 +354,27 @@ impl TextApp {
         if ui
             .add(Button::new("Select image").fill(Color32::from_rgb(60, 60, 120)))
             .clicked()
+            && self.pending_pick.is_none()
         {
-            let result = native_dialog::DialogBuilder::file()
-                .add_filter("Image Files", ["png", "jpg", "jpeg"])
-                .open_single_file()
-                .show();
-
-            match result {
-                Ok(file_path) => {
-                    info!("Selected image file: {:?}", file_path);
-                    self.image = file_path;
-                }
-                Err(e) => {
-                    error!("Error selecting image file: {e}");
-                }
-            }
+            self.pending_pick = Some(pick_images(false));
         }
 
-        if let Some(path) = self.image.clone() {
+        if let Some(img) = &self.image {
+            let mut clear = false;
             egui::Grid::new("text_image_grid")
                 .striped(true)
                 .spacing([8.0, 4.0])
                 .min_col_width(4.0)
                 .show(ui, |ui| {
                     if ui.button("✖").clicked() {
-                        self.image = None;
+                        clear = true;
                     }
-                    thumb(ui, &path);
-                    ui.label(Path::new(&path).file_name().unwrap().to_str().unwrap());
+                    thumb(ui, img);
+                    ui.label(&img.name);
                 });
+            if clear {
+                self.image = None;
+            }
         }
     }
 
@@ -380,6 +392,17 @@ impl TextApp {
     }
 
     pub fn draw(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
+        if let Some(promise) = self.pending_pick.take() {
+            match promise.try_take() {
+                Ok(images) => {
+                    if let Some(img) = images.into_iter().next() {
+                        info!("Selected image: {}", img.name);
+                        self.image = Some(img);
+                    }
+                }
+                Err(promise) => self.pending_pick = Some(promise),
+            }
+        }
         self.draw_settings(ui, shared);
         ui.separator();
         self.draw_submit(ui, shared);

@@ -69,6 +69,9 @@ impl FontPreset {
             // one cube depth: text sits in front of the anchor wall
             offset_z: 2.0,
             pitch_scale: 1.0,
+            mode: PixelMode::Color,
+            luma_threshold: 128,
+            invert: false,
         };
         match self {
             // at LineHeight 0.61 Monaspace renders 30/32 of the nominal
@@ -118,10 +121,16 @@ pub struct TextOptions {
     /// wall's face so the cubes hide behind the image.
     pub offset_z: f32,
     /// Rendered size / nominal pixel size: the brick grid's tile spacing is
-    /// `TILE_PX × line_world_height × pitch_scale`, matching how large the
+    /// `tile_px × line_world_height × pitch_scale`, matching how large the
     /// font actually draws a tile (calibrated in-game from tile gaps:
     /// gaps ⇒ lower, overlaps ⇒ raise).
     pub pitch_scale: f32,
+    /// How pixels become glyphs (full color, or monochrome braille/blocks).
+    pub mode: PixelMode,
+    /// Monochrome modes: pixels at least this bright are drawn.
+    pub luma_threshold: u8,
+    /// Monochrome modes: draw dark pixels instead of bright ones.
+    pub invert: bool,
 }
 
 impl Default for TextOptions {
@@ -217,6 +226,116 @@ pub fn encode_bands(img: &RgbaImage, opts: &TextOptions) -> Result<Vec<TextBand>
 /// component offsets stay tiny.
 pub const TILE_PX: u32 = 32;
 
+/// Braille sprite sheet: index bit `y*2 + x` set ⇒ dot at (x, y) in the
+/// char's 2-wide × 4-tall pixel cell.
+const BRAILLE_SPRITES: &str = "\
+⠀⠁⠈⠉⠂⠃⠊⠋⠐⠑⠘⠙⠒⠓⠚⠛⠄⠅⠌⠍⠆⠇⠎⠏⠔⠕⠜⠝⠖⠗⠞⠟\
+⠠⠡⠨⠩⠢⠣⠪⠫⠰⠱⠸⠹⠲⠳⠺⠻⠤⠥⠬⠭⠦⠧⠮⠯⠴⠵⠼⠽⠶⠷⠾⠿\
+⡀⡁⡈⡉⡂⡃⡊⡋⡐⡑⡘⡙⡒⡓⡚⡛⡄⡅⡌⡍⡆⡇⡎⡏⡔⡕⡜⡝⡖⡗⡞⡟\
+⡠⡡⡨⡩⡢⡣⡪⡫⡰⡱⡸⡹⡲⡳⡺⡻⡤⡥⡬⡭⡦⡧⡮⡯⡴⡵⡼⡽⡶⡷⡾⡿\
+⢀⢁⢈⢉⢂⢃⢊⢋⢐⢑⢘⢙⢒⢓⢚⢛⢄⢅⢌⢍⢆⢇⢎⢏⢔⢕⢜⢝⢖⢗⢞⢟\
+⢠⢡⢨⢩⢢⢣⢪⢫⢰⢱⢸⢹⢲⢳⢺⢻⢤⢥⢬⢭⢦⢧⢮⢯⢴⢵⢼⢽⢶⢷⢾⢿\
+⣀⣁⣈⣉⣂⣃⣊⣋⣐⣑⣘⣙⣒⣓⣚⣛⣄⣅⣌⣍⣆⣇⣎⣏⣔⣕⣜⣝⣖⣗⣞⣟\
+⣠⣡⣨⣩⣢⣣⣪⣫⣰⣱⣸⣹⣲⣳⣺⣻⣤⣥⣬⣭⣦⣧⣮⣯⣴⣵⣼⣽⣶⣷⣾⣿";
+
+/// Quadrant-block sprite sheet: index bit `y*2 + x` ⇒ quadrant at (x, y)
+/// in the char's 2×2 pixel cell.
+const BLOCK_SPRITES: &str = " ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█";
+
+/// How pixels become glyphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelMode {
+    /// One colored glyph run per pixel (full color).
+    Color,
+    /// Monochrome braille: each char is a 2-wide × 4-tall pixel cell —
+    /// eight pixels per character, no color tags.
+    Braille,
+    /// Monochrome quadrant blocks: each char is a 2×2 pixel cell.
+    Blocks,
+}
+
+impl PixelMode {
+    pub const ALL: [PixelMode; 3] = [PixelMode::Color, PixelMode::Braille, PixelMode::Blocks];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            PixelMode::Color => "Color",
+            PixelMode::Braille => "Braille",
+            PixelMode::Blocks => "Blocks",
+        }
+    }
+
+    /// Pixel cell covered by one character: (width, height).
+    pub fn cell(&self) -> (u32, u32) {
+        match self {
+            PixelMode::Color => (1, 1),
+            PixelMode::Braille => (2, 4),
+            PixelMode::Blocks => (2, 2),
+        }
+    }
+
+    /// Tile edge in pixels. Mono modes pack 4–8 pixels per char, so their
+    /// tiles are larger for the same char budget (fewer anchor bricks).
+    pub fn tile_px(&self) -> u32 {
+        match self {
+            PixelMode::Color => TILE_PX,
+            PixelMode::Braille | PixelMode::Blocks => 128,
+        }
+    }
+
+    fn sprites(&self) -> &'static str {
+        match self {
+            PixelMode::Color => "",
+            PixelMode::Braille => BRAILLE_SPRITES,
+            PixelMode::Blocks => BLOCK_SPRITES,
+        }
+    }
+}
+
+/// Whether a pixel's dot is drawn in a monochrome mode.
+fn mono_on(p: [u8; 4], opts: &TextOptions) -> bool {
+    if p[3] < opts.alpha_threshold {
+        return false;
+    }
+    // Rec.601 luma
+    let luma = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000;
+    (luma as u8 >= opts.luma_threshold) != opts.invert
+}
+
+/// Encode one tile as monochrome sprite characters (braille or quadrant
+/// blocks). Returns the text and its char count; edge cells pad with OFF
+/// pixels like the reference implementation.
+fn encode_mono_tile(img: &RgbaImage, opts: &TextOptions) -> (String, usize, bool) {
+    let (cw, ch) = opts.mode.cell();
+    let table: Vec<char> = opts.mode.sprites().chars().collect();
+    let (w, h) = img.dimensions();
+    let (cols, lines) = (w.div_ceil(cw), h.div_ceil(ch));
+    let mut out = String::new();
+    let mut chars = 0usize;
+    let mut any_on = false;
+    for cy in 0..lines {
+        if cy > 0 {
+            out.push('\n');
+            chars += 1;
+        }
+        for cx in 0..cols {
+            let mut idx = 0usize;
+            for dy in 0..ch {
+                for dx in 0..cw {
+                    let (x, y) = (cx * cw + dx, cy * ch + dy);
+                    if x < w && y < h && mono_on(img.get_pixel(x, y).0, opts) {
+                        idx |= 1 << (dy * cw + dx);
+                    }
+                }
+            }
+            any_on |= idx != 0;
+            out.push(table[idx]);
+            chars += 1;
+        }
+    }
+    (out, chars, any_on)
+}
+
 /// One tile of the image: a `TILE_PX`-square pixel patch (smaller at the
 /// right/bottom edges) with its own bands.
 #[derive(Clone, Debug)]
@@ -228,23 +347,40 @@ pub struct TextTile {
     pub bands: Vec<TextBand>,
 }
 
-/// Tile the image into `TILE_PX`-square patches across BOTH axes, banding
-/// each patch at the char budget (worst-case patches split into a couple of
-/// bands; typical patches are one). Fully transparent patches are skipped
-/// entirely — no brick, no component.
+/// Tile the image into square patches across BOTH axes (patch size per
+/// [`PixelMode::tile_px`]), banding each patch at the char budget
+/// (worst-case color patches split into a couple of bands; mono patches are
+/// always one). Patches with nothing visible are skipped entirely — no
+/// brick, no component.
 pub fn encode_tiles(img: &RgbaImage, opts: &TextOptions) -> Result<Vec<TextTile>, String> {
     let (w, h) = img.dimensions();
+    let tile_px = opts.mode.tile_px();
     let mut tiles = Vec::new();
     let mut ty = 0u32;
     while ty < h {
-        let th = TILE_PX.min(h - ty);
+        let th = tile_px.min(h - ty);
         let mut tx = 0u32;
         while tx < w {
-            let tw = TILE_PX.min(w - tx);
+            let tw = tile_px.min(w - tx);
             let sub = image::imageops::crop_imm(img, tx, ty, tw, th).to_image();
-            let bands = encode_bands(&sub, opts)?;
-            // a patch whose bands hold no glyphs at all is invisible
-            if bands.iter().any(|b| b.text.chars().any(|c| c != '\n')) {
+            let (bands, visible) = match opts.mode {
+                PixelMode::Color => {
+                    let bands = encode_bands(&sub, opts)?;
+                    let visible = bands.iter().any(|b| b.text.chars().any(|c| c != '\n'));
+                    (bands, visible)
+                }
+                PixelMode::Braille | PixelMode::Blocks => {
+                    let (text, chars, any_on) = encode_mono_tile(&sub, opts);
+                    let band = TextBand {
+                        start_row: 0,
+                        rows: th as usize,
+                        text,
+                        chars,
+                    };
+                    (vec![band], any_on)
+                }
+            };
+            if visible {
                 tiles.push(TextTile {
                     start_col: tx as usize,
                     start_row: ty as usize,
@@ -703,7 +839,12 @@ fn text_display_component(
         ("Rotation", Box::new(0.0f32)),
         ("Skew", Box::new(0.0f32)),
         ("Kerning", Box::new(opts.kerning)),
-        ("LineHeight", Box::new(opts.line_height)),
+        // one text line spans `cell height` pixel rows (braille chars are 4
+        // pixels tall, quadrant blocks 2), so the glyphs scale to match
+        (
+            "LineHeight",
+            Box::new(opts.line_height * opts.mode.cell().1 as f32),
+        ),
         ("LineOffset", Box::new(opts.line_offset)),
         (
             "Color",
@@ -935,6 +1076,54 @@ mod tests {
         assert!(world.bricks.iter().all(|b| b.position.x == 0));
         // every coordinate must be non-negative (brdb negative-chunk bug)
         assert!(world.bricks.iter().all(|b| b.position.y >= 0));
+    }
+
+    #[test]
+    fn braille_cells_encode_dot_patterns() {
+        let opts = TextOptions {
+            mode: PixelMode::Braille,
+            ..Default::default()
+        };
+        // white pixel at (0,0) of a 2×4 cell ⇒ dot 1 (⠁); all on ⇒ ⣿
+        let mut i = RgbaImage::new(2, 4);
+        i.put_pixel(0, 0, Rgba([255, 255, 255, 255]));
+        let tiles = encode_tiles(&i, &opts).unwrap();
+        assert_eq!(tiles[0].bands[0].text, "⠁");
+
+        let full = RgbaImage::from_pixel(2, 4, Rgba([255, 255, 255, 255]));
+        let tiles = encode_tiles(&full, &opts).unwrap();
+        assert_eq!(tiles[0].bands[0].text, "⣿");
+
+        // dark pixels are off by default, on when inverted
+        let dark = RgbaImage::from_pixel(2, 4, Rgba([0, 0, 0, 255]));
+        assert!(encode_tiles(&dark, &opts).unwrap().is_empty());
+        let inv = TextOptions {
+            invert: true,
+            ..opts.clone()
+        };
+        assert_eq!(encode_tiles(&dark, &inv).unwrap()[0].bands[0].text, "⣿");
+    }
+
+    #[test]
+    fn block_cells_encode_quadrants() {
+        let opts = TextOptions {
+            mode: PixelMode::Blocks,
+            ..Default::default()
+        };
+        // 4×2: left cell top-left quadrant only; right cell all four
+        let mut i = RgbaImage::new(4, 2);
+        i.put_pixel(0, 0, Rgba([255, 255, 255, 255]));
+        for (x, y) in [(2, 0), (3, 0), (2, 1), (3, 1)] {
+            i.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+        }
+        let tiles = encode_tiles(&i, &opts).unwrap();
+        assert_eq!(tiles[0].bands[0].text, "▘█");
+
+        // multi-line: 2×4 all-on in blocks = two stacked █ lines
+        let full = RgbaImage::from_pixel(2, 4, Rgba([255, 255, 255, 255]));
+        let tiles = encode_tiles(&full, &opts).unwrap();
+        assert_eq!(tiles[0].bands[0].text, "█\n█");
+        assert_eq!(tiles[0].bands[0].chars, 3);
     }
 
     #[test]

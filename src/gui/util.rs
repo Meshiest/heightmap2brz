@@ -1,16 +1,148 @@
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::{
     map::{Colormap, ColormapPNG, Heightmap, HeightmapFlat, HeightmapPNG},
-    util::{GenOptions, file_ext},
+    util::GenOptions,
 };
+use image::RgbaImage;
+use poll_promise::Promise;
+
+type MapPair = (Box<dyn Heightmap>, Box<dyn Colormap>);
+
+/// An image the user picked, already decoded — works identically on native
+/// (file dialogs + filesystem) and web (async pickers + in-memory bytes).
+#[derive(Clone)]
+pub struct PickedImage {
+    pub name: String,
+    pub image: Arc<RgbaImage>,
+}
+
+/// Pick one or more images asynchronously; poll the returned promise each
+/// frame. Files that fail to decode are dropped with a log message.
+pub fn pick_images(multiple: bool) -> Promise<Vec<PickedImage>> {
+    let dialog = rfd::AsyncFileDialog::new().add_filter("Image Files", &["png", "jpg", "jpeg"]);
+    let pick = async move {
+        let handles = if multiple {
+            dialog.pick_files().await.unwrap_or_default()
+        } else {
+            dialog.pick_file().await.into_iter().collect()
+        };
+        let mut out = Vec::new();
+        for h in handles {
+            let name = h.file_name();
+            let bytes = h.read().await;
+            match image::load_from_memory(&bytes) {
+                Ok(img) => out.push(PickedImage {
+                    name,
+                    image: Arc::new(img.to_rgba8()),
+                }),
+                Err(e) => log::error!("could not decode {name}: {e}"),
+            }
+        }
+        out
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Promise::spawn_thread("pick_images", move || pollster::block_on(pick))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Promise::spawn_async(pick)
+    }
+}
+
+/// Small square thumbnail for a picked image, served via egui's bytes loader.
+pub fn thumb(ui: &mut egui::Ui, img: &PickedImage) {
+    let uri = format!("bytes://thumb/{}", img.name);
+    if ui.ctx().try_load_bytes(&uri).is_err() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let _ = image::DynamicImage::ImageRgba8((*img.image).clone())
+            .thumbnail(32, 32)
+            .write_to(&mut buf, image::ImageFormat::Png);
+        ui.ctx().include_bytes(uri.clone(), buf.into_inner());
+    }
+    ui.add(
+        egui::Image::new(egui::ImageSource::Uri(uri.into()))
+            .fit_to_exact_size(egui::vec2(32.0, 32.0))
+            .maintain_aspect_ratio(false),
+    );
+}
+
+/// Build the generator inputs from picked images.
+pub fn maps_from_images(
+    options: &GenOptions,
+    heightmaps: &[PickedImage],
+    colormap: Option<&PickedImage>,
+) -> Result<MapPair, String> {
+    let colormap_img = colormap
+        .or(heightmaps.first())
+        .ok_or_else(|| "no images selected".to_string())?;
+    let colormap = ColormapPNG::from_image((*colormap_img.image).clone(), options.lrgb);
+
+    let heightmap: Box<dyn Heightmap> = if options.img {
+        Box::new(HeightmapFlat::new(colormap.size()).unwrap())
+    } else {
+        Box::new(HeightmapPNG::from_images(
+            heightmaps.iter().map(|p| (*p.image).clone()).collect(),
+            options.hdmap,
+        )?)
+    };
+
+    Ok((heightmap, Box::new(colormap)))
+}
+
+/// Deliver a generated save to the user: on native, write it next to the exe
+/// and optionally copy the file path to the clipboard for in-game pasting;
+/// on web, trigger a browser download.
+pub fn deliver_save(data: Vec<u8>, out_file: &str, clipboard: bool) -> Result<(), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::fs::write(out_file, data).map_err(|e| format!("failed to write file: {e}"))?;
+        if clipboard {
+            copy_path_to_clipboard(out_file)?;
+        }
+        Ok(())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = clipboard;
+        download_bytes(out_file, &data)
+    }
+}
+
+/// Trigger a browser download of the given bytes.
+#[cfg(target_arch = "wasm32")]
+fn download_bytes(name: &str, data: &[u8]) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    let err = |e: wasm_bindgen::JsValue| format!("download failed: {e:?}");
+
+    let array = js_sys::Array::new();
+    array.push(&js_sys::Uint8Array::from(data).buffer());
+    let blob = web_sys::Blob::new_with_buffer_source_sequence(&array).map_err(err)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(err)?;
+
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or("no document")?;
+    let a: web_sys::HtmlAnchorElement = document
+        .create_element("a")
+        .map_err(err)?
+        .dyn_into()
+        .map_err(|_| "anchor cast failed".to_string())?;
+    a.set_href(&url);
+    a.set_download(name);
+    a.click();
+    let _ = web_sys::Url::revoke_object_url(&url);
+    Ok(())
+}
 
 /// Copy the output file's absolute path to the OS clipboard as a file list so
 /// it can be pasted directly into Brickadia.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn copy_path_to_clipboard(out_file: &str) -> Result<(), String> {
     let mut full_path = std::path::Path::new(out_file)
         .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(out_file))
+        .unwrap_or_else(|_| std::path::PathBuf::from(out_file))
         .to_string_lossy()
         .to_string();
 
@@ -36,72 +168,4 @@ pub fn copy_path_to_clipboard(out_file: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// Small square thumbnail for an image file path.
-pub fn thumb(ui: &mut egui::Ui, image: &PathBuf) {
-    ui.add(
-        egui::Image::new(egui::ImageSource::Uri(std::borrow::Cow::from(format!(
-            "file://{}",
-            image.display().to_string().replace("\\", "/")
-        ))))
-        .fit_to_exact_size(egui::vec2(32.0, 32.0))
-        .maintain_aspect_ratio(false),
-    );
-}
-
-type MapPair = (Box<dyn Heightmap>, Box<dyn Colormap>);
-
-pub fn maps_from_files(
-    options: &GenOptions,
-    heightmap_files: Vec<PathBuf>,
-    colormap_file: Option<PathBuf>,
-) -> Result<MapPair, String> {
-    let heightmap_files: Vec<PathBuf> = heightmap_files.into_iter().collect();
-    let first_heightmap = heightmap_files
-        .first()
-        .map(|s| s.to_owned())
-        .unwrap_or_else(|| "".into());
-    let colormap_file = colormap_file.unwrap_or(first_heightmap);
-
-    // colormap file parsing
-    let colormap = match file_ext(&colormap_file)
-        .map(|s| s.to_lowercase())
-        .as_deref()
-    {
-        Some("png") | Some("jpg") | Some("jpeg") => ColormapPNG::new(&colormap_file, options.lrgb)
-            .map_err(|e| format!("Error reading colormap: {:?}", e))?,
-        Some(ext) => {
-            return Err(format!("Unsupported colormap format '{}'", ext));
-        }
-        None => {
-            return Err(format!(
-                "Missing colormap format for '{}'",
-                colormap_file.display()
-            ));
-        }
-    };
-
-    // heightmap file parsing
-    let heightmap: Box<dyn Heightmap> = if heightmap_files.iter().all(|f| {
-        matches!(
-            file_ext(f).map(|s| s.to_lowercase()).as_deref(),
-            Some("png") | Some("jpg") | Some("jpeg")
-        )
-    }) {
-        if options.img {
-            Box::new(HeightmapFlat::new(colormap.size()).unwrap())
-        } else {
-            match HeightmapPNG::new(heightmap_files.iter().collect(), options.hdmap) {
-                Ok(map) => Box::new(map),
-                Err(error) => {
-                    return Err(format!("Error reading heightmap: {:?}", error));
-                }
-            }
-        }
-    } else {
-        return Err("Unsupported heightmap format".to_string());
-    };
-
-    Ok((heightmap, Box::new(colormap)))
 }

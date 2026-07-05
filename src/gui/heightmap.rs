@@ -1,17 +1,10 @@
 #![allow(dead_code, unused_variables)]
-use std::{
-    borrow::Cow,
-    collections::HashSet,
-    path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
-    thread::{self},
-    time::Duration,
-};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::{
     gui::{
         SharedOptions,
-        util::{copy_path_to_clipboard, maps_from_files},
+        util::{PickedImage, deliver_save, maps_from_images, pick_images, thumb},
     },
     opt::*,
     util::{bricks_to_save, *},
@@ -19,12 +12,18 @@ use crate::{
 use brdb::assets::bricks::{
     PB_DEFAULT_BRICK, PB_DEFAULT_MICRO_BRICK, PB_DEFAULT_SMOOTH_TILE, PB_DEFAULT_STUDDED,
 };
-use egui::{Button, Color32, Context, Id, ImageSource, ProgressBar, Ui, vec2};
+use egui::{Button, Color32, Context, Id, ProgressBar, Ui};
 use log::{error, info};
 use poll_promise::Promise;
-use std::path::Path;
 
 type Progress = (&'static str, f32);
+
+/// Which selection an in-flight file pick fills.
+#[derive(Clone, Copy, PartialEq)]
+enum PickTarget {
+    Heightmaps,
+    Colormap,
+}
 
 #[derive(PartialEq, Clone)]
 enum BrickMode {
@@ -44,8 +43,9 @@ enum OptimizationMode {
 
 pub struct HeightmapApp {
     // options for the generator
-    heightmaps: Vec<PathBuf>,
-    colormap: Option<PathBuf>,
+    heightmaps: Vec<PickedImage>,
+    colormap: Option<PickedImage>,
+    pending_pick: Option<(PickTarget, Promise<Vec<PickedImage>>)>,
     vertical_scale: u32,
     horizontal_size: u16,
     optimization: OptimizationMode,
@@ -68,6 +68,7 @@ impl Default for HeightmapApp {
             // default generator options
             heightmaps: vec![],
             colormap: None,
+            pending_pick: None,
             vertical_scale: 1,
             horizontal_size: 1,
             optimization: OptimizationMode::Quad,
@@ -89,15 +90,36 @@ impl Default for HeightmapApp {
 impl HeightmapApp {
     fn has_large_image(&self) -> bool {
         // Check if any heightmap or colormap is larger than 1024px in either dimension
-        let check_image = |path: &PathBuf| -> bool {
-            if let Ok(img) = image::open(path) {
-                img.width() > 1024 || img.height() > 1024
-            } else {
-                false
-            }
-        };
+        let check_image =
+            |img: &PickedImage| -> bool { img.image.width() > 1024 || img.image.height() > 1024 };
 
         self.heightmaps.iter().any(check_image) || self.colormap.as_ref().map_or(false, check_image)
+    }
+
+    /// Poll an in-flight file pick and apply the result.
+    fn poll_pick(&mut self) {
+        if let Some((target, promise)) = self.pending_pick.take() {
+            match promise.try_take() {
+                Ok(images) => match target {
+                    PickTarget::Heightmaps => {
+                        if !images.is_empty() {
+                            info!(
+                                "Selected heightmaps: {:?}",
+                                images.iter().map(|i| &i.name).collect::<Vec<_>>()
+                            );
+                            self.heightmaps = images;
+                        }
+                    }
+                    PickTarget::Colormap => {
+                        if let Some(img) = images.into_iter().next() {
+                            info!("Selected image: {}", img.name);
+                            self.colormap = Some(img);
+                        }
+                    }
+                },
+                Err(promise) => self.pending_pick = Some((target, promise)),
+            }
+        }
     }
 
     fn options(&self, img_only: bool) -> GenOptions {
@@ -135,12 +157,12 @@ impl HeightmapApp {
         let options = self.options(img_only);
         // the Image2Brick pane renders the image flat, ignoring any
         // heightmaps picked while on the Heightmap pane
-        let heightmap_files = if img_only {
+        let heightmaps = if img_only {
             vec![]
         } else {
             self.heightmaps.clone()
         };
-        let colormap_file = self.colormap.clone();
+        let colormap = self.colormap.clone();
 
         let progress_tx = self.progress_channel.0.clone();
         let progress = move |status, p| progress_tx.send((status, p)).unwrap();
@@ -155,88 +177,86 @@ impl HeightmapApp {
             let (sender, promise) = Promise::new();
 
             progress("Reading", 0.);
+            let end_progress = progress.clone();
 
-            thread::spawn(move || {
-                macro_rules! stop_if_stopped {
-                    () => {
-                        if is_stopped() {
-                            sender.send(Err("Stopped by user".to_string()));
-                            return;
-                        }
-                    };
-                }
+            let work = move || -> Result<(), String> {
+                let stopped = || -> Result<(), String> {
+                    if is_stopped() {
+                        Err("Stopped by user".to_string())
+                    } else {
+                        Ok(())
+                    }
+                };
 
                 info!("Reading image files...");
                 let (heightmap, colormap) =
-                    match maps_from_files(&options, heightmap_files, colormap_file) {
-                        Ok(hc) => hc,
-                        Err(err) => {
-                            error!("{err}");
-                            return sender.send(Err(err));
-                        }
-                    };
+                    maps_from_images(&options, &heightmaps, colormap.as_ref())?;
 
-                stop_if_stopped!();
+                stopped()?;
                 progress("Generating", 0.10);
 
-                let bricks = match gen_opt_heightmap(&*heightmap, &*colormap, options, |p| {
+                let bricks = gen_opt_heightmap(&*heightmap, &*colormap, options, |p| {
                     progress("Generating", 0.1 + 0.85 * p);
                     !is_stopped()
-                }) {
-                    Ok(b) => b,
-                    Err(err) => {
-                        error!("{err}");
-                        return sender.send(Err(err));
-                    }
-                };
-                stop_if_stopped!();
+                })?;
+                stopped()?;
 
                 info!("Writing Save to {}", out_file);
                 progress("Writing", 0.95);
                 let data = bricks_to_save(bricks);
 
                 if out_file.to_lowercase().ends_with(".brz") {
-                    let brz = match data.to_brz_vec() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let err = format!("failed to encode brz: {e}");
-                            error!("{err}");
-                            return sender.send(Err(err));
-                        }
-                    };
-                    if let Err(e) = std::fs::write(&out_file, brz) {
-                        let err = format!("failed to write file: {e}");
-                        error!("{err}");
-                        return sender.send(Err(err));
-                    }
+                    let brz = data
+                        .to_brz_vec()
+                        .map_err(|e| format!("failed to encode brz: {e}"))?;
+                    deliver_save(brz, &out_file, is_clipboard)?;
                 } else if out_file.to_lowercase().ends_with(".brdb") {
-                    if let Err(e) = data.write_brdb(&out_file) {
-                        let err = format!("failed to write file: {e}");
-                        error!("{err}");
-                        return sender.send(Err(err));
-                    };
-                } else {
-                    let err = "output file must end with .brz or .brdb".to_string();
-                    error!("{err}");
-                    return sender.send(Err(err));
-                }
-
-                if is_clipboard {
-                    if let Err(e) = copy_path_to_clipboard(&out_file) {
-                        error!("{e}");
-                        return sender.send(Err(e));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        data.write_brdb(&out_file)
+                            .map_err(|e| format!("failed to write file: {e}"))?;
+                        if is_clipboard {
+                            crate::gui::util::copy_path_to_clipboard(&out_file)?;
+                        }
                     }
+                    #[cfg(target_arch = "wasm32")]
+                    return Err("only .brz output is supported on the web".to_string());
+                } else {
+                    return Err("output file must end with .brz or .brdb".to_string());
                 }
 
-                stop_if_stopped!();
-                progress("Finished", 1.0);
-
+                stopped()?;
                 info!("Done!");
-                sender.send(Ok(()));
-                thread::sleep(Duration::from_millis(500));
-                progress("", 2.0);
+                Ok(())
+            };
+
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::spawn(move || {
+                let result = work();
+                if let Err(e) = &result {
+                    error!("{e}");
+                    sender.send(result);
+                } else {
+                    end_progress("Finished", 1.0);
+                    sender.send(result);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    end_progress("", 2.0);
+                }
             });
-            // thread::self.gen_thread.unwrap().thread().
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                // no threads on the web: run synchronously (the tab blocks
+                // for the duration of the generation)
+                let result = work();
+                if let Err(e) = &result {
+                    error!("{e}");
+                } else {
+                    end_progress("", 2.0);
+                }
+                sender.send(result);
+            }
+
             promise
         });
     }
@@ -350,21 +370,8 @@ impl HeightmapApp {
             ui.label("Select image files to use for save generation.");
 
             // handle heightmap multiple file selection
-            if ui.button("Select heightmaps").clicked() {
-                let result = native_dialog::DialogBuilder::file()
-                    .add_filter("Image Files", ["png", "jpg", "jpeg"])
-                    .open_multiple_file()
-                    .show();
-
-                match result {
-                    Ok(files) => {
-                        self.heightmaps = files;
-                        info!("Selected heightmap files: {:?}", &self.heightmaps);
-                    }
-                    Err(e) => {
-                        error!("Error selecting heightmap files: {e}");
-                    }
-                }
+            if ui.button("Select heightmaps").clicked() && self.pending_pick.is_none() {
+                self.pending_pick = Some((PickTarget::Heightmaps, pick_images(true)));
             }
 
             egui::Grid::new("heightmap_grid")
@@ -372,16 +379,18 @@ impl HeightmapApp {
                 .spacing([8.0, 4.0])
                 .min_col_width(4.0)
                 .show(ui, |ui| {
-                    let mut to_remove = HashSet::new();
-                    for img in self.heightmaps.clone() {
+                    let mut to_remove = Vec::new();
+                    for (i, img) in self.heightmaps.iter().enumerate() {
                         if ui.add(Button::new("✖")).clicked() {
-                            to_remove.insert(img.clone());
+                            to_remove.push(i);
                         }
-                        self.thumb(ui, &img);
-                        ui.label(Path::new(&img).file_name().unwrap().to_str().unwrap());
+                        thumb(ui, img);
+                        ui.label(&img.name);
                         ui.end_row();
                     }
-                    self.heightmaps.retain(|i| !to_remove.contains(i));
+                    for i in to_remove.into_iter().rev() {
+                        self.heightmaps.remove(i);
+                    }
                 });
 
             ui.separator();
@@ -406,35 +415,27 @@ impl HeightmapApp {
                 .fill(Color32::from_rgb(60, 60, 120)),
             )
             .clicked()
+            && self.pending_pick.is_none()
         {
-            let result = native_dialog::DialogBuilder::file()
-                .add_filter("Image Files", ["png", "jpg", "jpeg"])
-                .open_single_file()
-                .show();
-
-            match result {
-                Ok(file_path) => {
-                    info!("Selected colormap file: {:?}", file_path);
-                    self.colormap = file_path;
-                }
-                Err(e) => {
-                    error!("Error selecting colormap file: {e}");
-                }
-            }
+            self.pending_pick = Some((PickTarget::Colormap, pick_images(false)));
         }
 
-        if let Some(path) = self.colormap.clone() {
+        if let Some(img) = &self.colormap {
+            let mut clear = false;
             egui::Grid::new("colormap_grid")
                 .striped(true)
                 .spacing([8.0, 4.0])
                 .min_col_width(4.0)
                 .show(ui, |ui| {
                     if ui.button("✖").clicked() {
-                        self.colormap = None;
+                        clear = true;
                     }
-                    self.thumb(ui, &path);
-                    ui.label(Path::new(&path).file_name().unwrap().to_str().unwrap());
+                    thumb(ui, img);
+                    ui.label(&img.name);
                 });
+            if clear {
+                self.colormap = None;
+            }
         }
     }
 
@@ -541,17 +542,6 @@ impl HeightmapApp {
         }
     }
 
-    fn thumb(&mut self, ui: &mut Ui, image: &PathBuf) {
-        ui.add(
-            egui::Image::new(ImageSource::Uri(Cow::from(format!(
-                "file://{}",
-                image.display().to_string().replace("\\", "/")
-            ))))
-            .fit_to_exact_size(vec2(32.0, 32.0))
-            .maintain_aspect_ratio(false),
-        );
-    }
-
     pub fn draw(
         &mut self,
         ui: &mut Ui,
@@ -560,6 +550,7 @@ impl HeightmapApp {
         shared: &mut SharedOptions,
         img_only: bool,
     ) {
+        self.poll_pick();
         self.draw_settings(ui, shared, img_only);
         ui.separator();
         if !self.draw_progress(ctx, ui) {

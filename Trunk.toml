@@ -1,0 +1,6 @@
+# trunk (https://trunk-rs.github.io/trunk/) builds the GUI for the web:
+#   trunk serve            # local dev server
+#   trunk build --release  # dist/ output (deployed to GitHub Pages by CI)
+[build]
+target = "index.html"
+release = true
