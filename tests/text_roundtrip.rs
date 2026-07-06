@@ -49,7 +49,7 @@ fn text_component_roundtrips_through_brz() {
             assert_eq!(offset.prop("X").unwrap().as_brdb_f32().unwrap(), 0.0);
             assert_eq!(offset.prop("Y").unwrap().as_brdb_f32().unwrap(), -0.2);
             // out-of-plane push so the anchor cube hides behind the image
-            assert_eq!(offset.prop("Z").unwrap().as_brdb_f32().unwrap(), 2.0);
+            assert_eq!(offset.prop("Z").unwrap().as_brdb_f32().unwrap(), 0.0);
             found += 1;
         }
     }

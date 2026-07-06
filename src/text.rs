@@ -66,8 +66,9 @@ impl FontPreset {
             kerning: 0.0,
             offset_x: 0.0,
             offset_y: -0.2 * pixel_size,
-            // one cube depth: text sits in front of the anchor wall
-            offset_z: 2.0,
+            // the calibrated reference clipboards all carry Offset Z = 0:
+            // front cubes get no forward offset at all
+            offset_z: 0.0,
             pitch_x: 1.0,
             pitch_y: 1.0,
             mode: PixelMode::Color,
@@ -680,6 +681,15 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
     let tiles = encode_tiles(&img, &cal).expect("checkerboard must encode");
     let text_ids = add_text_tiles(&mut world, tiles, &cal);
 
+    // sufficiently small displays depth-stagger their cubes, whose per-cube
+    // Offset.Z compensation a shared wire would clobber — drop that
+    // variable entirely there
+    let staggered = world.bricks.iter().any(|b| b.position.x > 0);
+    let variables: Vec<_> = calibration_variables(&cal)
+        .into_iter()
+        .filter(|(_, port, _)| !(staggered && *port == "Offset.Z"))
+        .collect();
+
     // one visible Variable gate per tunable, in a labeled row above the grid
     let (font_idx, _) = world
         .global_data
@@ -694,7 +704,7 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
         ..cal.clone()
     };
     let mut var_ids = Vec::new();
-    for (i, (label, _port, value)) in calibration_variables(&cal).into_iter().enumerate() {
+    for (i, (label, _port, value)) in variables.iter().copied().enumerate() {
         let (brick, id) = Brick {
             asset: B_GATE_VARIABLE,
             position: Position::new(0, i as i32 * 20, grid_top),
@@ -720,7 +730,9 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
             Vector3f {
                 x: 0.0,
                 y: 0.0,
-                z: 0.0,
+                // lift the label off the gate face (Offset acts in line
+                // units; the label's line is ~4 world units)
+                z: 0.5,
             },
             &label_opts,
             // the gate is rotated: its local top (+Z) faces the viewer
@@ -745,7 +757,7 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
     }
 
     // wire every variable into every tile's text component
-    for (var_id, (_, port, _)) in var_ids.iter().zip(calibration_variables(&cal)) {
+    for (var_id, (_, port, _)) in var_ids.iter().zip(variables) {
         for &text_id in &text_ids {
             world.add_wire_connection(
                 WirePort::new(*var_id, "BrickComponentType_WireGraphPseudo_Var", "Value"),
@@ -814,19 +826,15 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
         .insert_full(("BrickFontDescriptor".to_string(), opts.font.to_string()));
 
     // grid spacing follows the font's ACTUAL rendered size, not the nominal
-    // pixel size — tiles anchor where their neighbors' glyphs end. Cubes are
-    // 2 units wide, so the CUBE grid never steps below 2 (and vertically
-    // below the tallest in-tile band stack): at tiny pixel sizes the cubes
-    // spread wider than the rendering, and each tile's text is shifted back
-    // to its true position via its local offsets (small by construction).
+    // pixel size — tiles anchor where their neighbors' glyphs end. The CUBE
+    // POSITION carries each tile's in-plane placement exactly (rounded to
+    // the brick grid); component offsets stay pure glyph nudges. Any cube
+    // that would intersect an already-placed one — crowded tiles at tiny
+    // pixel sizes, or a tile's extra bands — steps BACKWARD (world +X) one
+    // cube at a time, its text returning via local Z.
     let tile_px = opts.tile_px() as usize;
     let step_true_x = tile_px as f32 * opts.line_world_height * opts.pitch_x;
     let step_true_z = tile_px as f32 * opts.line_world_height * opts.pitch_y;
-    let step_y = (step_true_x.ceil() as i32).max(2);
-    let step_z = (step_true_z.ceil() as i32).max(2);
-    // per-tile-index displacement between the cube grid and the rendering
-    let drift_y = step_y as f32 - step_true_x;
-    let drift_z = step_z as f32 - step_true_z;
 
     // brdb's chunk encoding mishandles negative coordinates (bricks land in
     // wrong chunks in-game), so the grid is translated to keep EVERY brick
@@ -842,48 +850,63 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
         .map(|t| t.start_row / tile_px)
         .max()
         .unwrap_or(0) as i32;
-    let mut bricks = Vec::new();
-    let mut ids = Vec::new();
+    // world +X points TOWARD the viewer (verified in-game), and bricks
+    // cannot use negative coordinates — so depth slots are assigned first,
+    // then the whole grid is arranged with the front plane at the deepest
+    // slot used and crowded cubes stepping down toward x=0 (away from the
+    // viewer), their text coming forward by their distance behind the
+    // front plane.
+    let mut pending = Vec::new();
+    let mut placed: Vec<Position> = Vec::new();
     for tile in tiles {
         let kx = max_kx - (tile.start_col / tile_px) as i32;
         let ky = max_ky - (tile.start_row / tile_px) as i32;
-        let y = kx * step_y;
+        let y = (kx as f32 * step_true_x).round() as i32;
         // bottom tile row anchors at z=1; rows above it proportionally higher
-        let z_tile = 1 + ky * step_z;
-        for (i, band) in tile.bands.into_iter().enumerate() {
-            let i = i as i32;
-            let offset = Vector3f {
-                // cube spread past the rendering pulls the text back right
-                // (local +X = world -Y)
-                x: opts.offset_x + kx as f32 * drift_y,
-                // ...and back down (negative local Y = down)
-                y: opts.offset_y - ky as f32 * drift_z,
-                // extra band cubes sit deeper (world +X) so the grid keeps a
-                // constant footprint; their text comes back to the common
-                // plane via local Z
-                z: opts.offset_z + (BRICK_STACK_STEP * i) as f32,
-            };
-            let (brick, id) = anchor_cube(Position::new(BRICK_STACK_STEP * i, y, z_tile), false)
-                .with_component(text_display_component(
-                    band.text,
-                    font_idx,
-                    offset,
-                    opts,
-                    0,
-                    SavedBrickColor {
-                        r: 255,
-                        g: 255,
-                        b: 255,
-                        a: 255,
-                    },
-                    Vector2f { x: 0.0, y: 0.0 },
-                    0,
-                    0,
-                ))
-                .with_id_split();
-            ids.push(id);
-            bricks.push(brick);
+        let z_tile = 1 + (ky as f32 * step_true_z).round() as i32;
+        for band in tile.bands {
+            // take the shallowest free depth slot at this in-plane spot
+            let mut depth = 0;
+            while placed.iter().any(|p| {
+                (p.x - depth).abs() < 2 && (p.y - y).abs() < 2 && (p.z - z_tile).abs() < 2
+            }) {
+                depth += BRICK_STACK_STEP;
+            }
+            placed.push(Position::new(depth, y, z_tile));
+            pending.push((band, y, z_tile, depth));
         }
+    }
+    let max_depth = pending.iter().map(|(_, _, _, d)| *d).max().unwrap_or(0);
+    let mut bricks = Vec::new();
+    let mut ids = Vec::new();
+    for (band, y, z_tile, depth) in pending {
+        let offset = Vector3f {
+            x: opts.offset_x,
+            y: opts.offset_y,
+            // text comes forward by the cube's distance behind the front
+            // plane (all offset axes share the same world units)
+            z: opts.offset_z + depth as f32,
+        };
+        let (brick, id) = anchor_cube(Position::new(max_depth - depth, y, z_tile), false)
+            .with_component(text_display_component(
+                band.text,
+                font_idx,
+                offset,
+                opts,
+                0,
+                SavedBrickColor {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                Vector2f { x: 0.0, y: 0.0 },
+                0,
+                0,
+            ))
+            .with_id_split();
+        ids.push(id);
+        bricks.push(brick);
     }
     world.add_bricks(bricks);
     // brdb 0.6 requires used component types registered in global data before
@@ -1119,6 +1142,7 @@ mod tests {
                 )
             })
             .collect();
+        let max_depth = 2 * (per_tile.iter().map(|(_, _, n)| *n).max().unwrap() - 1);
         let mut world = brdb::World::new();
         add_text_tiles(&mut world, tiles, &TextOptions::default());
         for (y, z_tile, n) in per_tile {
@@ -1129,8 +1153,10 @@ mod tests {
                 .map(|b| b.position.x)
                 .collect();
             xs.sort_unstable();
-            let expected: Vec<i32> = (0..n).map(|i| 2 * i).collect();
-            assert_eq!(xs, expected, "tile at y={y} z={z_tile}: bands go +X");
+            // band 0 on the front plane (x = max_depth), extras stepping back
+            let mut expected: Vec<i32> = (0..n).map(|i| max_depth - 2 * i).collect();
+            expected.sort_unstable();
+            assert_eq!(xs, expected, "tile at y={y} z={z_tile}: bands step back");
         }
         assert!(world.bricks.iter().all(|b| b.position.z >= 1));
         // every coordinate must be non-negative (brdb negative-chunk bug)
@@ -1189,8 +1215,8 @@ mod tests {
     #[test]
     fn tiny_pixel_sizes_never_overlap_cubes() {
         // 0.02 units/px: a 32px tile renders ~0.6 units wide, far below the
-        // 2-unit cube size — the cube grid must clamp to non-overlapping
-        // steps while the text compensates via offsets
+        // 2-unit cube size — crowded cubes must step BACKWARD (world +X)
+        // instead of spreading in-plane, keeping their true y/z placement
         let opts = TextOptions {
             line_world_height: 0.02,
             ..Default::default()
@@ -1204,20 +1230,23 @@ mod tests {
         let tiles = encode_tiles(&i, &opts).unwrap();
         let mut world = brdb::World::new();
         add_text_tiles(&mut world, tiles, &opts);
-        let mut positions: Vec<(i32, i32, i32)> = world
+        let positions: Vec<(i32, i32, i32)> = world
             .bricks
             .iter()
             .map(|b| (b.position.x, b.position.y, b.position.z))
             .collect();
-        let n = positions.len();
-        positions.sort_unstable();
-        positions.dedup();
-        assert_eq!(positions.len(), n, "no two cubes may share a position");
-        // adjacent cube columns/rows sit exactly one cube apart
-        let mut ys: Vec<i32> = world.bricks.iter().map(|b| b.position.y).collect();
-        ys.sort_unstable();
-        ys.dedup();
-        assert_eq!(ys, vec![0, 2, 4]);
+        for (i, a) in positions.iter().enumerate() {
+            for b in &positions[i + 1..] {
+                assert!(
+                    (a.0 - b.0).abs() >= 2 || (a.1 - b.1).abs() >= 2 || (a.2 - b.2).abs() >= 2,
+                    "cubes {a:?} and {b:?} intersect"
+                );
+            }
+        }
+        // in-plane placement stays true (rounded), so crowded cubes go deep
+        assert!(positions.iter().any(|p| p.0 > 0), "depth staggering engaged");
+        assert!(positions.iter().all(|p| p.1 <= 2 && p.2 <= 3));
+        assert!(positions.iter().all(|p| p.0 >= 0 && p.1 >= 0 && p.2 >= 0));
     }
 
     #[test]
@@ -1273,6 +1302,14 @@ mod tests {
         world
             .to_brz_vec()
             .expect("braille calibration world must encode to brz");
+
+        // a tiny display staggers cubes in depth: the Offset Z variable is
+        // dropped so the shared wire can't clobber per-cube compensation
+        let world = build_calibration_world(&TextOptions::default(), 1.0);
+        let staggered = world.bricks.iter().any(|b| b.position.x > 0);
+        assert!(staggered, "tiny spacing must depth-stagger");
+        assert_eq!(world.wires.len() % 16, 0);
+        assert_eq!(world.wires.len() / 16, 5, "Offset Z variable dropped");
     }
 
     #[test]
@@ -1290,11 +1327,12 @@ mod tests {
         add_text_bricks(&mut world, bands, &opts);
 
         assert_eq!(world.bricks.len(), 3);
-        // a single tile anchors at z=1; extra band cubes go BACKWARD (world
-        // +X) at constant footprint, their text returning via local Z
-        assert_eq!(world.bricks[0].position, Position::new(0, 0, 1));
+        // a single tile anchors at z=1; band 0's cube sits on the front
+        // plane (world +X faces the viewer) and extra bands step backward
+        // toward x=0, their text returning via local Z
+        assert_eq!(world.bricks[0].position, Position::new(4, 0, 1));
         assert_eq!(world.bricks[1].position, Position::new(2, 0, 1));
-        assert_eq!(world.bricks[2].position, Position::new(4, 0, 1));
+        assert_eq!(world.bricks[2].position, Position::new(0, 0, 1));
         assert_eq!(world.bricks[0].components.len(), 1);
         for b in &world.bricks {
             assert!(!b.visible, "anchor bricks must be invisible");
