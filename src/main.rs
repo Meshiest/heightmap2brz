@@ -135,6 +135,21 @@ fn main() {
             invert: matches.is_present("invert"),
             ..d
         };
+        let text_opts = if text_opts.mode == PixelMode::Color {
+            text_opts
+        } else {
+            // mono modes use their own measured component geometry
+            let (line_height, kerning, line_offset, pitch_x, pitch_y) =
+                mono_geometry(text_opts.mode, pixel_size);
+            TextOptions {
+                line_height,
+                kerning,
+                line_offset,
+                pitch_x: pitch_x.unwrap_or(text_opts.pitch_x),
+                pitch_y,
+                ..text_opts
+            }
+        };
         if text_opts.char_repeat == 0 {
             return error!("char-repeat must be at least 1");
         }

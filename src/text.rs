@@ -1,8 +1,8 @@
 use brdb::{
-    AsBrdbValue, BrdbSchemaError, Brick, BrickSize, BrickType, Collision, Color, Position,
-    PrefabJson, SavedBrickColor, Vector3f, World,
+    AsBrdbValue, BrdbSchemaError, Brick, BrickSize, BrickType, Collision, Color, Direction,
+    Position, PrefabJson, SavedBrickColor, Vector3f, WirePort, World,
     assets::{LiteralComponent, bricks::PB_DEFAULT_MICRO_BRICK},
-    schema::{BrdbInterned, BrdbSchema, BrdbValue},
+    schema::{BrdbInterned, BrdbSchema, BrdbValue, WireVariant},
 };
 use image::RgbaImage;
 
@@ -68,17 +68,20 @@ impl FontPreset {
             offset_y: -0.2 * pixel_size,
             // one cube depth: text sits in front of the anchor wall
             offset_z: 2.0,
-            pitch_scale: 1.0,
+            pitch_x: 1.0,
+            pitch_y: 1.0,
             mode: PixelMode::Color,
             luma_threshold: 128,
             invert: false,
+            tile_override: None,
         };
         match self {
             // at LineHeight 0.61 Monaspace renders 30/32 of the nominal
             // pixel size (measured in-game via uniform one-cube tile gaps):
             // the brick grid spacing shrinks to match the rendering
             FontPreset::MonaspaceArgon => TextOptions {
-                pitch_scale: 30.0 / 32.0,
+                pitch_x: 30.0 / 32.0,
+                pitch_y: 30.0 / 32.0,
                 ..base
             },
             FontPreset::IosevkaTerm => base,
@@ -120,17 +123,42 @@ pub struct TextOptions {
     /// Component Offset.Z — out-of-plane: pushes the text off the anchor
     /// wall's face so the cubes hide behind the image.
     pub offset_z: f32,
-    /// Rendered size / nominal pixel size: the brick grid's tile spacing is
-    /// `tile_px × line_world_height × pitch_scale`, matching how large the
-    /// font actually draws a tile (calibrated in-game from tile gaps:
-    /// gaps ⇒ lower, overlaps ⇒ raise).
-    pub pitch_scale: f32,
+    /// Horizontal rendered size / nominal pixel size: tile spacing along the
+    /// image's X is `tile_px × line_world_height × pitch_x` (gaps between
+    /// tile columns ⇒ lower, overlaps ⇒ raise).
+    pub pitch_x: f32,
+    /// Vertical counterpart (gap Y): tile row spacing scale. Mono modes'
+    /// glyph cells are not square, so the two differ there.
+    pub pitch_y: f32,
     /// How pixels become glyphs (full color, or monochrome braille/blocks).
     pub mode: PixelMode,
     /// Monochrome modes: pixels at least this bright are drawn.
     pub luma_threshold: u8,
     /// Monochrome modes: draw dark pixels instead of bright ones.
     pub invert: bool,
+    /// Override the mode's tile edge in pixels (None = mode default). The
+    /// calibration grid uses this to force seams in mono modes.
+    pub tile_override: Option<u32>,
+}
+
+impl TextOptions {
+    /// Tile edge in pixels for this configuration.
+    pub fn tile_px(&self) -> u32 {
+        self.tile_override.unwrap_or(self.mode.tile_px())
+    }
+}
+
+/// Component geometry for the monochrome modes, measured in-game
+/// (2026-07-04), returned as (font size, kerning, line offset, pitch_x,
+/// pitch_y): braille wants font size 2.7 with kerning -4 and a constant
+/// LineOffset of -8 (gap X from the font preset); blocks wants font size
+/// 1.08, gap X 0.41, and matches the normal mode's zeroes. Both use gap Y
+/// 0.8125.
+pub fn mono_geometry(mode: PixelMode, pixel_size: f32) -> (f32, f32, f32, Option<f32>, f32) {
+    match mode {
+        PixelMode::Braille => (2.7 * pixel_size, -4.0 * pixel_size, -8.0, None, 0.8125),
+        _ => (1.08 * pixel_size, 0.0, 0.0, Some(0.41), 0.8125),
+    }
 }
 
 impl Default for TextOptions {
@@ -354,7 +382,7 @@ pub struct TextTile {
 /// brick, no component.
 pub fn encode_tiles(img: &RgbaImage, opts: &TextOptions) -> Result<Vec<TextTile>, String> {
     let (w, h) = img.dimensions();
-    let tile_px = opts.mode.tile_px();
+    let tile_px = opts.tile_px();
     let mut tiles = Vec::new();
     let mut ty = 0u32;
     while ty < h {
@@ -471,40 +499,6 @@ impl AsBrdbValue for Vector2f {
     }
 }
 
-/// Measured font geometry, in world units per LineHeight unit. Read these
-/// off the measuring save's rulers once per font; every pixel size then
-/// solves exactly instead of being nudged iteratively.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FontMetrics {
-    /// Vertical world units the game advances per text line, per LineHeight.
-    pub line_advance: f32,
-    /// Horizontal world units one `█` advances (kerning 0), per LineHeight.
-    pub char_advance: f32,
-}
-
-impl FontMetrics {
-    /// Rows/columns in the measuring block (measured at LineHeight 1.0).
-    pub const MEASURE_ROWS: usize = 10;
-
-    /// Metrics from the measuring block's spans in world units: the height
-    /// of its 10 rows and the width of its 10 single-`█` columns.
-    pub fn from_measured(vertical_span: f32, horizontal_span: f32) -> Self {
-        Self {
-            line_advance: vertical_span / Self::MEASURE_ROWS as f32,
-            char_advance: horizontal_span / Self::MEASURE_ROWS as f32,
-        }
-    }
-
-    /// Solve (LineHeight, Kerning) so one pixel is exactly `pixel_size`
-    /// world units tall and `char_repeat` glyphs are exactly as wide.
-    pub fn solve(&self, pixel_size: f32, char_repeat: usize) -> (f32, f32) {
-        let line_height = pixel_size / self.line_advance;
-        let kerning =
-            pixel_size / char_repeat.max(1) as f32 - self.char_advance * line_height;
-        (line_height, kerning)
-    }
-}
-
 /// The invisible, collision-less anchor cube all text rides on.
 fn anchor_cube(position: Position, visible: bool) -> Brick {
     Brick {
@@ -548,9 +542,24 @@ pub fn add_text_block(
         kerning,
         ..opts.clone()
     };
-    world.add_brick(anchor_cube(position, visible_anchor).with_component(
-        text_display_component(text, font_idx, offset, &block_opts),
-    ));
+    world.add_brick(
+        anchor_cube(position, visible_anchor).with_component(text_display_component(
+            text,
+            font_idx,
+            offset,
+            &block_opts,
+            0,
+            SavedBrickColor {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
+            Vector2f { x: 0.0, y: 0.0 },
+            0,
+            0,
+        )),
+    );
 }
 
 /// Add a readable TextDisplay label brick (for annotating generated saves) —
@@ -568,167 +577,187 @@ pub fn add_annotation(
         position,
         line_height,
         0.0,
-        Vector3f { x: 0.0, y: 0.0, z: 0.0 },
+        Vector3f {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
         false,
         opts,
     );
 }
 
-/// A visible ruler cube (2 world units) for measuring against the stud grid.
-fn ruler_cube(position: Position, red: bool) -> Brick {
-    let mut b = anchor_cube(position, true);
-    b.color = if red {
-        Color { r: 255, g: 60, b: 60 }
-    } else {
-        Color { r: 250, g: 250, b: 250 }
-    };
-    b
+/// Brickadia's number Variable gate brick.
+const B_GATE_VARIABLE: BrickType = BrickType::str("B_1x1_Gate_Variable");
+
+/// The in-game tunable geometry fields: (label, TextDisplay wire port,
+/// current component value).
+fn calibration_variables(opts: &TextOptions) -> [(&'static str, &'static str, f32); 6] {
+    [
+        (
+            "Font
+Size",
+            "LineHeight",
+            opts.line_height,
+        ),
+        ("Kerning", "Kerning", opts.kerning),
+        (
+            "Line
+Offset",
+            "LineOffset",
+            opts.line_offset,
+        ),
+        (
+            "Offset
+X",
+            "Offset.X",
+            opts.offset_x,
+        ),
+        (
+            "Offset
+Y",
+            "Offset.Y",
+            opts.offset_y,
+        ),
+        (
+            "Offset
+Z",
+            "Offset.Z",
+            opts.offset_z,
+        ),
+    ]
 }
 
-/// Build the font-measuring save. Layout (all cubes at non-negative z):
-///
-/// - A 10×10 `█` measuring block at LineHeight 1.0 / Kerning 0 / Offset 0,
-///   with a vertical and horizontal ruler of alternating 2-unit cubes along
-///   its anchor edges. Reading the block's spans off the rulers gives
-///   [`FontMetrics`] directly (the GUI solves the rest).
-/// - A LineHeight sweep: five 8×8 checker blocks around the current solved
-///   LineHeight, each with a visible anchor cube and a marker cube at the
-///   expected bottom-right corner — the candidate whose checker exactly
-///   meets its marker is correct.
-/// - An Offset-Y sweep: five single-row strips on visible anchor cubes;
-///   pick the one whose glyph top aligns with its cube top.
-pub fn build_measuring_world(opts: &TextOptions) -> World {
-    const N: usize = FontMetrics::MEASURE_ROWS;
-    let px = opts.line_world_height;
-    let fill: String = opts.fill_char.to_string();
-    let fill_px: String = fill.repeat(opts.char_repeat.max(1));
+/// Build the live calibration save: a 128×128 checkerboard rendered exactly
+/// like a normal export (color, braille, and blocks modes alike), plus one
+/// number Variable gate per tunable geometry field, wired into EVERY text
+/// component — edit a variable in-game and the whole grid updates at once.
+/// Each variable carries an upward-facing (+Z) label so it's clear which is
+/// which. `cube_spacing` sets the world distance between tile anchors
+/// (tiny spacing = tiny text displays, large = billboards).
+pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
+    const CHECKER_PX: u32 = 128;
+    const CELL_PX: u32 = 8;
+
+    // force small tiles in every mode (mono modes normally use 128px tiles)
+    // so the checkerboard splits into a seamed grid — tile overlap/gaps are
+    // exactly what calibration needs to expose
+    let tile_px = TILE_PX.min(CHECKER_PX) as f32;
+    // scale the export geometry so a tile's rendering matches the requested
+    // anchor spacing (the variables re-tune everything live afterwards)
+    let s = cube_spacing / (tile_px * opts.line_world_height * opts.pitch_x);
+    let cal = TextOptions {
+        line_world_height: opts.line_world_height * s,
+        line_height: opts.line_height * s,
+        kerning: opts.kerning * s,
+        offset_x: opts.offset_x * s,
+        offset_y: opts.offset_y * s,
+        tile_override: Some(TILE_PX),
+        ..opts.clone()
+    };
+
+    // dark/light nested checkerboard: alternating 32px regions use single-
+    // and double-sized squares so scale errors read at two frequencies
+    let mut img = RgbaImage::new(CHECKER_PX, CHECKER_PX);
+    for y in 0..CHECKER_PX {
+        for x in 0..CHECKER_PX {
+            let cell = if ((x / 32) + (y / 32)) % 2 == 0 {
+                CELL_PX
+            } else {
+                CELL_PX * 2
+            };
+            let on = ((x / cell) + (y / cell)) % 2 == 0;
+            let c = if on {
+                [240, 240, 240, 255]
+            } else {
+                [40, 40, 40, 255]
+            };
+            img.put_pixel(x, y, image::Rgba(c));
+        }
+    }
+
     let mut world = World::new();
+    let tiles = encode_tiles(&img, &cal).expect("checkerboard must encode");
+    let text_ids = add_text_tiles(&mut world, tiles, &cal);
 
-    // ---- measuring block (single glyph per column, LineHeight 1.0) ----
-    let top = 90i32;
-    let measure_text = (0..N)
-        .map(|y| {
-            let c = if y % 2 == 0 { "FF3C3C" } else { "FAFAFA" };
-            format!("<color=\"{c}\">{}", fill.repeat(N))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    add_text_block(
-        &mut world,
-        measure_text,
-        Position::new(0, 0, top),
-        1.0,
-        0.0,
-        Vector3f { x: 0.0, y: 0.0, z: 0.0 },
-        true,
-        opts,
-    );
-    // rulers: vertical below the anchor, horizontal to its right
-    for i in 0..14i32 {
-        world.add_brick(ruler_cube(Position::new(0, 0, top - 2 - 2 * i), i % 2 == 0));
-        world.add_brick(ruler_cube(Position::new(2 + 2 * i, 0, top), i % 2 == 0));
+    // one visible Variable gate per tunable, in a labeled row above the grid
+    let (font_idx, _) = world
+        .global_data
+        .external_asset_references
+        .insert_full(("BrickFontDescriptor".to_string(), cal.font.to_string()));
+    let grid_top = world.bricks.iter().map(|b| b.position.z).max().unwrap_or(1) + 10;
+    let label_opts = TextOptions {
+        line_height: 2.5,
+        kerning: 0.0,
+        // labels are plain text: never apply the mono modes' cell scaling
+        mode: PixelMode::Color,
+        ..cal.clone()
+    };
+    let mut var_ids = Vec::new();
+    for (i, (label, _port, value)) in calibration_variables(&cal).into_iter().enumerate() {
+        let (brick, id) = Brick {
+            asset: B_GATE_VARIABLE,
+            position: Position::new(0, i as i32 * 20, grid_top),
+            // rotate the gate so its display (and label) faces the viewer
+            direction: Direction::XPositive,
+            // dark brick so the white label reads
+            color: Color {
+                r: 25,
+                g: 25,
+                b: 30,
+            },
+            ..Default::default()
+        }
+        .with_component(
+            LiteralComponent::new("BrickComponentType_WireGraphPseudo_Var").with_data([(
+                "Value",
+                Box::new(WireVariant::Number(value as f64)) as Box<dyn AsBrdbValue>,
+            )]),
+        )
+        .with_component(text_display_component(
+            label.to_string(),
+            font_idx,
+            Vector3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            &label_opts,
+            // the gate is rotated: its local top (+Z) faces the viewer
+            4,
+            // white with a black outline, on a dark brick
+            SavedBrickColor {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
+            // centered on the gate face
+            Vector2f { x: 0.5, y: 0.5 },
+            // bold
+            1,
+            // outlined
+            2,
+        ))
+        .with_id_split();
+        world.add_brick(brick);
+        var_ids.push(id);
     }
-    add_annotation(
-        &mut world,
-        format!(
-            "MEASURE ({}): block is {N} rows x {N} single-glyph columns at LineHeight 1.\n\
-             Read its height and width in world units off the rulers (1 cube = 2 units),\n\
-             enter both in the GUI (Measured V / Measured H) and hit Apply.",
-            opts.font
-        ),
-        Position::new(0, 0, top + 8),
-        1.2,
-        opts,
-    );
 
-    // ---- LineHeight sweep: 8x8 checkers with expected-corner markers ----
-    let sweep_z = 44i32;
-    let checker_px = 8usize;
-    let checker_text = (0..checker_px)
-        .map(|y| {
-            (0..checker_px)
-                .map(|x| {
-                    let c = if (x + y) % 2 == 0 { "FF3C3C" } else { "FAFAFA" };
-                    format!("<color=\"{c}\">{fill_px}")
-                })
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let expected = (checker_px as f32 * px).round() as i32;
-    for (i, scale) in [0.94f32, 0.97, 1.0, 1.03, 1.06].into_iter().enumerate() {
-        let lh = opts.line_height * scale;
-        let x = (i as f32 * (checker_px as f32 * px + 14.0)).round() as i32;
-        add_text_block(
-            &mut world,
-            checker_text.clone(),
-            Position::new(x, 0, sweep_z),
-            lh,
-            opts.kerning,
-            Vector3f { x: opts.offset_x, y: opts.offset_y, z: 0.0 },
-            true,
-            opts,
-        );
-        // marker cube whose top-left corner is the checker's expected
-        // bottom-right corner
-        world.add_brick(ruler_cube(
-            Position::new(x + expected + 1, 0, sweep_z - expected - 1),
-            true,
-        ));
-        add_annotation(
-            &mut world,
-            format!("LH {lh:.3}"),
-            Position::new(x, 0, sweep_z + 4),
-            1.0,
-            opts,
-        );
+    // wire every variable into every tile's text component
+    for (var_id, (_, port, _)) in var_ids.iter().zip(calibration_variables(&cal)) {
+        for &text_id in &text_ids {
+            world.add_wire_connection(
+                WirePort::new(*var_id, "BrickComponentType_WireGraphPseudo_Var", "Value"),
+                WirePort::new(text_id, "Component_TextDisplay", port),
+            );
+        }
     }
-    add_annotation(
-        &mut world,
-        "LINEHEIGHT SWEEP: pick the checker that exactly meets its corner marker."
-            .to_string(),
-        Position::new(0, 0, sweep_z + 8),
-        1.2,
-        opts,
-    );
 
-    // ---- Offset-Y sweep: glyph top vs cube top ----
-    let off_z = 12i32;
-    for (i, delta) in [-0.2f32, -0.1, 0.0, 0.1, 0.2].into_iter().enumerate() {
-        let off = opts.offset_y + delta * px;
-        let x = (i as f32 * (4.0 * px + 12.0)).round() as i32;
-        add_text_block(
-            &mut world,
-            format!("<color=\"FF3C3C\">{}", fill_px.repeat(4)),
-            Position::new(x, 0, off_z),
-            opts.line_height,
-            opts.kerning,
-            Vector3f { x: opts.offset_x, y: off, z: 0.0 },
-            true,
-            opts,
-        );
-        add_annotation(
-            &mut world,
-            format!("OffY {off:.3}"),
-            Position::new(x, 0, off_z + 4),
-            1.0,
-            opts,
-        );
-    }
-    add_annotation(
-        &mut world,
-        "OFFSET SWEEP: pick the strip whose glyph top sits flush with its cube top."
-            .to_string(),
-        Position::new(0, 0, off_z + 8),
-        1.2,
-        opts,
-    );
-
-    world.meta.bundle.description = "Text render font measuring tool".to_string();
-    world.make_prefab();
-    // brdb 0.6 requires used component types registered before writing;
-    // add_text_bricks does this itself but the measuring world is built from
-    // raw text blocks
+    world.meta.bundle.description = "Text render live calibration".to_string();
+    make_text_prefab(&mut world, CHECKER_PX, CHECKER_PX, &cal);
+    // re-register: the wires (and their port names) were added after
+    // add_text_tiles registered the component types
     world.register_used_components();
     world
 }
@@ -740,11 +769,12 @@ pub fn build_measuring_world(opts: &TextOptions) -> World {
 /// two edges — a ground placement then rests the image (not the cubes) on
 /// the ground.
 pub fn make_text_prefab(world: &mut World, _img_w: u32, _img_h: u32, opts: &TextOptions) {
-    let tile_span = (TILE_PX as f32 * opts.line_world_height * opts.pitch_scale).ceil() as i32;
+    let span_x = (TILE_PX as f32 * opts.line_world_height * opts.pitch_x).ceil() as i32;
+    let span_z = (TILE_PX as f32 * opts.line_world_height * opts.pitch_y).ceil() as i32;
     let (bmin, bmax) = world
         .brick_bounds()
         .unwrap_or((Position::ZERO, Position::ZERO));
-    let min = Position::new(bmin.x, bmin.y - tile_span, bmin.z - tile_span);
+    let min = Position::new(bmin.x, bmin.y - span_x, bmin.z - span_z);
     world.meta.bundle.level_type = "Prefab".to_string();
     world.meta.prefab = Some(PrefabJson::from_bounds(min, bmax));
 }
@@ -771,11 +801,11 @@ pub fn add_text_bricks(world: &mut World, bands: Vec<TextBand>, opts: &TextOptio
 /// position (brick coordinates carry ALL the placement — the game does not
 /// honor large component Offset values), forming a sparse cube grid with
 /// the same footprint as the image, always covered by the rendered text.
-/// A multi-band tile stacks its extra cubes upward from the tile anchor
-/// (staying non-negative for the bottom row), each band's text shifting
-/// back down by its cube's displacement. Component offsets carry only the
-/// glyph nudges and that tiny in-tile compensation.
-pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOptions) {
+/// A multi-band tile stacks its extra cubes BACKWARD (world +X, behind the
+/// wall) so the grid's vertical/horizontal footprint stays one cube per
+/// tile; their text returns to the common plane via local Z. Component
+/// offsets carry only the glyph nudges and these tiny compensations.
+pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOptions) -> Vec<usize> {
     // Index into global_data.external_asset_references, written as the Font
     // object reference (same pattern bearilog uses for item assets).
     let (font_idx, _) = world
@@ -784,42 +814,82 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
         .insert_full(("BrickFontDescriptor".to_string(), opts.font.to_string()));
 
     // grid spacing follows the font's ACTUAL rendered size, not the nominal
-    // pixel size — tiles anchor exactly where their neighbors' glyphs end
-    let pitch = opts.line_world_height * opts.pitch_scale;
-    let max_row = tiles.iter().map(|t| t.start_row).max().unwrap_or(0) as f32;
+    // pixel size — tiles anchor where their neighbors' glyphs end. Cubes are
+    // 2 units wide, so the CUBE grid never steps below 2 (and vertically
+    // below the tallest in-tile band stack): at tiny pixel sizes the cubes
+    // spread wider than the rendering, and each tile's text is shifted back
+    // to its true position via its local offsets (small by construction).
+    let tile_px = opts.tile_px() as usize;
+    let step_true_x = tile_px as f32 * opts.line_world_height * opts.pitch_x;
+    let step_true_z = tile_px as f32 * opts.line_world_height * opts.pitch_y;
+    let step_y = (step_true_x.ceil() as i32).max(2);
+    let step_z = (step_true_z.ceil() as i32).max(2);
+    // per-tile-index displacement between the cube grid and the rendering
+    let drift_y = step_y as f32 - step_true_x;
+    let drift_z = step_z as f32 - step_true_z;
+
     // brdb's chunk encoding mishandles negative coordinates (bricks land in
     // wrong chunks in-game), so the grid is translated to keep EVERY brick
     // coordinate non-negative: the rightmost tile sits at y=0 and the image
     // grows toward +Y (the text's right is world -Y, so the order mirrors).
-    let max_col_span = tiles
+    let max_kx = tiles
         .iter()
-        .map(|t| (t.start_col as f32 * pitch).round() as i32)
+        .map(|t| t.start_col / tile_px)
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0) as i32;
+    let max_ky = tiles
+        .iter()
+        .map(|t| t.start_row / tile_px)
+        .max()
+        .unwrap_or(0) as i32;
     let mut bricks = Vec::new();
+    let mut ids = Vec::new();
     for tile in tiles {
-        let y = max_col_span - (tile.start_col as f32 * pitch).round() as i32;
+        let kx = max_kx - (tile.start_col / tile_px) as i32;
+        let ky = max_ky - (tile.start_row / tile_px) as i32;
+        let y = kx * step_y;
         // bottom tile row anchors at z=1; rows above it proportionally higher
-        let z_tile = 1 + ((max_row - tile.start_row as f32) * pitch).round() as i32;
+        let z_tile = 1 + ky * step_z;
         for (i, band) in tile.bands.into_iter().enumerate() {
             let i = i as i32;
             let offset = Vector3f {
-                x: opts.offset_x,
-                // extra band cubes sit above the anchor; shift their text
-                // back down (negative Y = down)
-                y: opts.offset_y - (BRICK_STACK_STEP * i) as f32,
-                z: opts.offset_z,
+                // cube spread past the rendering pulls the text back right
+                // (local +X = world -Y)
+                x: opts.offset_x + kx as f32 * drift_y,
+                // ...and back down (negative local Y = down)
+                y: opts.offset_y - ky as f32 * drift_z,
+                // extra band cubes sit deeper (world +X) so the grid keeps a
+                // constant footprint; their text comes back to the common
+                // plane via local Z
+                z: opts.offset_z + (BRICK_STACK_STEP * i) as f32,
             };
-            bricks.push(
-                anchor_cube(Position::new(0, y, z_tile + BRICK_STACK_STEP * i), false)
-                    .with_component(text_display_component(band.text, font_idx, offset, opts)),
-            );
+            let (brick, id) = anchor_cube(Position::new(BRICK_STACK_STEP * i, y, z_tile), false)
+                .with_component(text_display_component(
+                    band.text,
+                    font_idx,
+                    offset,
+                    opts,
+                    0,
+                    SavedBrickColor {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                        a: 255,
+                    },
+                    Vector2f { x: 0.0, y: 0.0 },
+                    0,
+                    0,
+                ))
+                .with_id_split();
+            ids.push(id);
+            bricks.push(brick);
         }
     }
     world.add_bricks(bricks);
     // brdb 0.6 requires used component types registered in global data before
     // writing; rebuilds from the max schema, so calling once at the end is fine.
     world.register_used_components();
+    ids
 }
 
 /// TextDisplay component data mirroring the user's calibrated reference
@@ -830,31 +900,23 @@ fn text_display_component(
     font_idx: usize,
     offset: Vector3f,
     opts: &TextOptions,
+    face: u8,
+    color: SavedBrickColor,
+    anchor: Vector2f,
+    typeface: u8,
+    outline: u8,
 ) -> LiteralComponent {
     LiteralComponent::new("Component_TextDisplay").with_data([
         ("Text", Box::new(text) as Box<dyn AsBrdbValue>),
         ("Font", Box::new(BrdbValue::Asset(Some(font_idx)))),
-        ("Anchor", Box::new(Vector2f { x: 0.0, y: 0.0 })),
+        ("Anchor", Box::new(anchor)),
         ("Offset", Box::new(offset)),
         ("Rotation", Box::new(0.0f32)),
         ("Skew", Box::new(0.0f32)),
         ("Kerning", Box::new(opts.kerning)),
-        // one text line spans `cell height` pixel rows (braille chars are 4
-        // pixels tall, quadrant blocks 2), so the glyphs scale to match
-        (
-            "LineHeight",
-            Box::new(opts.line_height * opts.mode.cell().1 as f32),
-        ),
+        ("LineHeight", Box::new(opts.line_height)),
         ("LineOffset", Box::new(opts.line_offset)),
-        (
-            "Color",
-            Box::new(SavedBrickColor {
-                r: 255,
-                g: 255,
-                b: 255,
-                a: 255,
-            }),
-        ),
+        ("Color", Box::new(color)),
         ("MaterialSlider", Box::new(10i32)),
         ("ShadingWidth", Box::new(2.0f32)),
         (
@@ -872,15 +934,15 @@ fn text_display_component(
         ("GraffitiAngleLimit", Box::new(45.0f32)),
         ("GraffitiLayer", Box::new(0i32)),
         ("bEnabled", Box::new(true)),
-        ("Face", Box::new(0u8)),
+        ("Face", Box::new(face)),
         ("bAlignToWedge", Box::new(false)),
         ("bOverrideColor", Box::new(true)),
-        ("Typeface", Box::new(0u8)),
+        ("Typeface", Box::new(typeface)),
         ("Billboard", Box::new(0u8)),
         ("Material", Box::new(0u8)),
         ("Shading", Box::new(0u8)),
         ("bFlipShading", Box::new(false)),
-        ("Outline", Box::new(0u8)),
+        ("Outline", Box::new(outline)),
         ("bSharpCorners", Box::new(true)),
         ("bSharpOutlines", Box::new(true)),
         ("bOverrideOutlineColor", Box::new(true)),
@@ -1043,16 +1105,16 @@ mod tests {
         // (text right = world -Y ⇒ rightmost tile at y=0, image grows +Y;
         // brdb's negative-chunk encoding is unreliable in-game); z descends
         // with start_row from the top tile row (bottom row at z=1); extra
-        // band cubes stack directly above their tile anchor
+        // band cubes go BACKWARD (world +X) at constant y/z footprint
         let d = TextOptions::default();
-        let pitch = d.line_world_height * d.pitch_scale;
-        let max_span = (64.0 * pitch).round() as i32;
+        let pitch = d.line_world_height * d.pitch_x;
+        let step = (32.0 * pitch).ceil().max(2.0) as i32;
         let per_tile: Vec<(i32, i32, i32)> = tiles
             .iter()
             .map(|t| {
                 (
-                    max_span - (t.start_col as f32 * pitch).round() as i32,
-                    1 + ((64 - t.start_row as i32) as f32 * pitch).round() as i32,
+                    (2 - (t.start_col / 32) as i32) * step,
+                    1 + (2 - (t.start_row / 32) as i32) * step,
                     t.bands.len() as i32,
                 )
             })
@@ -1060,21 +1122,19 @@ mod tests {
         let mut world = brdb::World::new();
         add_text_tiles(&mut world, tiles, &TextOptions::default());
         for (y, z_tile, n) in per_tile {
-            let mut zs: Vec<i32> = world
+            let mut xs: Vec<i32> = world
                 .bricks
                 .iter()
-                .filter(|b| {
-                    b.position.y == y && b.position.z >= z_tile && b.position.z < z_tile + 2 * n
-                })
-                .map(|b| b.position.z)
+                .filter(|b| b.position.y == y && b.position.z == z_tile)
+                .map(|b| b.position.x)
                 .collect();
-            zs.sort_unstable();
-            let expected: Vec<i32> = (0..n).map(|i| z_tile + 2 * i).collect();
-            assert_eq!(zs, expected, "tile at y={y} anchors at z={z_tile}");
+            xs.sort_unstable();
+            let expected: Vec<i32> = (0..n).map(|i| 2 * i).collect();
+            assert_eq!(xs, expected, "tile at y={y} z={z_tile}: bands go +X");
         }
         assert!(world.bricks.iter().all(|b| b.position.z >= 1));
-        assert!(world.bricks.iter().all(|b| b.position.x == 0));
         // every coordinate must be non-negative (brdb negative-chunk bug)
+        assert!(world.bricks.iter().all(|b| b.position.x >= 0));
         assert!(world.bricks.iter().all(|b| b.position.y >= 0));
     }
 
@@ -1127,6 +1187,40 @@ mod tests {
     }
 
     #[test]
+    fn tiny_pixel_sizes_never_overlap_cubes() {
+        // 0.02 units/px: a 32px tile renders ~0.6 units wide, far below the
+        // 2-unit cube size — the cube grid must clamp to non-overlapping
+        // steps while the text compensates via offsets
+        let opts = TextOptions {
+            line_world_height: 0.02,
+            ..Default::default()
+        };
+        let mut i = RgbaImage::new(96, 96);
+        for y in 0..96 {
+            for x in 0..96 {
+                i.put_pixel(x, y, if (x / 8 + y / 8) % 2 == 0 { RED } else { GREEN });
+            }
+        }
+        let tiles = encode_tiles(&i, &opts).unwrap();
+        let mut world = brdb::World::new();
+        add_text_tiles(&mut world, tiles, &opts);
+        let mut positions: Vec<(i32, i32, i32)> = world
+            .bricks
+            .iter()
+            .map(|b| (b.position.x, b.position.y, b.position.z))
+            .collect();
+        let n = positions.len();
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(positions.len(), n, "no two cubes may share a position");
+        // adjacent cube columns/rows sit exactly one cube apart
+        let mut ys: Vec<i32> = world.bricks.iter().map(|b| b.position.y).collect();
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys, vec![0, 2, 4]);
+    }
+
+    #[test]
     fn fully_transparent_tiles_are_skipped() {
         // 64×32: left half opaque, right half fully transparent
         let mut i = RgbaImage::new(64, 32);
@@ -1151,20 +1245,34 @@ mod tests {
     }
 
     #[test]
-    fn font_metrics_solve() {
-        // measured: 10 rows span 16.4 units, 10 cols span 8.2 units at LH 1
-        let m = FontMetrics::from_measured(16.4, 8.2);
-        let (lh, kerning) = m.solve(1.0, 2);
-        // line advance 1.64/LH ⇒ LH ≈ 0.6098 for 1 unit rows
-        assert!((lh - 1.0 / 1.64).abs() < 1e-6);
-        // two glyphs at 0.82/LH each must fit 1 unit ⇒ kerning closes the gap
-        assert!((kerning - (0.5 - 0.82 * lh)).abs() < 1e-6);
-        // a measuring world builds, stays non-negative z, and actually
-        // serializes (catches missing component registration)
-        let world = build_measuring_world(&TextOptions::default());
+    fn calibration_world_wires_variables_to_all_tiles() {
+        // color mode: 128px checker / 32px tiles = 16 text cubes
+        let world = build_calibration_world(&TextOptions::default(), 30.0);
+        let text_cubes = world
+            .bricks
+            .iter()
+            .filter(|b| matches!(b.asset, BrickType::Procedural { .. }))
+            .count();
+        let vars = world.bricks.len() - text_cubes;
+        assert_eq!(text_cubes, 16, "4x4 tile grid");
+        assert_eq!(vars, 6, "one variable gate per tunable");
+        assert_eq!(world.wires.len(), 6 * 16, "every var wired to every tile");
         assert!(world.bricks.iter().all(|b| b.position.z >= 0));
-        assert!(world.bricks.len() > 40, "block + rulers + sweeps present");
-        world.to_brz_vec().expect("measuring world must encode to brz");
+        world
+            .to_brz_vec()
+            .expect("calibration world must encode to brz");
+
+        // braille mode: tiles are forced down to 32px so seams exist to
+        // check — same 4x4 grid, fully wired
+        let opts = TextOptions {
+            mode: PixelMode::Braille,
+            ..Default::default()
+        };
+        let world = build_calibration_world(&opts, 120.0);
+        assert_eq!(world.wires.len(), 6 * 16);
+        world
+            .to_brz_vec()
+            .expect("braille calibration world must encode to brz");
     }
 
     #[test]
@@ -1182,11 +1290,11 @@ mod tests {
         add_text_bricks(&mut world, bands, &opts);
 
         assert_eq!(world.bricks.len(), 3);
-        // a single tile anchors at z=1; extra band cubes stack upward from
-        // the anchor (their text shifts back down via the component Offset)
+        // a single tile anchors at z=1; extra band cubes go BACKWARD (world
+        // +X) at constant footprint, their text returning via local Z
         assert_eq!(world.bricks[0].position, Position::new(0, 0, 1));
-        assert_eq!(world.bricks[1].position, Position::new(0, 0, 3));
-        assert_eq!(world.bricks[2].position, Position::new(0, 0, 5));
+        assert_eq!(world.bricks[1].position, Position::new(2, 0, 1));
+        assert_eq!(world.bricks[2].position, Position::new(4, 0, 1));
         assert_eq!(world.bricks[0].components.len(), 1);
         for b in &world.bricks {
             assert!(!b.visible, "anchor bricks must be invisible");
@@ -1199,11 +1307,9 @@ mod tests {
                 "anchor bricks must have no collision"
             );
         }
-        assert!(
-            world
-                .global_data
-                .external_asset_references
-                .contains(&("BrickFontDescriptor".to_string(), "MonaspaceArgon".to_string()))
-        );
+        assert!(world.global_data.external_asset_references.contains(&(
+            "BrickFontDescriptor".to_string(),
+            "MonaspaceArgon".to_string()
+        )));
     }
 }

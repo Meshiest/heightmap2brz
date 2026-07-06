@@ -4,15 +4,14 @@ use crate::{
         util::{PickedImage, deliver_save, pick_images, thumb},
     },
     text::{
-        FontMetrics, FontPreset, PixelMode, TextOptions, add_text_tiles, build_measuring_world,
-        encode_tiles, make_text_prefab,
+        FontPreset, PixelMode, TILE_PX, TextOptions, add_text_tiles, build_calibration_world,
+        encode_tiles, make_text_prefab, mono_geometry,
     },
 };
 use brdb::World;
 use egui::{Button, Color32, Ui};
 use log::{error, info};
 use poll_promise::Promise;
-use std::collections::HashMap;
 
 pub struct TextApp {
     image: Option<PickedImage>,
@@ -30,15 +29,13 @@ pub struct TextApp {
     offset_x: f32,
     offset_y: f32,
     offset_z: f32,
-    pitch_scale: f32,
+    pitch_x: f32,
+    pitch_y: f32,
     mode: PixelMode,
     luma_threshold: u8,
     invert: bool,
-    // measured spans of the measuring block (world units) and per-font
-    // metrics solved from them
-    measured_v: f32,
-    measured_h: f32,
-    metrics: HashMap<&'static str, FontMetrics>,
+    /// world units between calibration tile anchors (tiny = tiny displays)
+    cube_spacing: u32,
 }
 
 impl Default for TextApp {
@@ -60,13 +57,12 @@ impl Default for TextApp {
             offset_x: d.offset_x,
             offset_y: d.offset_y,
             offset_z: d.offset_z,
-            pitch_scale: d.pitch_scale,
+            pitch_x: d.pitch_x,
+            pitch_y: d.pitch_y,
             mode: d.mode,
             luma_threshold: d.luma_threshold,
             invert: d.invert,
-            measured_v: 0.0,
-            measured_h: 0.0,
-            metrics: HashMap::new(),
+            cube_spacing: 30,
         }
     }
 }
@@ -85,7 +81,8 @@ impl TextApp {
             offset_x: self.offset_x,
             offset_y: self.offset_y,
             offset_z: self.offset_z,
-            pitch_scale: self.pitch_scale,
+            pitch_x: self.pitch_x,
+            pitch_y: self.pitch_y,
             mode: self.mode,
             luma_threshold: self.luma_threshold,
             invert: self.invert,
@@ -107,39 +104,44 @@ impl TextApp {
         self.offset_x = d.offset_x;
         self.offset_y = d.offset_y;
         self.offset_z = d.offset_z;
-        self.pitch_scale = d.pitch_scale;
-        if let Some(m) = self.metrics.get(self.preset.font_asset()) {
-            let (lh, kerning) = m.solve(self.pixel_size, self.char_repeat);
+        self.pitch_x = d.pitch_x;
+        self.pitch_y = d.pitch_y;
+        self.seed_mode_geometry();
+        self.cube_spacing = self.natural_spacing();
+    }
+
+    /// The mono modes use their own measured component geometry; reseed the
+    /// calibration fields whenever the mode (or preset/pixel size) changes.
+    fn seed_mode_geometry(&mut self) {
+        if self.mode != PixelMode::Color {
+            let (lh, kerning, line_offset, pitch_x, pitch_y) =
+                mono_geometry(self.mode, self.pixel_size);
             self.line_height = lh;
             self.kerning = kerning;
+            self.line_offset = line_offset;
+            if let Some(pitch_x) = pitch_x {
+                self.pitch_x = pitch_x;
+            }
+            self.pitch_y = pitch_y;
         }
     }
 
-    /// Solve the calibration from the measured block spans and apply it.
-    fn apply_measurements(&mut self) {
-        if self.measured_v <= 0.0 || self.measured_h <= 0.0 {
-            return error!("enter the measured V and H spans (world units) first");
-        }
-        let m = FontMetrics::from_measured(self.measured_v, self.measured_h);
-        self.metrics.insert(self.preset.font_asset(), m);
-        let (lh, kerning) = m.solve(self.pixel_size, self.char_repeat);
-        self.line_height = lh;
-        self.kerning = kerning;
-        info!(
-            "{}: line advance {:.4}/LH, char advance {:.4}/LH -> LineHeight {:.4}, Kerning {:.4}",
-            self.preset.name(),
-            m.line_advance,
-            m.char_advance,
-            lh,
-            kerning
-        );
+    /// The calibration grid spacing matching the current mode, pixel size,
+    /// and grid pitch — one tile's rendered span.
+    fn natural_spacing(&self) -> u32 {
+        // the calibration grid always uses TILE_PX tiles (mono modes force
+        // seams), so spacing is one 32px tile's span regardless of mode
+        (TILE_PX as f32 * self.pixel_size * self.pitch_x)
+            .round()
+            .max(1.0) as u32
     }
 
-    /// Write the font-measuring save using the current calibration values.
-    fn generate_measuring(&self, shared: &SharedOptions) {
-        let world = build_measuring_world(&self.options());
-        let out_file = "measure.brz";
-        info!("Writing measuring save to {out_file}");
+    /// Write the live calibration save: a checkerboard grid with number
+    /// Variable gates wired into every text component for in-game tuning.
+    fn generate_calibration(&self, shared: &SharedOptions) {
+        let world = build_calibration_world(&self.options(), self.cube_spacing as f32);
+        let out_file = "calibrate.brz";
+        info!("Writing calibration save to {out_file}");
         let data = match world.to_brz_vec() {
             Ok(d) => d,
             Err(e) => return error!("failed to encode brz: {e}"),
@@ -147,8 +149,8 @@ impl TextApp {
         if let Err(e) = deliver_save(data, out_file, shared.out_clipboard) {
             return error!("{e}");
         }
-        info!("Paste it: read the 10x10 block's V/H spans off the rulers,");
-        info!("enter them below and Apply; the sweeps verify the result.");
+        info!("Paste it, then edit the labeled Variable gates in-game:");
+        info!("every tile updates live. Copy the dialed-in numbers back here.");
     }
 
     /// Encoding and writing are fast enough to run on the UI thread.
@@ -254,8 +256,14 @@ impl TextApp {
                     "Color: one colored glyph run per pixel. Braille: monochrome, 8 pixels per character. Blocks: monochrome quadrants, 4 per character",
                 );
                 ui.horizontal(|ui| {
+                    let mut mode_changed = false;
                     for m in PixelMode::ALL {
-                        ui.radio_value(&mut self.mode, m, m.name());
+                        mode_changed |= ui.radio_value(&mut self.mode, m, m.name()).changed();
+                    }
+                    if mode_changed {
+                        // re-pull the preset's color geometry, then apply the
+                        // mono overrides when applicable
+                        self.load_preset();
                     }
                     if self.mode != PixelMode::Color {
                         ui.label("Luma");
@@ -275,7 +283,11 @@ impl TextApp {
                 ui.label("Pixel Size")
                     .on_hover_text("World units per pixel row (1.0 = calibrated glyph fit)");
                 if ui
-                    .add(egui::Slider::new(&mut self.pixel_size, 0.01..=8.0).text("units"))
+                    .add(
+                        egui::Slider::new(&mut self.pixel_size, 0.01..=8.0)
+                            .logarithmic(true)
+                            .text("units"),
+                    )
                     .changed()
                 {
                     self.load_preset();
@@ -288,9 +300,11 @@ impl TextApp {
                 );
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label("LineHeight");
+                        ui.label("Font Size");
                         ui.add(egui::DragValue::new(&mut self.line_height).speed(0.01))
-                            .on_hover_text("Font size: scales the glyphs");
+                            .on_hover_text(
+                                "The TextDisplay LineHeight field — the game's font size.                                  Scales the glyphs; presets derive it from Pixel Size",
+                            );
                         ui.label("LineOffset");
                         ui.add(egui::DragValue::new(&mut self.line_offset).speed(0.05));
                         ui.label("Kerning");
@@ -301,11 +315,6 @@ impl TextApp {
                         ui.add(egui::DragValue::new(&mut self.offset_x).speed(0.01));
                         ui.label("Offset Y");
                         ui.add(egui::DragValue::new(&mut self.offset_y).speed(0.01));
-                        ui.label("Grid Scale");
-                        ui.add(egui::DragValue::new(&mut self.pitch_scale).speed(0.002))
-                            .on_hover_text(
-                                "Brick-grid spacing as a fraction of the nominal pixel size, matching the font's actual rendered size. Tile gaps = lower it, overlaps = raise it",
-                            );
                         ui.label("Offset Z");
                         ui.add(egui::DragValue::new(&mut self.offset_z).speed(0.1))
                             .on_hover_text(
@@ -313,33 +322,39 @@ impl TextApp {
                             );
                     });
                     ui.horizontal(|ui| {
-                        if ui
-                            .button("Generate measuring save")
+                        ui.label("Gap X");
+                        ui.add(egui::DragValue::new(&mut self.pitch_x).speed(0.002))
                             .on_hover_text(
-                                "Writes measure.brz: a 10x10 glyph block at LineHeight 1 \
-                                 against brick rulers, plus LineHeight and Offset sweep \
-                                 grids with corner markers. Read the block's V/H spans off \
-                                 the rulers and enter them here.",
+                                "Horizontal tile spacing as a fraction of the nominal pixel size. Gaps between tile columns = lower it, overlaps = raise it",
+                            );
+                        ui.label("Gap Y");
+                        ui.add(egui::DragValue::new(&mut self.pitch_y).speed(0.002))
+                            .on_hover_text(
+                                "Vertical tile spacing as a fraction of the nominal pixel size. Gaps between tile rows = lower it, overlaps = raise it",
+                            );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Cube Spacing");
+                        ui.add(
+                            egui::Slider::new(&mut self.cube_spacing, 1..=512)
+                                .logarithmic(true)
+                                .text("units"),
+                        )
+                        .on_hover_text(
+                            "World distance between the calibration grid's anchor cubes: \
+                             tiny spacing = tiny text displays, large = billboards",
+                        );
+                        if ui
+                            .button("Generate calibration save")
+                            .on_hover_text(
+                                "Writes calibrate.brz: a 128px checkerboard rendered like a \
+                                 normal export (current mode included), with labeled number \
+                                 Variable gates wired into EVERY text component — edit a \
+                                 variable in-game and the whole grid updates live.",
                             )
                             .clicked()
                         {
-                            self.generate_measuring(shared);
-                        }
-                        ui.label("Measured V");
-                        ui.add(egui::DragValue::new(&mut self.measured_v).speed(0.05))
-                            .on_hover_text("Height of the 10-row block in world units");
-                        ui.label("Measured H");
-                        ui.add(egui::DragValue::new(&mut self.measured_h).speed(0.05))
-                            .on_hover_text("Width of the 10-column block in world units");
-                        if ui
-                            .button("Apply")
-                            .on_hover_text(
-                                "Solve LineHeight, Kerning, and Row Advance exactly from \
-                                 the measurements; remembered per font while the app runs",
-                            )
-                            .clicked()
-                        {
-                            self.apply_measurements();
+                            self.generate_calibration(shared);
                         }
                     });
                 });

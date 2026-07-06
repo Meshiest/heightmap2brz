@@ -19,7 +19,7 @@ egui_extras = { version = "0.33.3", features = [
 
 # native: full brdb (brz + sqlite-backed brdb), CLI deps, sync dialogs
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-brdb = "0.6.1"
+brdb = "0.6.3"
 rayon = "1.11.0"
 poll-promise = { version = "0.2.0", optional = true }
 clap = "2.33.0"
@@ -31,7 +31,7 @@ clipboard-win = { version = "5.4.1", features = [
 
 # web: brz-only brdb with the wasm clock, async dialogs, browser downloads
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-brdb = { version = "0.6.1", default-features = false, features = [
+brdb = { version = "0.6.3", default-features = false, features = [
   "brz",
   "wasm",
 ] }
