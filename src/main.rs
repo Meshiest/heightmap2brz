@@ -1,7 +1,7 @@
 pub mod map;
 pub mod opt;
-pub mod util;
 pub mod text;
+pub mod util;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{map::*, opt::*, text::*, util::*};
@@ -64,6 +64,7 @@ fn main() {
         (@arg blocks: --blocks "Text mode: monochrome quadrant-block glyphs (4 pixels per character)")
         (@arg lumathreshold: --("luma-threshold") +takes_value "Braille/blocks: pixels at least this bright are drawn (default 128)")
         (@arg invert: --invert "Braille/blocks: draw dark pixels instead of bright ones")
+        (@arg material: --material +takes_value "Text mode: material (unlit, graffiti, plastic, metallic, glow, translucent, glass; default unlit)")
     )
     .get_matches();
 
@@ -105,9 +106,31 @@ fn main() {
                 return error!("unknown font preset '{other}' (monaspace, iosevka, orbitron)");
             }
         };
+        let material = match matches
+            .value_of("material")
+            .map(|s| s.to_lowercase())
+            .as_deref()
+        {
+            None | Some("unlit") => TextMaterial::Unlit,
+            Some("graffiti") => TextMaterial::Graffiti,
+            Some("plastic") => TextMaterial::Plastic,
+            Some("metallic") | Some("metal") => TextMaterial::Metallic,
+            Some("glow") => TextMaterial::Glow,
+            Some("translucent") => TextMaterial::TranslucentPlastic,
+            Some("glass") => TextMaterial::Glass,
+            Some(other) => {
+                return error!(
+                    "unknown material '{other}' (unlit, graffiti, plastic, metallic, glow, \
+                     translucent, glass)"
+                );
+            }
+        };
         let pixel_size = matches
             .value_of("lineheight")
-            .map(|s| s.parse::<f32>().expect("line-height-world must be a number"))
+            .map(|s| {
+                s.parse::<f32>()
+                    .expect("line-height-world must be a number")
+            })
             .unwrap_or(1.0);
         let d = preset.options(pixel_size);
         let text_opts = TextOptions {
@@ -133,6 +156,7 @@ fn main() {
                 .map(|s| s.parse::<u8>().expect("luma-threshold must be 0-255"))
                 .unwrap_or(d.luma_threshold),
             invert: matches.is_present("invert"),
+            material,
             ..d
         };
         let text_opts = if text_opts.mode == PixelMode::Color {

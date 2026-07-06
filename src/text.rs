@@ -75,6 +75,17 @@ impl FontPreset {
             luma_threshold: 128,
             invert: false,
             tile_override: None,
+            // material defaults from the calibrated reference clipboards
+            // (they also match the game's own field defaults)
+            material: TextMaterial::Unlit,
+            material_intensity: 10,
+            scuff: 0.0,
+            graffiti_depth_limit: 5.0,
+            graffiti_angle_limit: 45.0,
+            graffiti_priority: 0,
+            shading: TextShading::None,
+            shading_width: 2.0,
+            invert_shading: false,
         };
         match self {
             // at LineHeight 0.61 Monaspace renders 30/32 of the nominal
@@ -98,6 +109,106 @@ impl FontPreset {
                 ..base
             },
         }
+    }
+}
+
+/// TextDisplay material (`EBRTextMaterial` — declaration order matches the
+/// game's enum values). Unlit and Graffiti have no shading settings; only
+/// Graffiti projects onto nearby bricks (depth/angle limit, priority).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextMaterial {
+    Unlit,
+    Graffiti,
+    Plastic,
+    Metallic,
+    Glow,
+    TranslucentPlastic,
+    Glass,
+}
+
+impl TextMaterial {
+    pub const ALL: [TextMaterial; 7] = [
+        TextMaterial::Unlit,
+        TextMaterial::Graffiti,
+        TextMaterial::Plastic,
+        TextMaterial::Metallic,
+        TextMaterial::Glow,
+        TextMaterial::TranslucentPlastic,
+        TextMaterial::Glass,
+    ];
+
+    /// Display name for UIs (matches the in-game dropdown).
+    pub fn name(&self) -> &'static str {
+        match self {
+            TextMaterial::Unlit => "Unlit",
+            TextMaterial::Graffiti => "Graffiti",
+            TextMaterial::Plastic => "Plastic",
+            TextMaterial::Metallic => "Metallic",
+            TextMaterial::Glow => "Glow",
+            TextMaterial::TranslucentPlastic => "Translucent Plastic",
+            TextMaterial::Glass => "Glass",
+        }
+    }
+
+    /// `EBRTextMaterial` enum value.
+    pub fn byte(&self) -> u8 {
+        *self as u8
+    }
+
+    /// The game enables the Material Intensity slider for every material
+    /// except Unlit and Plastic.
+    pub fn has_intensity(&self) -> bool {
+        !matches!(self, TextMaterial::Unlit | TextMaterial::Plastic)
+    }
+
+    /// Only Graffiti projects: depth limit, angle limit, and priority.
+    pub fn is_graffiti(&self) -> bool {
+        matches!(self, TextMaterial::Graffiti)
+    }
+
+    /// Shading settings are not available for Unlit or Graffiti.
+    pub fn has_shading(&self) -> bool {
+        !matches!(self, TextMaterial::Unlit | TextMaterial::Graffiti)
+    }
+}
+
+/// TextDisplay edge shading style (`EBRTextShading` — declaration order
+/// matches the game's enum values). Unavailable for Unlit/Graffiti.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextShading {
+    None,
+    Chamfer,
+    Fillet,
+    DoubleChamfer,
+    DoubleFillet,
+    Rounded,
+}
+
+impl TextShading {
+    pub const ALL: [TextShading; 6] = [
+        TextShading::None,
+        TextShading::Chamfer,
+        TextShading::Fillet,
+        TextShading::DoubleChamfer,
+        TextShading::DoubleFillet,
+        TextShading::Rounded,
+    ];
+
+    /// Display name for UIs (matches the in-game dropdown).
+    pub fn name(&self) -> &'static str {
+        match self {
+            TextShading::None => "None",
+            TextShading::Chamfer => "Chamfer",
+            TextShading::Fillet => "Fillet",
+            TextShading::DoubleChamfer => "Double Chamfer",
+            TextShading::DoubleFillet => "Double Fillet",
+            TextShading::Rounded => "Rounded",
+        }
+    }
+
+    /// `EBRTextShading` enum value.
+    pub fn byte(&self) -> u8 {
+        *self as u8
     }
 }
 
@@ -140,6 +251,25 @@ pub struct TextOptions {
     /// Override the mode's tile edge in pixels (None = mode default). The
     /// calibration grid uses this to force seams in mono modes.
     pub tile_override: Option<u32>,
+    /// Component material.
+    pub material: TextMaterial,
+    /// Material Intensity — glow brightness / metal, glass, translucency
+    /// strength. Inert for Unlit and Plastic.
+    pub material_intensity: i32,
+    /// Scuff width — worn-edge wear on the glyphs.
+    pub scuff: f32,
+    /// Graffiti only: projection depth limit in cm.
+    pub graffiti_depth_limit: f32,
+    /// Graffiti only: projection angle limit in degrees.
+    pub graffiti_angle_limit: f32,
+    /// Graffiti only: projection priority (the component's GraffitiLayer).
+    pub graffiti_priority: i32,
+    /// Edge shading style. Unavailable for Unlit/Graffiti.
+    pub shading: TextShading,
+    /// Shading width.
+    pub shading_width: f32,
+    /// Invert Shading (the component's bFlipShading).
+    pub invert_shading: bool,
 }
 
 impl TextOptions {
@@ -683,8 +813,12 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
 
     // sufficiently small displays depth-stagger their cubes, whose per-cube
     // Offset.Z compensation a shared wire would clobber — drop that
-    // variable entirely there
-    let staggered = world.bricks.iter().any(|b| b.position.x > 0);
+    // variable entirely there (the collidable graffiti canvas also sits at
+    // x > 0 without being a stagger, so only collisionless cubes count)
+    let staggered = world
+        .bricks
+        .iter()
+        .any(|b| b.position.x > 0 && !b.collision.player);
     let variables: Vec<_> = calibration_variables(&cal)
         .into_iter()
         .filter(|(_, port, _)| !(staggered && *port == "Offset.Z"))
@@ -701,6 +835,8 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
         kerning: 0.0,
         // labels are plain text: never apply the mono modes' cell scaling
         mode: PixelMode::Color,
+        // nor the image's material — a Graffiti/Glow label is unreadable
+        material: TextMaterial::Unlit,
         ..cal.clone()
     };
     let mut var_ids = Vec::new();
@@ -874,16 +1010,33 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
         for band in tile.bands {
             // take the shallowest free depth slot at this in-plane spot
             let mut depth = 0;
-            while placed.iter().any(|p| {
-                (p.x - depth).abs() < 2 && (p.y - y).abs() < 2 && (p.z - z_tile).abs() < 2
-            }) {
+            while placed
+                .iter()
+                .any(|p| (p.x - depth).abs() < 2 && (p.y - y).abs() < 2 && (p.z - z_tile).abs() < 2)
+            {
                 depth += BRICK_STACK_STEP;
             }
             placed.push(Position::new(depth, y, z_tile));
             pending.push((band, y, z_tile, depth, res_y, res_z));
         }
     }
-    let max_depth = pending.iter().map(|(_, _, _, d, _, _)| *d).max().unwrap_or(0);
+    let max_depth = pending
+        .iter()
+        .map(|(_, _, _, d, _, _)| *d)
+        .max()
+        .unwrap_or(0);
+    // graffiti renders only where it projects onto a collision surface, so
+    // those exports get an invisible collidable wall flush in front of the
+    // text plane. The wall must cover the content hanging one tile span
+    // below/right of the outermost anchors — and negative brick coordinates
+    // are forbidden, so the whole grid first shifts up/left by that overhang.
+    let span_y = step_true_x.ceil() as i32;
+    let span_z = step_true_z.ceil() as i32;
+    let (shift_y, shift_z) = if opts.material.is_graffiti() {
+        (span_y + 1, span_z + 1)
+    } else {
+        (0, 0)
+    };
     let mut bricks = Vec::new();
     let mut ids = Vec::new();
     for (band, y, z_tile, depth, res_y, res_z) in pending {
@@ -897,32 +1050,84 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
             // plane (all offset axes share the same world units)
             z: opts.offset_z + depth as f32,
         };
-        let (brick, id) = anchor_cube(Position::new(max_depth - depth, y, z_tile), false)
-            .with_component(text_display_component(
-                band.text,
-                font_idx,
-                offset,
-                opts,
-                0,
-                SavedBrickColor {
-                    r: 255,
-                    g: 255,
-                    b: 255,
-                    a: 255,
-                },
-                Vector2f { x: 0.0, y: 0.0 },
-                0,
-                0,
-            ))
-            .with_id_split();
+        let (brick, id) = anchor_cube(
+            Position::new(max_depth - depth, y + shift_y, z_tile + shift_z),
+            false,
+        )
+        .with_component(text_display_component(
+            band.text,
+            font_idx,
+            offset,
+            opts,
+            0,
+            SavedBrickColor {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
+            Vector2f { x: 0.0, y: 0.0 },
+            0,
+            0,
+        ))
+        .with_id_split();
         ids.push(id);
         bricks.push(brick);
+    }
+    if opts.material.is_graffiti() && !placed.is_empty() {
+        bricks.extend(graffiti_canvas(
+            &placed,
+            (max_depth, shift_y, shift_z),
+            (span_y, span_z),
+        ));
     }
     world.add_bricks(bricks);
     // brdb 0.6 requires used component types registered in global data before
     // writing; rebuilds from the max schema, so calling once at the end is fine.
     world.register_used_components();
     ids
+}
+
+/// Graffiti projects onto collision surfaces — build one: invisible,
+/// collidable micro-brick slabs covering the image rectangle (the anchor
+/// grid plus the one-tile content overhang toward -Y/-Z), their back faces
+/// flush against the text plane (the front cubes' viewer-side face).
+fn graffiti_canvas(
+    placed: &[Position],
+    (max_depth, shift_y, shift_z): (i32, i32, i32),
+    (span_y, span_z): (i32, i32),
+) -> Vec<Brick> {
+    // half-extent cap per slab, matching the heightmap generator's 250
+    // ceiling for procedural brick sizes
+    const MAX_HALF: i32 = 250;
+    let y_lo = placed.iter().map(|p| p.y).min().unwrap() + shift_y - 1 - span_y;
+    let y_hi = placed.iter().map(|p| p.y).max().unwrap() + shift_y + 1;
+    let z_lo = placed.iter().map(|p| p.z).min().unwrap() + shift_z - 1 - span_z;
+    let z_hi = placed.iter().map(|p| p.z).max().unwrap() + shift_z + 1;
+    // one micro unit thick, just past the front cubes' faces (x=max_depth+1)
+    let x = max_depth + 2;
+    let mut slabs = Vec::new();
+    let mut z = z_lo;
+    while z < z_hi {
+        let hz = ((z_hi - z).min(2 * MAX_HALF) + 1) / 2;
+        let mut y = y_lo;
+        while y < y_hi {
+            let hy = ((y_hi - y).min(2 * MAX_HALF) + 1) / 2;
+            slabs.push(Brick {
+                asset: BrickType::Procedural {
+                    asset: PB_DEFAULT_MICRO_BRICK,
+                    size: BrickSize::new(1, hy as u16, hz as u16),
+                },
+                position: Position::new(x, y + hy, z + hz),
+                visible: false,
+                // default collision stays on: the wall is the canvas
+                ..Default::default()
+            });
+            y += 2 * hy;
+        }
+        z += 2 * hz;
+    }
+    slabs
 }
 
 /// TextDisplay component data mirroring the user's calibrated reference
@@ -950,8 +1155,8 @@ fn text_display_component(
         ("LineHeight", Box::new(opts.line_height)),
         ("LineOffset", Box::new(opts.line_offset)),
         ("Color", Box::new(color)),
-        ("MaterialSlider", Box::new(10i32)),
-        ("ShadingWidth", Box::new(2.0f32)),
+        ("MaterialSlider", Box::new(opts.material_intensity)),
+        ("ShadingWidth", Box::new(opts.shading_width)),
         (
             "OutlineColor",
             Box::new(SavedBrickColor {
@@ -962,19 +1167,19 @@ fn text_display_component(
             }),
         ),
         ("OutlineWidth", Box::new(2.0f32)),
-        ("ScuffWidth", Box::new(0.0f32)),
-        ("GraffitiDepthLimit", Box::new(5.0f32)),
-        ("GraffitiAngleLimit", Box::new(45.0f32)),
-        ("GraffitiLayer", Box::new(0i32)),
+        ("ScuffWidth", Box::new(opts.scuff)),
+        ("GraffitiDepthLimit", Box::new(opts.graffiti_depth_limit)),
+        ("GraffitiAngleLimit", Box::new(opts.graffiti_angle_limit)),
+        ("GraffitiLayer", Box::new(opts.graffiti_priority)),
         ("bEnabled", Box::new(true)),
         ("Face", Box::new(face)),
         ("bAlignToWedge", Box::new(false)),
         ("bOverrideColor", Box::new(true)),
         ("Typeface", Box::new(typeface)),
         ("Billboard", Box::new(0u8)),
-        ("Material", Box::new(0u8)),
-        ("Shading", Box::new(0u8)),
-        ("bFlipShading", Box::new(false)),
+        ("Material", Box::new(opts.material.byte())),
+        ("Shading", Box::new(opts.shading.byte())),
+        ("bFlipShading", Box::new(opts.invert_shading)),
         ("Outline", Box::new(outline)),
         ("bSharpCorners", Box::new(true)),
         ("bSharpOutlines", Box::new(true)),
@@ -1254,9 +1459,78 @@ mod tests {
             }
         }
         // in-plane placement stays true (rounded), so crowded cubes go deep
-        assert!(positions.iter().any(|p| p.0 > 0), "depth staggering engaged");
+        assert!(
+            positions.iter().any(|p| p.0 > 0),
+            "depth staggering engaged"
+        );
         assert!(positions.iter().all(|p| p.1 <= 2 && p.2 <= 3));
         assert!(positions.iter().all(|p| p.0 >= 0 && p.1 >= 0 && p.2 >= 0));
+    }
+
+    /// Graffiti projects onto collision surfaces, so those exports carry an
+    /// invisible collidable wall flush in front of the text plane, covering
+    /// the image rectangle — with the grid shifted up/left so the wall's
+    /// bricks stay in non-negative coordinates.
+    #[test]
+    fn graffiti_gets_invisible_collision_canvas() {
+        let opts = TextOptions {
+            material: TextMaterial::Graffiti,
+            ..Default::default()
+        };
+        // 33×33 → a 2×2 tile grid
+        let i = RgbaImage::from_pixel(33, 33, RED);
+        let tiles = encode_tiles(&i, &opts).unwrap();
+        let mut world = brdb::World::new();
+        add_text_tiles(&mut world, tiles, &opts);
+
+        let (slabs, cubes): (Vec<_>, Vec<_>) =
+            world.bricks.iter().partition(|b| b.collision.player);
+        assert!(!slabs.is_empty(), "graffiti must add a collision canvas");
+        assert!(slabs.iter().all(|b| !b.visible));
+        // the wall sits flush in front of the front plane's cube faces
+        let front = cubes.iter().map(|b| b.position.x).max().unwrap();
+        assert!(slabs.iter().all(|b| b.position.x == front + 2));
+        assert!(
+            world
+                .bricks
+                .iter()
+                .all(|b| b.position.x >= 0 && b.position.y >= 0 && b.position.z >= 0)
+        );
+        // the wall covers the anchor grid plus the one-tile content overhang
+        // beyond the outermost anchors toward -Y/-Z
+        let span = (32.0 * (30.0 / 32.0_f32)).ceil() as i32; // default preset
+        let (mut wy, mut wz) = ((i32::MAX, i32::MIN), (i32::MAX, i32::MIN));
+        for b in &slabs {
+            let BrickType::Procedural { size, .. } = &b.asset else {
+                panic!("canvas must be procedural");
+            };
+            wy = (
+                wy.0.min(b.position.y - size.y as i32),
+                wy.1.max(b.position.y + size.y as i32),
+            );
+            wz = (
+                wz.0.min(b.position.z - size.z as i32),
+                wz.1.max(b.position.z + size.z as i32),
+            );
+        }
+        let cy = cubes.iter().map(|b| b.position.y).collect::<Vec<_>>();
+        let cz = cubes.iter().map(|b| b.position.z).collect::<Vec<_>>();
+        let (cy_lo, cy_hi) = (*cy.iter().min().unwrap(), *cy.iter().max().unwrap());
+        let (cz_lo, cz_hi) = (*cz.iter().min().unwrap(), *cz.iter().max().unwrap());
+        assert!(
+            wy.0 <= cy_lo - 1 - span && wy.1 >= cy_hi + 1,
+            "wall covers Y"
+        );
+        assert!(
+            wz.0 <= cz_lo - 1 - span && wz.1 >= cz_hi + 1,
+            "wall covers Z"
+        );
+
+        // non-graffiti materials add no canvas
+        let plain = TextOptions::default();
+        let mut world = brdb::World::new();
+        add_text_tiles(&mut world, encode_tiles(&i, &plain).unwrap(), &plain);
+        assert!(world.bricks.iter().all(|b| !b.collision.player));
     }
 
     #[test]

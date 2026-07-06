@@ -4,8 +4,8 @@ use crate::{
         util::{PickedImage, deliver_save, pick_images, thumb},
     },
     text::{
-        FontPreset, PixelMode, TILE_PX, TextOptions, add_text_tiles, build_calibration_world,
-        encode_tiles, make_text_prefab, mono_geometry,
+        FontPreset, PixelMode, TILE_PX, TextMaterial, TextOptions, TextShading, add_text_tiles,
+        build_calibration_world, encode_tiles, make_text_prefab, mono_geometry,
     },
 };
 use brdb::World;
@@ -36,6 +36,16 @@ pub struct TextApp {
     invert: bool,
     /// world units between calibration tile anchors (tiny = tiny displays)
     cube_spacing: u32,
+    // material; not reseeded by presets — a user choice, not calibration
+    material: TextMaterial,
+    material_intensity: i32,
+    scuff: f32,
+    graffiti_depth_limit: f32,
+    graffiti_angle_limit: f32,
+    graffiti_priority: i32,
+    shading: TextShading,
+    shading_width: f32,
+    invert_shading: bool,
 }
 
 impl Default for TextApp {
@@ -63,6 +73,15 @@ impl Default for TextApp {
             luma_threshold: d.luma_threshold,
             invert: d.invert,
             cube_spacing: 30,
+            material: d.material,
+            material_intensity: d.material_intensity,
+            scuff: d.scuff,
+            graffiti_depth_limit: d.graffiti_depth_limit,
+            graffiti_angle_limit: d.graffiti_angle_limit,
+            graffiti_priority: d.graffiti_priority,
+            shading: d.shading,
+            shading_width: d.shading_width,
+            invert_shading: d.invert_shading,
         }
     }
 }
@@ -86,6 +105,15 @@ impl TextApp {
             mode: self.mode,
             luma_threshold: self.luma_threshold,
             invert: self.invert,
+            material: self.material,
+            material_intensity: self.material_intensity,
+            scuff: self.scuff,
+            graffiti_depth_limit: self.graffiti_depth_limit,
+            graffiti_angle_limit: self.graffiti_angle_limit,
+            graffiti_priority: self.graffiti_priority,
+            shading: self.shading,
+            shading_width: self.shading_width,
+            invert_shading: self.invert_shading,
             ..d
         }
     }
@@ -272,6 +300,82 @@ impl TextApp {
                         ui.checkbox(&mut self.invert, "Invert")
                             .on_hover_text("Draw dark pixels instead of bright ones");
                     }
+                });
+                ui.end_row();
+
+                ui.label("Material").on_hover_text(
+                    "TextDisplay material. Unlit ignores lighting (the calibrated default); \
+                     Graffiti projects onto nearby bricks; the rest are the standard brick \
+                     materials",
+                );
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for m in TextMaterial::ALL {
+                            ui.radio_value(&mut self.material, m, m.name());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(self.material.has_intensity(), |ui| {
+                            ui.label("Intensity");
+                            ui.add(egui::Slider::new(&mut self.material_intensity, 0..=10))
+                                .on_hover_text(
+                                    "Material Intensity: glow brightness / metal, glass, \
+                                     translucency strength",
+                                );
+                        });
+                        ui.label("Scuff");
+                        ui.add(
+                            egui::DragValue::new(&mut self.scuff)
+                                .speed(0.01)
+                                .range(0.0..=4.0),
+                        )
+                        .on_hover_text("Worn-edge wear on the glyphs (0–4)");
+                    });
+                    ui.add_enabled_ui(self.material.is_graffiti(), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Depth Limit");
+                            ui.add(
+                                egui::DragValue::new(&mut self.graffiti_depth_limit)
+                                    .speed(0.1)
+                                    .suffix("cm")
+                                    .range(0.0..=f32::INFINITY),
+                            )
+                            .on_hover_text("How far the graffiti projects onto bricks behind it");
+                            ui.label("Angle Limit");
+                            ui.add(
+                                egui::DragValue::new(&mut self.graffiti_angle_limit)
+                                    .speed(1.0)
+                                    .suffix("°")
+                                    .range(0.0..=180.0),
+                            )
+                            .on_hover_text("Steepest surface angle the graffiti projects onto");
+                            ui.label("Priority");
+                            ui.add(egui::DragValue::new(&mut self.graffiti_priority))
+                                .on_hover_text("Layer order between overlapping graffiti");
+                        });
+                    });
+                    // the game offers no shading for Unlit or Graffiti
+                    ui.add_enabled_ui(self.material.has_shading(), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Shading");
+                            egui::ComboBox::from_id_salt("text_shading")
+                                .selected_text(self.shading.name())
+                                .show_ui(ui, |ui| {
+                                    for s in TextShading::ALL {
+                                        ui.selectable_value(&mut self.shading, s, s.name());
+                                    }
+                                });
+                            ui.add_enabled_ui(self.shading != TextShading::None, |ui| {
+                                ui.label("Width");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.shading_width)
+                                        .speed(0.05)
+                                        .range(0.0..=f32::INFINITY),
+                                );
+                                ui.checkbox(&mut self.invert_shading, "Invert");
+                            });
+                        });
+                    });
                 });
                 ui.end_row();
 

@@ -511,7 +511,10 @@ impl HeightmapApp {
         if img_only {
             if colormap_ok {
                 if ui
-                    .add(Button::new("Generate image2brick save").fill(Color32::from_rgb(50, 90, 50)))
+                    .add(
+                        Button::new("Generate image2brick save")
+                            .fill(Color32::from_rgb(50, 90, 50)),
+                    )
                     .clicked()
                 {
                     self.run_converter(shared.clone(), true);
