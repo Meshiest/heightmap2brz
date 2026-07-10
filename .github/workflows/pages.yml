@@ -31,8 +31,12 @@ jobs:
         with:
           version: "latest"
 
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
       - name: Build web GUI
-        run: trunk build --release
+        run: trunk build --release --public-url "${{ steps.pages.outputs.base_path }}/"
 
       - uses: actions/upload-pages-artifact@v3
         with:
