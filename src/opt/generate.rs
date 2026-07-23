@@ -63,7 +63,7 @@ pub fn gen_quad_heightmap<F: Fn(f32) -> bool>(
     let quadtree_build_start = Instant::now();
     let (width, height) = heightmap.size();
     let area = width * height;
-    let mut quad = QuadTree::new(heightmap, colormap)?;
+    let mut quad = QuadTree::new(heightmap, colormap, options.gen_full_layers_above_height)?;
     let quadtree_build_duration = quadtree_build_start.elapsed();
     info!(
         "Built quadtree in {:.2}s",
