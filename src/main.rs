@@ -53,6 +53,7 @@ fn main() {
         (@arg hdmap: --hdmap "Using a high detail rgb color encoded heightmap")
         (@arg nocollide: --nocollide "Disable brick collision")
         (@arg greedy: --greedy "Use greedy optimization")
+        (@arg gen_full_layers_above: --gen_full_layers +takes_value "Generate full solid layers above this height (default 0)")
         (@arg text: --text "Render the input image as TextDisplay component bricks")
         (@arg fillchar: --("fill-char") +takes_value "Text mode: glyph for opaque pixels (default █)")
         (@arg emptychar: --("empty-char") +takes_value "Text mode: glyph for transparent pixels (default space)")
@@ -244,6 +245,11 @@ fn main() {
         nocollide: matches.is_present("nocollide"),
         quadtree: true,
         greedy: matches.is_present("greedy"),
+        gen_full_layers_above_height: matches
+            .value_of("gen_full_layers_above")
+            .unwrap_or("0")
+            .parse::<u32>()
+            .expect("Generate full layers above height must be integer"),
     };
 
     info!("Reading image files");

@@ -17,6 +17,8 @@ pub struct GenOptions {
     pub nocollide: bool,
     pub quadtree: bool,
     pub greedy: bool,
+    /// Height threshold above which to generate full solid fill layers (0 = disabled)
+    pub gen_full_layers_above_height: u32,
 }
 
 impl GenOptions {

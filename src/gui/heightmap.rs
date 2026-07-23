@@ -48,6 +48,7 @@ pub struct HeightmapApp {
     pending_pick: Option<(PickTarget, Promise<Vec<PickedImage>>)>,
     vertical_scale: u32,
     horizontal_size: u16,
+    gen_full_layers_above_height: u32,
     optimization: OptimizationMode,
     opt_cull: bool,
     opt_nocollide: bool,
@@ -71,6 +72,7 @@ impl Default for HeightmapApp {
             pending_pick: None,
             vertical_scale: 1,
             horizontal_size: 1,
+            gen_full_layers_above_height: 0,
             optimization: OptimizationMode::Quad,
             opt_cull: false,
             opt_nocollide: false,
@@ -148,6 +150,7 @@ impl HeightmapApp {
             nocollide: self.opt_nocollide,
             quadtree: self.optimization == OptimizationMode::Quad,
             greedy: self.optimization == OptimizationMode::Greedy,
+            gen_full_layers_above_height: self.gen_full_layers_above_height,
         }
     }
 
@@ -298,6 +301,16 @@ impl HeightmapApp {
                     ui.label("Vertical Size")
                         .on_hover_text("The height of each shade of grey from the heightmap");
                     ui.add(egui::Slider::new(&mut self.vertical_scale, 1..=100).text("units"));
+                    ui.end_row();
+
+                    ui.label("Generate Full Layers Above Height").on_hover_text(
+                        "Collapse terrain at or below this height into one solid base layer \
+                         and generate solid fill layers above it (0 = disabled)",
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.gen_full_layers_above_height, 0..=100)
+                            .text("units"),
+                    );
                     ui.end_row();
                 }
 
