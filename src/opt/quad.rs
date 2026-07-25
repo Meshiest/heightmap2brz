@@ -538,8 +538,8 @@ impl QuadTree {
 
                 // snap bricks to grid
                 if options.snap {
-                    z += 4 - z % 4;
-                    desired_height += 4 - desired_height % 4;
+                    z += (4 - z % 4) % 4;
+                    desired_height += (4 - desired_height % 4) % 4;
                 }
 
                 let mut bricks = vec![];
