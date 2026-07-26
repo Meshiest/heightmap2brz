@@ -3,6 +3,7 @@
 use super::logger;
 use crate::gui::heightmap::HeightmapApp;
 use crate::gui::text::TextApp;
+use crate::gui::video::VideoApp;
 use eframe::App;
 use egui::{CentralPanel, Color32, Context, Id, ScrollArea, TopBottomPanel, Ui};
 
@@ -15,6 +16,7 @@ pub struct BrzApp {
     shared: SharedOptions,
     heightmap: HeightmapApp,
     text: TextApp,
+    video: VideoApp,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,7 @@ enum Menu {
     Image,
     Text,
     Heightmap,
+    Video,
 }
 
 impl AsRef<str> for Menu {
@@ -30,6 +33,7 @@ impl AsRef<str> for Menu {
             Menu::Image => "Image2Brick",
             Menu::Text => "Image2Text",
             Menu::Heightmap => "Heightmap",
+            Menu::Video => "Video2Brick",
         }
     }
 }
@@ -42,6 +46,7 @@ impl Menu {
             Menu::Heightmap => {
                 "Select a heightmap and colormap to generate optimized brick terrain"
             }
+            Menu::Video => "Convert an animated image or frame sequence into wired, animated bricks",
         }
     }
 }
@@ -54,6 +59,7 @@ impl Default for BrzApp {
             shared: SharedOptions::default(),
             heightmap: HeightmapApp::default(),
             text: TextApp::default(),
+            video: VideoApp::default(),
         }
     }
 }
@@ -124,6 +130,7 @@ impl App for BrzApp {
                 self.menu(ui, Menu::Image);
                 self.menu(ui, Menu::Heightmap);
                 self.menu(ui, Menu::Text);
+                self.menu(ui, Menu::Video);
             });
             ui.separator();
             ScrollArea::vertical()
@@ -132,6 +139,7 @@ impl App for BrzApp {
                     Menu::Image => self.heightmap.draw(ui, ctx, frame, &mut self.shared, true),
                     Menu::Heightmap => self.heightmap.draw(ui, ctx, frame, &mut self.shared, false),
                     Menu::Text => self.text.draw(ui, &mut self.shared),
+                    Menu::Video => self.video.draw(ui, &mut self.shared),
                 });
 
             TopBottomPanel::bottom(Id::new("logs"))

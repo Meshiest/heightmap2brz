@@ -17,6 +17,18 @@ use clap::clap_app;
 #[cfg(not(target_arch = "wasm32"))]
 use env_logger::Builder;
 #[cfg(not(target_arch = "wasm32"))]
+use heightmap::{
+    anim::{
+        bricks::{AnimOptions, DisplayBrickStyle, build_brick_world},
+        cost,
+        pack::MAX_FRAMES,
+    },
+    video::{
+        scale::{Filter, FitMode, resample_fps, resize_clip},
+        source::{Source, decode, is_animated},
+    },
+};
+#[cfg(not(target_arch = "wasm32"))]
 use log::{LevelFilter, error, info, warn};
 #[cfg(not(target_arch = "wasm32"))]
 use std::{boxed::Box, io::Write, path::PathBuf};
@@ -49,7 +61,7 @@ fn main() {
         (@arg snap: --snap "Snap bricks to the brick grid")
         (@arg lrgb: --lrgb "Use linear rgb input color instead of sRGB")
         (@arg img: -i --img "Make the heightmap flat and render an image")
-        (@arg glow: --glow "Make the heightmap glow at 0 intensity")
+        (@arg glow: --glow "Make the heightmap (or animation display) glow at 0 intensity")
         (@arg hdmap: --hdmap "Using a high detail rgb color encoded heightmap")
         (@arg nocollide: --nocollide "Disable brick collision")
         (@arg greedy: --greedy "Use greedy optimization")
@@ -65,6 +77,18 @@ fn main() {
         (@arg lumathreshold: --("luma-threshold") +takes_value "Braille/blocks: pixels at least this bright are drawn (default 128)")
         (@arg invert: --invert "Braille/blocks: draw dark pixels instead of bright ones")
         (@arg material: --material +takes_value "Text mode: material (unlit, graffiti, plastic, metallic, glow, translucent, glass; default unlit)")
+        (@arg animmode: --("anim-mode") +takes_value "Animation output mode (brick)")
+        (@arg animfps: --fps +takes_value "Animation output frame rate (default 10)")
+        (@arg animstart: --start +takes_value "Start offset into the source, seconds")
+        (@arg animduration: --duration +takes_value "Duration taken from the source, seconds")
+        (@arg animmaxframes: --("max-frames") +takes_value "Cap on emitted frames (default 1048560; frames past 65535 spill into extra arrays)")
+        (@arg animwidth: --width +takes_value "Target width in pixels")
+        (@arg animheight: --height +takes_value "Target height in pixels")
+        (@arg animfit: --fit +takes_value "Fit mode (exact, contain, cover; default contain)")
+        (@arg animfilter: --filter +takes_value "Resample filter (lanczos, nearest; default lanczos)")
+        (@arg externalclock: --("external-clock") "Expose Frame as a chip input instead of running a timer")
+        (@arg animbrickstyle: --("brick-style") +takes_value "Animation display-brick style (micro, tile; default micro)")
+        (@arg animpixelextent: --("pixel-extent") +takes_value "Animation display-brick half-extent in units (default 1; 1 = smallest, 2 units wide; tile style is always 4 units tall)")
     )
     .get_matches();
 
@@ -82,6 +106,220 @@ fn main() {
         .value_of("output")
         .unwrap_or("./out.brz")
         .to_string();
+
+    if matches.is_present("animmode") {
+        // The BRZ/BRDB string-array encoding this renderer builds on tops
+        // out at `MAX_FRAMES` frames; passing an unbounded sentinel here
+        // would re-enable an unbounded resampling loop (a fat-fingered --fps
+        // could OOM).
+        let mode = matches.value_of("animmode").unwrap_or("brick");
+        if mode != "brick" {
+            return error!(
+                "unsupported --anim-mode '{mode}' (only 'brick' is supported; text mode is a later phase)"
+            );
+        }
+
+        if matches.is_present("colormap") {
+            warn!("--anim-mode ignores --colormap");
+        }
+
+        let fps = matches
+            .value_of("animfps")
+            .map(|s| s.parse::<f32>().expect("fps must be a number"))
+            .unwrap_or(10.0);
+        let start = matches
+            .value_of("animstart")
+            .map(|s| s.parse::<f32>().expect("start must be a number"))
+            .unwrap_or(0.0);
+        let duration = matches
+            .value_of("animduration")
+            .map(|s| s.parse::<f32>().expect("duration must be a number"));
+        let max_frames = matches
+            .value_of("animmaxframes")
+            .map(|s| s.parse::<usize>().expect("max-frames must be an integer"))
+            .unwrap_or(MAX_FRAMES)
+            .min(MAX_FRAMES);
+
+        let fit = match matches
+            .value_of("animfit")
+            .map(|s| s.to_lowercase())
+            .as_deref()
+        {
+            None | Some("contain") => FitMode::Contain,
+            Some("exact") => FitMode::Exact,
+            Some("cover") => FitMode::Cover,
+            Some(other) => {
+                return error!("unknown fit mode '{other}' (exact, contain, cover)");
+            }
+        };
+        let filter = match matches
+            .value_of("animfilter")
+            .map(|s| s.to_lowercase())
+            .as_deref()
+        {
+            None | Some("lanczos") => Filter::Lanczos,
+            Some("nearest") => Filter::Nearest,
+            Some(other) => {
+                return error!("unknown filter '{other}' (lanczos, nearest)");
+            }
+        };
+
+        // A frame sequence outruns the OS argument limit long before it
+        // outruns anything else this renderer cares about. At ~11 characters
+        // per relative filename, Windows' 32767-character command line runs
+        // dry around 3000 frames -- but a 90-minute clip at 12fps is 65391 of
+        // them: inside one bank's 65535 entries, far inside the 1048560-frame
+        // overall cap, and ~20x past argv. Naming the directory sidesteps it
+        // entirely, so the real limit stays the one that means something.
+        //
+        // Scoped to anim mode on purpose: a directory of images is a frame
+        // sequence, which has no meaning for the heightmap or text paths.
+        let heightmap_files = if heightmap_files.len() == 1 && heightmap_files[0].is_dir() {
+            let dir = &heightmap_files[0];
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(e) => return error!("Error reading directory {}: {e}", dir.display()),
+            };
+            let mut found = Vec::new();
+            for entry in entries {
+                let path = match entry {
+                    Ok(e) => e.path(),
+                    Err(e) => return error!("Error reading directory {}: {e}", dir.display()),
+                };
+                // Filter on extension rather than by attempting a decode: a
+                // stray .txt or a nested directory should be skipped in
+                // silence, while a genuinely corrupt .png must still be the
+                // hard error it becomes below.
+                let is_image = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .is_some_and(|e| {
+                        matches!(e.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tga" | "webp")
+                    });
+                if is_image && path.is_file() {
+                    found.push(path);
+                }
+            }
+            if found.is_empty() {
+                return error!("No image files found in directory {}", dir.display());
+            }
+            // `decode_sequence` re-sorts by natural key (so f_2 precedes
+            // f_10); this sort only settles the order for the single-image
+            // case below, which never reaches it.
+            found.sort();
+            info!("Found {} image(s) in {}", found.len(), dir.display());
+            found
+        } else {
+            heightmap_files
+        };
+
+        info!("Reading image file(s)");
+        let source = if heightmap_files.len() == 1 {
+            let input = &heightmap_files[0];
+            let bytes = match std::fs::read(input) {
+                Ok(b) => b,
+                Err(e) => return error!("Error reading file {}: {e}", input.display()),
+            };
+            if is_animated(&bytes) {
+                Source::Animated(bytes)
+            } else {
+                match image::load_from_memory(&bytes) {
+                    Ok(i) => Source::Still(i.to_rgba8()),
+                    Err(e) => return error!("Error reading image: {e:?}"),
+                }
+            }
+        } else {
+            let mut named = Vec::with_capacity(heightmap_files.len());
+            for input in &heightmap_files {
+                let img = match image::open(input) {
+                    Ok(i) => i.to_rgba8(),
+                    Err(e) => return error!("Error reading image {}: {e:?}", input.display()),
+                };
+                named.push((input.display().to_string(), img));
+            }
+            Source::Sequence(named)
+        };
+
+        let clip = match decode(source, fps) {
+            Ok(c) => c,
+            Err(e) => return error!("{e}"),
+        };
+
+        // Omitted width/height mean "use the clip's own dimensions" -- skip
+        // the resize entirely rather than resampling to an identical size.
+        let clip = if matches.is_present("animwidth") || matches.is_present("animheight") {
+            let target_w = matches
+                .value_of("animwidth")
+                .map(|s| s.parse::<u32>().expect("width must be an integer"))
+                .unwrap_or(clip.width);
+            let target_h = matches
+                .value_of("animheight")
+                .map(|s| s.parse::<u32>().expect("height must be an integer"))
+                .unwrap_or(clip.height);
+            resize_clip(clip, target_w, target_h, fit, filter)
+        } else {
+            clip
+        };
+
+        let clip = match resample_fps(clip, fps, start, duration, max_frames) {
+            Ok(c) => c,
+            Err(e) => return error!("{e}"),
+        };
+
+        let brick_style = match matches
+            .value_of("animbrickstyle")
+            .map(|s| s.to_lowercase())
+            .as_deref()
+        {
+            None | Some("micro") => DisplayBrickStyle::Micro,
+            Some("tile") => DisplayBrickStyle::SmoothTile,
+            Some(other) => {
+                return error!("unknown brick style '{other}' (micro, tile)");
+            }
+        };
+        // No upper bound beyond `u16`'s own range: any half-extent tiles
+        // flush at `2 * pixel_extent` (see `AnimOptions::pixel_extent`), so
+        // there is no value that can trip the overlap check.
+        let pixel_extent = matches
+            .value_of("animpixelextent")
+            .map(|s| s.parse::<u16>().expect("pixel-extent must be an integer"))
+            .unwrap_or(1)
+            .max(1);
+
+        // Built before the estimate so the readout costs the options the
+        // render will actually consume -- `bank_size` in particular decides
+        // how many arrays the frames spill across.
+        let anim_opts = AnimOptions {
+            external_clock: matches.is_present("externalclock"),
+            brick_style,
+            pixel_extent,
+            glow: matches.is_present("glow"),
+            ..AnimOptions::default()
+        };
+
+        let cost = cost::estimate(
+            clip.width,
+            clip.height,
+            clip.frames.len(),
+            anim_opts.bank_size,
+        );
+        info!(
+            "Estimated cost: {} pixel(s), {} gate(s), {} wire(s), {} brick(s), {} chunk(s), {} bank(s), {} frame(s)",
+            cost.pixels, cost.gates, cost.wires, cost.bricks, cost.chunks, cost.banks, cost.frames
+        );
+
+        let world = match build_brick_world(&clip, &anim_opts) {
+            Ok(w) => w,
+            Err(e) => return error!("{e}"),
+        };
+
+        info!("Writing Save to {}", out_file);
+        if let Err(e) = write_world(&world, &out_file) {
+            return error!("{e}");
+        }
+        return info!("Done!");
+    }
 
     if matches.is_present("text") {
         if heightmap_files.len() > 1 {

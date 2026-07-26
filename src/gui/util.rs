@@ -51,6 +51,34 @@ pub fn pick_images(multiple: bool) -> Promise<Vec<PickedImage>> {
     }
 }
 
+/// Pick a single file's raw bytes, without any image decode.
+///
+/// `pick_images` decodes eagerly via `image::load_from_memory(...).to_rgba8()`,
+/// which keeps only the first frame of a GIF/APNG/animated-WebP and throws the
+/// original bytes away. `video::source::decode_animated` needs every byte to
+/// recover every frame, so this hands them over untouched instead.
+///
+/// `None` if the user cancels the dialog. Poll the returned promise each
+/// frame, same as [`pick_images`].
+pub fn pick_animated_bytes() -> Promise<Option<(String, Vec<u8>)>> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .add_filter("Animated Images", &["gif", "png", "webp", "jpg", "jpeg"]);
+    let pick = async move {
+        let handle = dialog.pick_file().await?;
+        let name = handle.file_name();
+        let bytes = handle.read().await;
+        Some((name, bytes))
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Promise::spawn_thread("pick_animated_bytes", move || pollster::block_on(pick))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Promise::spawn_async(pick)
+    }
+}
+
 /// Small square thumbnail for a picked image, served via egui's bytes loader.
 pub fn thumb(ui: &mut egui::Ui, img: &PickedImage) {
     let uri = format!("bytes://thumb/{}", img.name);
