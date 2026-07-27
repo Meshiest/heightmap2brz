@@ -405,9 +405,9 @@ pub fn build_brick_world(clip: &Clip, opts: &AnimOptions) -> Result<World, Strin
                 service(bi as i32, -8), vec![]);
             world.add_wire_connection(ge[bi].clone(), WirePort::new(br, BRANCH, "bCond"));
             world.add_wire_connection(exec_src, WirePort::new(br, BRANCH, "Exec"));
-            // false -> this bank; true -> keep descending
-            exec_src = WirePort::new(br, BRANCH, "ExecOutB");
-            WirePort::new(br, BRANCH, "ExecOutA")
+            // true -> keep descending; false -> this bank
+            exec_src = WirePort::new(br, BRANCH, "ExecOutA");
+            WirePort::new(br, BRANCH, "ExecOutB")
         } else {
             exec_src.clone()
         };

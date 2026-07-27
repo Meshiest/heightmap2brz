@@ -41,8 +41,16 @@ pub fn estimate(width: u32, height: u32, frames: usize, bank_size: usize) -> Cos
         // and one value select per chunk
         gates: 2 * pixels + 2 * chunks * banks + 5 + boundaries * 3 + boundaries * chunks,
         // 3 per pixel + 2 per chunk per bank + exec chain + detector feed
-        // + 3 clock chain + 3 control pins
-        wires: 3 * pixels + 2 * chunks * banks + (chunks * banks - 1) + 1 + 3 + 3,
+        // + 3 clock chain + 3 control pins, plus per boundary: comparator
+        // InputA (1) + subtract InputA (1) + branch bCond/Exec (2) + one
+        // select's bSelectB/InputA/InputB (3) per chunk
+        wires: 3 * pixels
+            + 2 * chunks * banks
+            + (chunks * banks - 1)
+            + 1
+            + 3
+            + 3
+            + boundaries * (3 * chunks + 4),
         // one display brick per pixel + the microchip shell
         bricks: pixels + 1,
         chunks,
@@ -114,6 +122,26 @@ mod tests {
         let chunks = 2;
         let extra = boundaries * 3 + boundaries * chunks + 2 * chunks * boundaries;
         assert_eq!(three.gates - one.gates, extra);
+    }
+
+    #[test]
+    fn spilling_adds_the_boundary_wiring_to_the_wires_estimate() {
+        // Same setup as the gates counterpart above: 2304 px -> 2 chunks;
+        // 5 frames at bank size 2 -> 3 banks, 2 boundaries.
+        let one = estimate(64, 36, 5, 65_535);
+        let three = estimate(64, 36, 5, 2);
+        assert_eq!(three.banks, 3);
+        let boundaries = 2;
+        let chunks = 2;
+        // the extra array/Get pair per chunk per extra bank contributes 2
+        // wires each (ArrayVarRef, Index), plus one more link in the exec
+        // chain per extra bank per chunk; each boundary itself adds a
+        // comparator InputA + subtract InputA + branch bCond/Exec (2) + one
+        // select's bSelectB/InputA/InputB (3) per chunk
+        let extra_bank_wires = 2 * chunks * boundaries + chunks * boundaries;
+        let extra_boundary_wires = boundaries * (3 * chunks + 4);
+        assert_eq!(three.wires - one.wires, extra_bank_wires + extra_boundary_wires);
+        assert_eq!(three.wires - one.wires, 32, "12 bank wires + 20 boundary wires");
     }
 
     #[test]

@@ -424,7 +424,7 @@ fn spike_anim_output_file_is_valid() {
 
 use brdb::assets::materials::{GLOW, PLASTIC};
 use heightmap::anim::bricks::{
-    AnimOptions, COMPARE_GE, DisplayBrickStyle, SELECT, build_brick_world,
+    AnimOptions, BRANCH, COMPARE_GE, DisplayBrickStyle, SELECT, build_brick_world,
 };
 use heightmap::anim::pack::PIXELS_PER_CHUNK;
 use heightmap::video::Clip;
@@ -1092,6 +1092,105 @@ fn no_exec_input_ever_has_two_sources() {
     }
 }
 
+/// Finding 1 (2026-07-26 spillover final review): the game's `Exec_Branch`
+/// takes `ExecOutA` on a TRUTHY `bCond` and `ExecOutB` on a FALSY one -- the
+/// opposite of what an earlier version of this renderer assumed. Because
+/// `ArrayVar_Get` is an exec gate whose `Value` only refreshes when its own
+/// `Exec` fires, wiring the branch backwards makes the bank that actually
+/// EXECUTES the complement of the bank the Select cascade READS, so every
+/// multi-bank render would show the component default for the whole clip --
+/// yet every other test in this file, which only checks that a wire exists
+/// and not which polarity it rides, stayed green either way. That is exactly
+/// how the inversion survived five prior reviews.
+///
+/// This test pins the polarity directly against the wire graph: each
+/// branch's falsy (`ExecOutB`) output must feed an `ArrayVar_Get.Exec` -- the
+/// entry to its OWN bank's chain -- and its truthy (`ExecOutA`) output must
+/// feed either the next branch's `Exec` (if one exists) or, for the last
+/// branch, the final bank's `ArrayVar_Get.Exec` directly (there is no
+/// further branch to descend into).
+///
+/// Both-directions check performed by hand while writing this test (per the
+/// review brief): with the two `WirePort` labels in `bricks.rs`'s branch
+/// cascade swapped back to `ExecOutB` = "keep descending" / `ExecOutA` =
+/// "this bank", this test fails -- every non-last branch's `ExecOutB` then
+/// targets the next branch's `Exec` (component type `BRANCH`, not
+/// `ARRAY_GET`), tripping the first assertion in the loop. Re-applying the
+/// fix makes it pass again.
+#[test]
+fn each_branchs_falsy_output_enters_its_own_bank_and_its_truthy_output_keeps_descending() {
+    // 7 frames at bank size 2 -> 4 banks -> 3 boundaries -> 3 branches.
+    // 4x3 px is a single chunk, so each bank's Get chain is exactly one gate
+    // long and the branch's entry wire IS that gate's Exec wire.
+    let clip = tiny_clip(4, 3, 7);
+    let opts = AnimOptions { bank_size: 2, ..AnimOptions::default() };
+    let world = build_brick_world(&clip, &opts).expect("build");
+    let inner = &world.grids[0].1;
+
+    // Branches are emitted in `bi = 0, 1, ...` order and every brick id in
+    // this chip is minted from one monotonic, whole-build counter
+    // (`Brick::next_id`, see brdb's `wrapper/brick.rs`), so sorting the
+    // branch bricks by id recovers that same bi order.
+    let mut branch_ids: Vec<usize> = inner
+        .iter()
+        .filter(|b| {
+            b.components
+                .iter()
+                .any(|c| c.component_type().is_some_and(|t| t.to_string() == BRANCH))
+        })
+        .map(|b| b.id.expect("every emitted brick has an id"))
+        .collect();
+    branch_ids.sort_unstable();
+    assert_eq!(branch_ids.len(), 3, "4 banks must cascade through exactly 3 branches");
+
+    // The one and only wire leaving `brick_id`'s `port` on its `Exec_Branch`
+    // component -- there must be exactly one, since a branch output either
+    // drives the next branch's `Exec` or a Get's `Exec`, never both.
+    let target_from = |brick_id: usize, port: &str| -> WirePort {
+        let mut hits = world.wires.iter().filter(|w| {
+            w.source.brick_id == brick_id
+                && w.source.component_type.to_string() == BRANCH
+                && w.source.port_name.to_string() == port
+        });
+        let wire = hits
+            .next()
+            .unwrap_or_else(|| panic!("branch {brick_id}'s {port} must drive something"));
+        assert!(hits.next().is_none(), "branch {brick_id}'s {port} must drive exactly one target");
+        wire.target.clone()
+    };
+
+    for (i, &br) in branch_ids.iter().enumerate() {
+        let falsy = target_from(br, "ExecOutB");
+        assert_eq!(
+            falsy.component_type.to_string(),
+            ARRAY_GET,
+            "branch {i}'s falsy (ExecOutB) output must enter its own bank's Get chain, not {:?}",
+            falsy.component_type
+        );
+        assert_eq!(falsy.port_name.to_string(), "Exec");
+
+        let truthy = target_from(br, "ExecOutA");
+        if i + 1 < branch_ids.len() {
+            assert_eq!(
+                truthy.brick_id, branch_ids[i + 1],
+                "branch {i}'s truthy (ExecOutA) output must keep descending into branch {}",
+                i + 1
+            );
+            assert_eq!(truthy.component_type.to_string(), BRANCH);
+            assert_eq!(truthy.port_name.to_string(), "Exec");
+        } else {
+            assert_eq!(
+                truthy.component_type.to_string(),
+                ARRAY_GET,
+                "the last branch's truthy (ExecOutA) output must enter the final bank's Get \
+                 chain directly, not {:?}",
+                truthy.component_type
+            );
+            assert_eq!(truthy.port_name.to_string(), "Exec");
+        }
+    }
+}
+
 /// The select cascade must be well formed: each Select takes its condition
 /// from a comparator, its B input from an array Get, and its A input from
 /// either a Get (the first stage) or another Select (a later stage). A
@@ -1195,13 +1294,26 @@ fn each_banks_array_holds_only_its_own_frames() {
     }
     let chip_grid_id = chip_grid_id.expect("a chip must publish a microchip grid");
 
+    // `ArrayVar.Value` is a `WireGraphPrimMathVariant`-style tagged union, not
+    // a bare `BrdbValue::Array` -- it decodes as `BrdbValue::Struct` wrapping a
+    // `WireGraph*Array` struct (here `WireGraphStringArray`, holding the real
+    // array under its own `Values` field). `WireArrayVariant`'s
+    // `TryFrom<&BrdbValue>` already knows how to unwrap that; matching on the
+    // exact data-struct name (rather than `Get`'s, which also contains
+    // "ArrayVar" but carries no `Value` field) is what the sibling
+    // multi-chunk test above (`a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start`)
+    // already established as the working pattern.
     let mut lengths = Vec::new();
     for chunk in &db.brick_chunk_index(chip_grid_id).expect("chunk index") {
         let (_soa, structs) = db.component_chunk(chip_grid_id, chunk.index).expect("components");
         for s in &structs {
-            if s.get_name().contains("ArrayVar") {
-                if let Some(brdb::schema::BrdbValue::Array(v)) = s.get("Value") {
-                    lengths.push(v.len());
+            if s.get_name() == "BrickComponentData_WireGraphPseudo_ArrayVar" {
+                if let Some(value) = s.get("Value") {
+                    let variant: WireArrayVariant =
+                        value.try_into().expect("ArrayVar Value must decode");
+                    if let WireArrayVariant::StringArray(v) = variant {
+                        lengths.push(v.len());
+                    }
                 }
             }
         }
@@ -1235,11 +1347,19 @@ fn boundary_constants_are_the_real_multiples_of_the_bank_size() {
     }
     let chip_grid_id = chip_grid_id.expect("a chip must publish a microchip grid");
 
+    // `CompareGreaterOrEqual` is the COMPONENT TYPE name, but `s.get_name()`
+    // reports the underlying DATA STRUCT, and every `Compare*` comparator
+    // (Greater, GreaterOrEqual, Less, LessOrEqual) shares one struct --
+    // `BrickComponentData_WireGraph_Expr_MathCompare` -- per brdb's
+    // `COMPONENT_TYPE_STRUCT_PAIRS`. This chip only ever emits
+    // `CompareGreaterOrEqual` gates (see `bricks.rs`'s boundary cascade), so
+    // matching the shared struct name is equivalent here and is what the
+    // encoded save actually contains.
     let mut bounds = Vec::new();
     for chunk in &db.brick_chunk_index(chip_grid_id).expect("chunk index") {
         let (_soa, structs) = db.component_chunk(chip_grid_id, chunk.index).expect("components");
         for s in &structs {
-            if s.get_name().contains("CompareGreaterOrEqual") {
+            if s.get_name() == "BrickComponentData_WireGraph_Expr_MathCompare" {
                 // The literal form depends on the field's declared type; accept
                 // whichever the encoder produced and compare numerically.
                 match s.get("InputB") {
