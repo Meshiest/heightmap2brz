@@ -10,15 +10,19 @@
 //! [`crate::text::MAX_COMPONENT_CHARS`] limit.
 //!
 //! A pixel below `alpha_threshold` in a given frame gets no brick and no
-//! gates elsewhere in the pipeline (brick placement is decided independently,
-//! across *every* frame, by whatever renderer calls [`pack`]) — but it still
-//! contributes exactly [`HEX_STRIDE`] characters to *that* frame's string, so
-//! every surviving pixel's offset stays the plain `pixel_in_chunk *
-//! HEX_STRIDE` the encoding relies on. No remap table, no gaps. Since nothing
-//! ever displays a culled pixel's color, its slot is written as `"000000"`
-//! rather than its real (and here, meaningless) source color.
+//! gates elsewhere in the pipeline. In production that decision is made by
+//! [`Packer`], which folds visibility into the very same per-frame traversal
+//! that builds these strings (see its own doc comment) — NOT independently by
+//! whatever renderer calls [`pack`], which has no production caller left (see
+//! `pack`'s own doc note). Either way, a culled pixel still contributes
+//! exactly [`HEX_STRIDE`] characters to *that* frame's string, so every
+//! surviving pixel's offset stays the plain `pixel_in_chunk * HEX_STRIDE` the
+//! encoding relies on. No remap table, no gaps. Since nothing ever displays a
+//! culled pixel's color, its slot is written as `"000000"` rather than its
+//! real (and here, meaningless) source color.
 use crate::text::MAX_COMPONENT_CHARS;
 use crate::video::Clip;
+use image::RgbaImage;
 use std::fmt::Write as _;
 
 /// Characters one pixel contributes to a frame string: `RRGGBB`, no `#`.
@@ -97,6 +101,17 @@ pub struct Chunk {
 /// Errors (naming both limits) if `clip.frames.len()` exceeds [`MAX_FRAMES`]
 /// — the overall cap across all [`MAX_BANKS`] banks of [`BANK_FRAMES`]
 /// entries each; never truncates.
+///
+/// RETAINED DELIBERATELY, though it has no production caller any more (that
+/// role now belongs to [`Packer`], which fuses this same encoding with
+/// visibility in one pass instead of two): this whole-clip, two-pass
+/// implementation is the byte-identity oracle every `Packer` test diffs
+/// against (see `tests/anim_pack.rs`'s differential sweep, and
+/// `the_fused_packer_matches_the_two_pass_result_exactly`). `pub` on purpose
+/// so it stays reachable from the integration tests without a `#[cfg(test)]`
+/// carve-out. Do not remove this function, and do not delete it as "dead
+/// code" — doing so would delete the only independent check that `Packer`
+/// still encodes frames exactly the way this crate always has.
 pub fn pack(clip: &Clip, alpha_threshold: u8) -> Result<Vec<Chunk>, String> {
     if clip.frames.len() > MAX_FRAMES {
         return Err(format!(
@@ -156,4 +171,105 @@ pub fn slice_of(chunk: &Chunk, frame: usize, pixel_in_chunk: usize) -> &str {
         "pack must only ever write ASCII hex; a non-ASCII byte would break this offset"
     );
     &s[start..end]
+}
+
+/// Builds the per-chunk frame strings and the per-pixel visibility bitmap in
+/// ONE traversal of the frames, so no frame is ever retained.
+///
+/// This replaces two separate whole-clip scans: `bricks::visible` walked
+/// every frame per pixel, and [`pack`] walked every frame again. Fusing them
+/// costs one thing, deliberately accepted: `visible` short-circuits with
+/// `.any()`, so a pixel opaque in frame 0 stopped its scan immediately, while
+/// this must visit every frame because it is building the strings anyway. For
+/// a clip opaque everywhere it therefore performs strictly more pixel visits.
+/// It is still one traversal instead of two, and it is the only way to avoid
+/// holding the frames.
+pub struct Packer {
+    width: usize,
+    height: usize,
+    alpha_threshold: u8,
+    stride: usize,
+    chunks: Vec<Chunk>,
+    visible: Vec<bool>,
+    frames_pushed: usize,
+}
+
+impl Packer {
+    pub fn new(width: u32, height: u32, alpha_threshold: u8, stride: usize) -> Self {
+        let width_usize = width as usize;
+        let height_usize = height as usize;
+        let total_pixels = width_usize * height_usize;
+        let per_chunk = MAX_COMPONENT_CHARS / stride.max(1);
+        let mut chunks = Vec::new();
+        let mut first_pixel = 0;
+        while first_pixel < total_pixels {
+            let pixel_count = per_chunk.min(total_pixels - first_pixel);
+            chunks.push(Chunk { first_pixel, pixel_count, frames: Vec::new() });
+            first_pixel += pixel_count;
+        }
+        Self {
+            width: width_usize,
+            height: height_usize,
+            alpha_threshold,
+            stride,
+            chunks,
+            visible: vec![false; total_pixels],
+            frames_pushed: 0,
+        }
+    }
+
+    /// Push one frame's contribution to every chunk's per-frame string.
+    ///
+    /// `frame` MUST be exactly `width x height` (the dimensions `new` was
+    /// built with -- the same ones a caller's `SourceInfo` reported, per the
+    /// contract documented on [`crate::video::stream::FrameStream::next`]).
+    /// Nothing upstream of this call enforces that: `build_brick_world` sizes
+    /// this `Packer` from `source.info()` once and then indexes every
+    /// subsequent frame with `get_pixel(col, row)` -- an undersized frame
+    /// would panic there instead of here, and an oversized one would decode
+    /// silently with its excess pixels ignored, no error at all. Checking
+    /// here, before any pixel is read, turns both into one descriptive `Err`
+    /// naming both the expected and the actual size.
+    pub fn push_frame(&mut self, frame: &RgbaImage) -> Result<(), String> {
+        if self.frames_pushed >= MAX_FRAMES {
+            return Err(format!(
+                "clip exceeds the {MAX_FRAMES}-frame limit ({MAX_BANKS} banks of {BANK_FRAMES})"
+            ));
+        }
+        let (frame_w, frame_h) = (frame.width() as usize, frame.height() as usize);
+        if frame_w != self.width || frame_h != self.height {
+            return Err(format!(
+                "frame {} is {frame_w}x{frame_h}, but the source's SourceInfo reported \
+                 {}x{} -- every frame a FrameStream emits must match info()'s dimensions",
+                self.frames_pushed, self.width, self.height
+            ));
+        }
+        for chunk in &mut self.chunks {
+            let mut s = String::with_capacity(chunk.pixel_count * self.stride);
+            for local in 0..chunk.pixel_count {
+                let idx = chunk.first_pixel + local;
+                let col = (idx % self.width) as u32;
+                let row = (idx / self.width) as u32;
+                let p = frame.get_pixel(col, row).0;
+                if p[3] < self.alpha_threshold {
+                    for _ in 0..self.stride {
+                        s.push('0');
+                    }
+                } else {
+                    self.visible[idx] = true;
+                    write!(s, "{:02X}{:02X}{:02X}", p[0], p[1], p[2])
+                        .expect("writing to a String is infallible");
+                }
+            }
+            chunk.frames.push(s);
+        }
+        self.frames_pushed += 1;
+        Ok(())
+    }
+
+    /// The chunks, plus row-major per-pixel visibility (`true` where the
+    /// pixel was opaque enough in at least one frame).
+    pub fn finish(self) -> (Vec<Chunk>, Vec<bool>) {
+        (self.chunks, self.visible)
+    }
 }

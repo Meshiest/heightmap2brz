@@ -8,6 +8,20 @@ pub enum Source {
     Still(RgbaImage),
 }
 
+/// Extensions routed to a video decode backend rather than the image decoders.
+///
+/// Extension-based rather than content-sniffed on purpose: the backends probe
+/// the real container themselves and error clearly on a mismatch, so sniffing
+/// here would duplicate that and disagree with it eventually.
+pub const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mov", "mkv", "webm", "avi", "m4v"];
+
+pub fn is_video_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.as_str()))
+}
+
 /// True when the bytes are a container that can hold multiple frames. A
 /// single-frame GIF still counts — `decode_animated` handles it and yields a
 /// one-frame clip.
@@ -73,5 +87,26 @@ mod tests {
     #[test]
     fn garbage_bytes_are_rejected_not_panicked_on() {
         assert!(decode(Source::Animated(b"nonsense".to_vec()), 10.0).is_err());
+    }
+
+    #[test]
+    fn video_extensions_are_recognised_case_insensitively() {
+        for ext in ["mp4", "MP4", "mov", "mkv", "webm", "avi", "m4v", "M4v"] {
+            let path = std::path::PathBuf::from(format!("clip.{ext}"));
+            assert!(is_video_path(&path), "{ext} should be treated as a video");
+        }
+    }
+
+    #[test]
+    fn non_video_extensions_are_not_routed_to_a_video_backend() {
+        for ext in ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tga"] {
+            let path = std::path::PathBuf::from(format!("image.{ext}"));
+            assert!(!is_video_path(&path), "{ext} should not be treated as a video");
+        }
+    }
+
+    #[test]
+    fn an_extensionless_path_is_not_a_video() {
+        assert!(!is_video_path(&std::path::PathBuf::from("no_extension")));
     }
 }

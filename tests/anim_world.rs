@@ -427,7 +427,9 @@ use heightmap::anim::bricks::{
     AnimOptions, BRANCH, COMPARE_GE, DisplayBrickStyle, SELECT, build_brick_world,
 };
 use heightmap::anim::pack::PIXELS_PER_CHUNK;
+use heightmap::progress::NoProgress;
 use heightmap::video::Clip;
+use heightmap::video::stream::FrameSource;
 use image::{Rgba, RgbaImage};
 
 fn tiny_clip(w: u32, h: u32, n: usize) -> Clip {
@@ -440,7 +442,7 @@ fn tiny_clip(w: u32, h: u32, n: usize) -> Clip {
 #[test]
 fn brick_world_has_two_gates_per_pixel_plus_overhead() {
     let clip = tiny_clip(4, 3, 5);
-    let world = build_brick_world(&clip, &AnimOptions::default()).unwrap();
+    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
     // 12 display bricks + 1 microchip shell on the main grid
     assert_eq!(world.bricks.len(), 13);
     // inner grid: 2*12 pixel gates + 2 chunk gates + 1 detector + 4 clock
@@ -452,7 +454,7 @@ fn brick_world_has_two_gates_per_pixel_plus_overhead() {
 #[test]
 fn brick_world_writes_and_every_wire_resolves() {
     let clip = tiny_clip(4, 3, 5);
-    let world = build_brick_world(&clip, &AnimOptions::default()).unwrap();
+    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
     let path = std::env::temp_dir().join(format!("h2b_anim_{}.brz", std::process::id()));
     std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
     wire_integrity::assert_wires_valid(&path);
@@ -464,7 +466,7 @@ fn fully_transparent_pixels_emit_no_brick() {
     let mut img = RgbaImage::from_pixel(2, 1, Rgba([255, 0, 0, 255]));
     img.put_pixel(1, 0, Rgba([0, 0, 0, 0]));
     let clip = Clip { width: 2, height: 1, fps: 10.0, frames: vec![img] };
-    let world = build_brick_world(&clip, &AnimOptions::default()).unwrap();
+    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
     assert_eq!(world.bricks.len(), 2, "1 display brick + 1 chip shell");
 }
 
@@ -476,7 +478,7 @@ fn fully_transparent_pixels_emit_no_brick() {
 #[test]
 fn micro_default_pixels_tile_flush_with_no_overlap_at_the_smallest_extent() {
     let clip = tiny_clip(4, 3, 2);
-    let world = build_brick_world(&clip, &AnimOptions::default())
+    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress)
         .expect("flush-tiled micro pixels at the smallest extent must not overlap each other \
                  or the chip shell");
 
@@ -513,9 +515,14 @@ fn micro_default_pixels_tile_flush_with_no_overlap_at_the_smallest_extent() {
 fn glow_sets_the_display_bricks_to_glow_at_intensity_zero() {
     let clip = tiny_clip(3, 2, 2);
 
-    let plain = build_brick_world(&clip, &AnimOptions::default()).expect("default must build");
-    let lit = build_brick_world(&clip, &AnimOptions { glow: true, ..AnimOptions::default() })
-        .expect("glow must build");
+    let plain = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress)
+        .expect("default must build");
+    let lit = build_brick_world(
+        &clip,
+        &AnimOptions { glow: true, ..AnimOptions::default() },
+        &mut NoProgress,
+    )
+    .expect("glow must build");
 
     // Display bricks rest at z = their own half-height; the chip shell and
     // its gates sit elsewhere, so this picks out the screen alone.
@@ -563,7 +570,8 @@ fn smooth_tile_style_display_bricks_are_4_units_tall_and_follow_5x_the_extent() 
         ..AnimOptions::default()
     };
     let world =
-        build_brick_world(&clip, &opts).expect("a smooth-tile screen must build without overlap");
+        build_brick_world(&clip, &opts, &mut NoProgress)
+            .expect("a smooth-tile screen must build without overlap");
 
     let origin = world
         .bricks
@@ -597,7 +605,7 @@ fn smooth_tile_pixels_tile_flush_at_the_10_unit_pitch_at_the_smallest_extent() {
         pixel_extent: 1,
         ..AnimOptions::default()
     };
-    let world = build_brick_world(&clip, &opts)
+    let world = build_brick_world(&clip, &opts, &mut NoProgress)
         .expect("flush-tiled smooth-tile pixels at the smallest extent must not overlap");
 
     let origin = world
@@ -634,13 +642,13 @@ fn the_chip_shell_clears_the_screen_at_the_smallest_extent_for_every_style() {
     for style in [DisplayBrickStyle::Micro, DisplayBrickStyle::SmoothTile] {
         let clip = tiny_clip(3, 3, 2);
         let opts = AnimOptions { brick_style: style, pixel_extent: 1, ..AnimOptions::default() };
-        build_brick_world(&clip, &opts)
+        build_brick_world(&clip, &opts, &mut NoProgress)
             .unwrap_or_else(|e| panic!("{style:?} at the smallest extent must clear the screen: {e}"));
     }
 }
 
-/// F3 regression: `video::scale::resample_fps` legitimately returns `Ok` with
-/// zero frames when `start_s >= end_time` (e.g. `--start` past a short
+/// F3 regression: `video::scale::FpsStream` legitimately ends with zero
+/// frames emitted when `start_s >= end_time` (e.g. `--start` past a short
 /// clip's end, or the GUI's Start slider dragged past it). Before this
 /// guard, `build_brick_world` would still "succeed" on that empty clip --
 /// no display bricks, and `clock::build_clock` inlining
@@ -651,7 +659,7 @@ fn the_chip_shell_clears_the_screen_at_the_smallest_extent_for_every_style() {
 #[test]
 fn a_zero_frame_clip_is_rejected_instead_of_building_a_broken_save() {
     let clip = Clip { width: 4, height: 3, fps: 10.0, frames: Vec::new() };
-    let result = build_brick_world(&clip, &AnimOptions::default());
+    let result = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress);
     assert!(
         result.is_err(),
         "an empty clip must not produce a \"successful\" save with an in-game modulo-by-zero"
@@ -703,7 +711,7 @@ fn chip_plane_extent_contains_every_brick_in_a_real_render() {
     // pixel/service gates across multiple lattice stages -- exactly the
     // shape the old `(h+2)*CELL/2+5`-style halving underestimated.
     let clip = tiny_clip(6, 5, 3);
-    let world = build_brick_world(&clip, &AnimOptions::default()).unwrap();
+    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
 
     // Reconstruct every inner brick's original (pre-`add_brick_grid`-shift)
     // center: `World::add_brick_grid` subtracts `Position::CHUNK_HALF` from
@@ -826,7 +834,7 @@ fn chip_plane_extent_contains_every_brick_in_a_real_render() {
 fn a_screen_wider_than_one_chunk_gets_more_arrays() {
     let n = PIXELS_PER_CHUNK + 10;
     let clip = tiny_clip(n as u32, 1, 2);
-    let world = build_brick_world(&clip, &AnimOptions::default()).unwrap();
+    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
     let inner = &world.grids[0].1;
     // 2 chunks => 2 ArrayVar + 2 Get; 4 clock gates + 1 detector + 5 clock pins
     assert_eq!(inner.len(), 2 * n + 4 + 1 + 4 + 5);
@@ -881,7 +889,7 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
         "chunk 2 must start exactly where chunk 1 ends"
     );
 
-    let world = build_brick_world(&clip, &opts).unwrap();
+    let world = build_brick_world(&clip, &opts, &mut NoProgress).unwrap();
     let path = std::env::temp_dir().join(format!("h2b_anim_xchunk_{}.brz", std::process::id()));
     std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
 
@@ -981,7 +989,7 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
 fn no_inner_brick_lands_at_a_negative_coordinate() {
     for (w, h) in [(1u32, 1u32), (4, 1), (1, 4), (2, 2), (7, 3)] {
         let clip = tiny_clip(w, h, 3);
-        let world = build_brick_world(&clip, &AnimOptions::default())
+        let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress)
             .unwrap_or_else(|e| panic!("{w}x{h} must build: {e}"));
         let inner = &world.grids[0].1;
         for b in inner {
@@ -1017,7 +1025,7 @@ use heightmap::anim::pack::BANK_FRAMES;
 #[test]
 fn a_single_bank_render_emits_no_spillover_gates() {
     let clip = tiny_clip(4, 3, 5);
-    let world = build_brick_world(&clip, &AnimOptions::default()).expect("build");
+    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).expect("build");
     // `BrdbComponent::component_type() -> Option<BString>` is the accessor;
     // there is no `name()`. Gates live inside the chip's own inner grid
     // (`world.grids[0].1`), not `world.bricks` -- that vec is the MAIN grid
@@ -1045,7 +1053,7 @@ fn a_multi_bank_render_emits_one_array_per_chunk_per_bank() {
     // 5 frames at bank size 2 -> 3 banks; 4x3 px is a single chunk.
     let clip = tiny_clip(4, 3, 5);
     let opts = AnimOptions { bank_size: 2, ..AnimOptions::default() };
-    let world = build_brick_world(&clip, &opts).expect("build");
+    let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
 
     // Gates live inside the chip's own inner grid (`world.grids[0].1`), not
     // `world.bricks` -- that vec is the MAIN grid (display bricks + the chip
@@ -1074,7 +1082,7 @@ fn a_multi_bank_render_emits_one_array_per_chunk_per_bank() {
 fn no_exec_input_ever_has_two_sources() {
     let clip = tiny_clip(40, 40, 7);
     let opts = AnimOptions { bank_size: 2, ..AnimOptions::default() };
-    let world = build_brick_world(&clip, &opts).expect("build");
+    let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
 
     // `world.wires` is a `Vec<WireConnection>`; each has `.source`/`.target`
     // of type `WirePort { brick_id, component_type, port_name }`.
@@ -1124,7 +1132,7 @@ fn each_branchs_falsy_output_enters_its_own_bank_and_its_truthy_output_keeps_des
     // long and the branch's entry wire IS that gate's Exec wire.
     let clip = tiny_clip(4, 3, 7);
     let opts = AnimOptions { bank_size: 2, ..AnimOptions::default() };
-    let world = build_brick_world(&clip, &opts).expect("build");
+    let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
     let inner = &world.grids[0].1;
 
     // Branches are emitted in `bi = 0, 1, ...` order and every brick id in
@@ -1200,7 +1208,7 @@ fn each_branchs_falsy_output_enters_its_own_bank_and_its_truthy_output_keeps_des
 fn the_select_cascade_is_well_formed() {
     let clip = tiny_clip(4, 3, 7);
     let opts = AnimOptions { bank_size: 2, ..AnimOptions::default() };
-    let world = build_brick_world(&clip, &opts).expect("build");
+    let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
 
     let source_of = |brick: usize, port: &str| -> Option<String> {
         world.wires.iter()
@@ -1247,7 +1255,7 @@ fn the_select_cascade_is_well_formed() {
 fn a_multi_bank_render_encodes_and_every_wire_resolves() {
     let clip = tiny_clip(4, 3, 5);
     let opts = AnimOptions { bank_size: 2, ..AnimOptions::default() };
-    let world = build_brick_world(&clip, &opts).expect("build");
+    let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
     let path = std::env::temp_dir().join(format!("h2b_anim_multibank_{}.brz", std::process::id()));
     std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
     wire_integrity::assert_wires_valid(&path);
@@ -1278,7 +1286,7 @@ fn a_multi_bank_render_encodes_and_every_wire_resolves() {
 fn each_banks_array_holds_only_its_own_frames() {
     let clip = tiny_clip(4, 3, 7);
     let opts = AnimOptions { bank_size: 3, ..AnimOptions::default() };
-    let mut world = build_brick_world(&clip, &opts).expect("build");
+    let mut world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
     world.register_used_components();
     let path = std::env::temp_dir().join(format!("h2b_bankarr_{}.brz", std::process::id()));
     std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
@@ -1331,7 +1339,7 @@ fn each_banks_array_holds_only_its_own_frames() {
 fn boundary_constants_are_the_real_multiples_of_the_bank_size() {
     let clip = tiny_clip(4, 3, 7);
     let opts = AnimOptions { bank_size: 3, ..AnimOptions::default() };
-    let mut world = build_brick_world(&clip, &opts).expect("build");
+    let mut world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
     world.register_used_components();
     let path = std::env::temp_dir().join(format!("h2b_bounds_{}.brz", std::process::id()));
     std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
@@ -1374,4 +1382,132 @@ fn boundary_constants_are_the_real_multiples_of_the_bank_size() {
     // 7 frames at bank size 3 -> 3 banks -> boundaries at 3 and 6
     assert_eq!(bounds, vec![3, 6], "comparators must sit on the real bank seams");
     let _ = std::fs::remove_file(&path);
+}
+
+// --- Task 5: render from a FrameSource --------------------------------------
+//
+// `build_brick_world` stops taking a `&Clip` and takes any `&dyn FrameSource`
+// plus a `&mut dyn Progress`. Every call site above already proves a `Clip`
+// (which implements `FrameSource`) still renders identically through the new
+// signature -- these tests cover what's actually NEW: a non-`Clip` source, a
+// driven progress reporter, and a mid-stream failure that must abort rather
+// than truncate.
+
+/// A `Clip` is a `FrameSource`, so every existing expectation must hold
+/// through the new signature -- same bricks, same gates, same everything.
+#[test]
+fn rendering_from_a_source_matches_rendering_from_a_clip() {
+    let clip = tiny_clip(4, 3, 5);
+    let world =
+        build_brick_world(&clip as &dyn FrameSource, &AnimOptions::default(), &mut NoProgress)
+            .expect("build");
+    // 12 pixels, all opaque -> 12 display bricks + the chip shell
+    assert_eq!(world.bricks.len(), 13);
+}
+
+/// The reporter must actually be driven, with a real total when the source
+/// knows its length. A progress bar that never ticks is worse than none.
+#[test]
+fn the_render_reports_progress() {
+    #[derive(Default)]
+    struct Rec {
+        began: Vec<(String, Option<u64>)>,
+        ticks: u64,
+        finished: usize,
+    }
+    impl heightmap::progress::Progress for Rec {
+        fn begin(&mut self, label: &str, total: Option<u64>) {
+            self.began.push((label.to_string(), total));
+        }
+        fn tick(&mut self, _n: u64) {
+            self.ticks += 1;
+        }
+        fn finish(&mut self) {
+            self.finished += 1;
+        }
+    }
+
+    let clip = tiny_clip(4, 3, 5);
+    let mut rec = Rec::default();
+    build_brick_world(&clip as &dyn FrameSource, &AnimOptions::default(), &mut rec)
+        .expect("build");
+    assert!(!rec.began.is_empty(), "the render must begin a phase");
+    assert_eq!(rec.began[0].1, Some(5), "an in-memory clip knows its frame count");
+    assert!(rec.ticks > 0, "the reporter must be ticked");
+    assert_eq!(rec.finished, rec.began.len(), "every phase begun must be finished");
+}
+
+/// A stream that fails partway must abort the render, not write a save
+/// silently missing its tail.
+#[test]
+fn a_failing_stream_aborts_the_render() {
+    struct Failing;
+    struct FailingStream(usize);
+    impl heightmap::video::stream::FrameStream for FailingStream {
+        fn next(&mut self) -> Result<Option<image::RgbaImage>, String> {
+            self.0 += 1;
+            if self.0 > 2 { Err("decode failed at frame 3".into()) }
+            else { Ok(Some(image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255])))) }
+        }
+    }
+    impl FrameSource for Failing {
+        fn info(&self) -> heightmap::video::stream::SourceInfo {
+            heightmap::video::stream::SourceInfo {
+                width: 2, height: 2, fps: 10.0, frame_count_hint: Some(10),
+            }
+        }
+        fn open(&self) -> Result<Box<dyn heightmap::video::stream::FrameStream + '_>, String> {
+            Ok(Box::new(FailingStream(0)))
+        }
+    }
+    // `.expect_err`/`.unwrap_err` both require `T: Debug` on the `Ok` side --
+    // `brdb::World` does not derive `Debug`, so the `Ok` variant is mapped
+    // away first (deviation from the task brief, which called `.expect_err`
+    // directly; that does not compile against this `World`).
+    let err =
+        build_brick_world(&Failing as &dyn FrameSource, &AnimOptions::default(), &mut NoProgress)
+            .map(|_| ())
+            .expect_err("a mid-stream failure must abort");
+    assert!(err.contains("frame 3"), "the underlying error must surface: {err}");
+}
+
+/// Proof that the packer's row-major visibility vector (`idx = row * width +
+/// col`) reaches the display-brick loop with the SAME index order `visible()`
+/// used before it was deleted -- not transposed into column-major (`idx = col
+/// * height + row`). A SQUARE clip cannot distinguish the two formulas (every
+/// `(row, col)` pair has a symmetric partner with the same pair of numbers),
+/// so this uses a 5-wide, 2-tall clip and marks exactly one pixel opaque, at
+/// (col=2, row=1) -- chosen so the row-major index (7) and the naive
+/// column-major index (5) actually differ, and so does the (col=3, row=1)
+/// pixel a column-major reader would land on instead (index 7 under that
+/// formula). A transposed read would either drop the display brick entirely
+/// or place it at the wrong column; this asserts the exact position.
+#[test]
+fn visibility_indexing_follows_the_packers_row_major_layout_on_a_non_square_clip() {
+    let (w, h) = (5u32, 2u32);
+    let mut img = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0]));
+    img.put_pixel(2, 1, Rgba([200, 100, 50, 255]));
+    let clip = Clip { width: w, height: h, fps: 10.0, frames: vec![img] };
+
+    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress)
+        .expect("a single opaque pixel must build");
+
+    // 1 display brick (the lone opaque pixel) + 1 chip shell.
+    assert_eq!(world.bricks.len(), 2, "exactly one pixel is opaque in any frame");
+
+    // Micro style at the default pixel_extent=1 has footprint 1, pitch 2, so
+    // (col=2, row=1) lands at world position (4, 2, 1). A column-major
+    // indexing bug would instead light up (col=3, row=1) -> (6, 2, 1) (see
+    // the doc comment above for the arithmetic), so this pins the exact
+    // coordinates rather than merely the count. Display bricks rest at
+    // z = their own half-height (1 for Micro); the chip shell sits at z=2,
+    // so filtering on z=1 picks out the lone display brick unambiguously.
+    let display_bricks: Vec<Position> =
+        world.bricks.iter().filter(|b| b.position.z == 1).map(|b| b.position).collect();
+    assert_eq!(
+        display_bricks,
+        vec![Position { x: 4, y: 2, z: 1 }],
+        "the opaque pixel at (col=2, row=1) must render at its row-major position (4, 2), \
+         not the column-major transposition (6, 2)"
+    );
 }

@@ -21,8 +21,8 @@ use super::Clip;
 /// emit that to mean "as fast as possible". Browsers clamp it to 100ms
 /// instead of treating it as instantaneous, and we do the same: left
 /// unclamped, a zero-delay animation would produce an infinite `fps`, which
-/// `resample_fps` downstream rejects as a hard error rather than an
-/// unbounded but working frame rate.
+/// `video::scale::FpsStream` downstream rejects as a hard error rather than
+/// an unbounded but working frame rate.
 const ZERO_DELAY_CLAMP_MS: f64 = 100.0;
 
 /// Decode an animated GIF, APNG, or animated WebP into a [`Clip`].
@@ -203,7 +203,7 @@ mod tests {
 
     /// Regression test: a zero-delay GIF must not yield an infinite fps.
     /// `image` returns GIF `delay == 0` verbatim; without the 100ms clamp
-    /// this divides to `fps == inf`, which `resample_fps` downstream treats
+    /// this divides to `fps == inf`, which `FpsStream` downstream treats
     /// as a hard error instead of a working 10fps animation.
     fn zero_delay_gif() -> Vec<u8> {
         let mut out = Vec::new();

@@ -4,6 +4,9 @@ pub mod text;
 pub mod util;
 
 #[cfg(not(target_arch = "wasm32"))]
+mod progress_cli;
+
+#[cfg(not(target_arch = "wasm32"))]
 use crate::{map::*, opt::*, text::*, util::*};
 #[cfg(not(target_arch = "wasm32"))]
 use brdb::World;
@@ -24,8 +27,11 @@ use heightmap::{
         pack::MAX_FRAMES,
     },
     video::{
-        scale::{Filter, FitMode, resample_fps, resize_clip},
-        source::{Source, decode, is_animated},
+        backend::{self, Backend},
+        ffmpeg::{DownloadConsent, ensure_ffmpeg},
+        scale::{Filter, FitMode, estimated_frame_count, max_frames_error},
+        source::{Source, decode, is_animated, is_video_path},
+        stream::{AdaptedSource, FrameSource},
     },
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -89,6 +95,9 @@ fn main() {
         (@arg externalclock: --("external-clock") "Expose Frame as a chip input instead of running a timer")
         (@arg animbrickstyle: --("brick-style") +takes_value "Animation display-brick style (micro, tile; default micro)")
         (@arg animpixelextent: --("pixel-extent") +takes_value "Animation display-brick half-extent in units (default 1; 1 = smallest, 2 units wide; tile style is always 4 units tall)")
+        (@arg yesdownload: --yes "Consent to downloading ffmpeg if it is missing and a video backend needs it")
+        (@arg nodownload: --("no-download") "Never download ffmpeg; error instead if it is missing")
+        (@arg backend: --backend +takes_value "Video decode backend (auto, rust, ffmpeg; default auto)")
     )
     .get_matches();
 
@@ -106,6 +115,32 @@ fn main() {
         .value_of("output")
         .unwrap_or("./out.brz")
         .to_string();
+
+    // Task 3 added these; this is where they finally do something.
+    // `Ask` is the default because it downgrades to `Never` on a
+    // non-terminal stdin, so a headless run errors rather than hanging.
+    // Validated here regardless of render mode (cheap, and catches a
+    // contradictory pair immediately); only a video render ever actually
+    // consults `consent`, via `ensure_ffmpeg`.
+    let consent = match (matches.is_present("yesdownload"), matches.is_present("nodownload")) {
+        (true, true) => return error!("--yes and --no-download contradict each other"),
+        (true, false) => DownloadConsent::Always,
+        (false, true) => DownloadConsent::Never,
+        (false, false) => DownloadConsent::Ask,
+    };
+
+    let backend_choice = match matches
+        .value_of("backend")
+        .map(|s| s.to_lowercase())
+        .as_deref()
+    {
+        None | Some("auto") => Backend::Auto,
+        Some("rust") => Backend::Rust,
+        Some("ffmpeg") => Backend::Ffmpeg,
+        Some(other) => {
+            return error!("unknown --backend '{other}' (auto, rust, ffmpeg)");
+        }
+    };
 
     if matches.is_present("animmode") {
         // The BRZ/BRDB string-array encoding this renderer builds on tops
@@ -127,13 +162,19 @@ fn main() {
             .value_of("animfps")
             .map(|s| s.parse::<f32>().expect("fps must be a number"))
             .unwrap_or(10.0);
+        // Both clamped at 0 here rather than left raw: `FpsStream` clamps
+        // them internally the same way, so this changes no render, but it
+        // lets the pre-flight frame-count check below mirror the stream's
+        // arithmetic exactly instead of approximating it. The GUI clamps
+        // these at the same point for the same reason.
         let start = matches
             .value_of("animstart")
             .map(|s| s.parse::<f32>().expect("start must be a number"))
-            .unwrap_or(0.0);
+            .unwrap_or(0.0)
+            .max(0.0);
         let duration = matches
             .value_of("animduration")
-            .map(|s| s.parse::<f32>().expect("duration must be a number"));
+            .map(|s| s.parse::<f32>().expect("duration must be a number").max(0.0));
         let max_frames = matches
             .value_of("animmaxframes")
             .map(|s| s.parse::<usize>().expect("max-frames must be an integer"))
@@ -214,6 +255,169 @@ fn main() {
             heightmap_files
         };
 
+        // A video file goes to a decode backend, which pushes fps and
+        // scaling into its own filters rather than materialising a Clip --
+        // the whole point of this path. The directory and animated-image
+        // branches below are unchanged.
+        if heightmap_files.len() == 1 && is_video_path(&heightmap_files[0]) {
+            // ffmpeg's availability is consulted only where it is actually
+            // needed, and `open_video_ensuring` owns that decision so it can
+            // be unit tested (see its doc, and this task's report):
+            //
+            // - a GIF/PNG/frame-sequence render never reaches this branch at
+            //   all, so it is never prompted about ffmpeg;
+            // - `--backend rust` never consults it -- that backend either
+            //   decodes in pure Rust or refuses by name;
+            // - `--backend ffmpeg` consults it eagerly, because the user
+            //   named the backend and a missing binary should fail fast;
+            // - `--backend auto` (the DEFAULT) TRIES the pure-Rust backend
+            //   first and only consults ffmpeg once that has failed with
+            //   something ffmpeg could actually help with. An earlier version
+            //   checked eagerly here, which made a machine without ffmpeg
+            //   refuse every video by default -- including CABAC H.264 files
+            //   the pure-Rust backend handles perfectly well on its own.
+            info!("Opening video {}", heightmap_files[0].display());
+            let raw = match backend::open_video_ensuring(
+                &heightmap_files[0],
+                backend_choice,
+                None,
+                fit,
+                filter,
+                None,
+                &mut || ensure_ffmpeg(consent),
+            ) {
+                Ok(s) => s,
+                Err(e) => return error!("{e}"),
+            };
+
+            // `open_video` does not apply target size/rate to the pure-Rust
+            // backend -- `RustVideoSource::open_path` takes no such
+            // parameters at all -- so passing `--width`/`--height`/`--fps`
+            // straight through to it here would make those flags work on the
+            // ffmpeg backend and silently do nothing on the Rust one.
+            // `AdaptedSource` is layered over whatever `open_video` returned
+            // instead, exactly the way the image-sequence path below layers
+            // it over a `Clip`, so every scaling/rate/window flag behaves
+            // identically no matter which backend produced the raw frames.
+            // `open_video` above is deliberately called with `None`/`None`
+            // for size/fps so the raw source stays native and untouched on
+            // EITHER backend -- there is exactly one place, this
+            // `AdaptedSource`, that ever resizes or resamples.
+            let native = raw.info();
+            let size = if matches.is_present("animwidth") || matches.is_present("animheight") {
+                // A raw `.expect` here (as the pre-existing image path a few
+                // hundred lines down still has, deliberately left alone --
+                // see this block's own comment) would turn a typo'd
+                // `--width abc` into a Rust panic message instead of a clean
+                // CLI error; a video render already got this far spawning a
+                // decode backend, so this is also further into the run than
+                // the image path's equivalent check.
+                let target_w = match matches.value_of("animwidth") {
+                    Some(s) => match s.parse::<u32>() {
+                        Ok(v) => v,
+                        Err(e) => return error!("--width must be an integer: {e}"),
+                    },
+                    None => native.width,
+                };
+                let target_h = match matches.value_of("animheight") {
+                    Some(s) => match s.parse::<u32>() {
+                        Ok(v) => v,
+                        Err(e) => return error!("--height must be an integer: {e}"),
+                    },
+                    None => native.height,
+                };
+                Some((target_w, target_h))
+            } else {
+                None
+            };
+
+            let adapted = AdaptedSource {
+                inner: raw.as_ref(),
+                size,
+                fit,
+                filter,
+                target_fps: fps,
+                start_s: start,
+                duration_s: duration,
+                max_frames,
+            };
+
+            let brick_style = match matches
+                .value_of("animbrickstyle")
+                .map(|s| s.to_lowercase())
+                .as_deref()
+            {
+                None | Some("micro") => DisplayBrickStyle::Micro,
+                Some("tile") => DisplayBrickStyle::SmoothTile,
+                Some(other) => {
+                    return error!("unknown brick style '{other}' (micro, tile)");
+                }
+            };
+            let pixel_extent = match matches.value_of("animpixelextent") {
+                Some(s) => match s.parse::<u16>() {
+                    Ok(v) => v,
+                    Err(e) => return error!("--pixel-extent must be an integer: {e}"),
+                },
+                None => 1,
+            }
+            .max(1);
+
+            let anim_opts = AnimOptions {
+                external_clock: matches.is_present("externalclock"),
+                brick_style,
+                pixel_extent,
+                glow: matches.is_present("glow"),
+                ..AnimOptions::default()
+            };
+
+            // `AdaptedSource::info` folds the resample/window math into the
+            // hint whenever the raw source can say its own frame count up
+            // front (see its doc) -- a video probed from a real container
+            // almost always can. When it genuinely can't, the hint is `None`:
+            // there is no pre-flight number to refuse on, but `FpsStream`
+            // itself still enforces `max_frames` mid-render (an `Err`, not a
+            // silent truncation), so nothing is left unguarded -- only the
+            // refusal-before-printing-a-cost-line optimization is unavailable.
+            let info = adapted.info();
+            if let Some(n) = info.frame_count_hint {
+                if n > max_frames {
+                    return error!("{}", max_frames_error(max_frames));
+                }
+            } else {
+                warn!(
+                    "source did not report a frame count ahead of decode; the cost estimate \
+                     below counts 0 frames rather than guess, but max_frames is still enforced \
+                     during the render"
+                );
+            }
+
+            let cost = cost::estimate(
+                info.width,
+                info.height,
+                info.frame_count_hint.unwrap_or(0),
+                anim_opts.bank_size,
+            );
+            info!(
+                "Estimated cost: {} pixel(s), {} gate(s), {} wire(s), {} brick(s), {} chunk(s), {} bank(s), {} frame(s)",
+                cost.pixels, cost.gates, cost.wires, cost.bricks, cost.chunks, cost.banks, cost.frames
+            );
+
+            let world = match build_brick_world(
+                &adapted,
+                &anim_opts,
+                &mut progress_cli::CliProgress::new(),
+            ) {
+                Ok(w) => w,
+                Err(e) => return error!("{e}"),
+            };
+
+            info!("Writing Save to {}", out_file);
+            if let Err(e) = write_world(&world, &out_file) {
+                return error!("{e}");
+            }
+            return info!("Done!");
+        }
+
         info!("Reading image file(s)");
         let source = if heightmap_files.len() == 1 {
             let input = &heightmap_files[0];
@@ -248,7 +452,7 @@ fn main() {
 
         // Omitted width/height mean "use the clip's own dimensions" -- skip
         // the resize entirely rather than resampling to an identical size.
-        let clip = if matches.is_present("animwidth") || matches.is_present("animheight") {
+        let size = if matches.is_present("animwidth") || matches.is_present("animheight") {
             let target_w = matches
                 .value_of("animwidth")
                 .map(|s| s.parse::<u32>().expect("width must be an integer"))
@@ -257,14 +461,24 @@ fn main() {
                 .value_of("animheight")
                 .map(|s| s.parse::<u32>().expect("height must be an integer"))
                 .unwrap_or(clip.height);
-            resize_clip(clip, target_w, target_h, fit, filter)
+            Some((target_w, target_h))
         } else {
-            clip
+            None
         };
 
-        let clip = match resample_fps(clip, fps, start, duration, max_frames) {
-            Ok(c) => c,
-            Err(e) => return error!("{e}"),
+        // Resize (if requested) then resample, streamed rather than
+        // materialized twice: `AdaptedSource` layers `ResizeStream` under
+        // `FpsStream` so frames are scaled before selection, never the other
+        // way around.
+        let adapted = AdaptedSource {
+            inner: &clip,
+            size,
+            fit,
+            filter,
+            target_fps: fps,
+            start_s: start,
+            duration_s: duration,
+            max_frames,
         };
 
         let brick_style = match matches
@@ -298,21 +512,41 @@ fn main() {
             ..AnimOptions::default()
         };
 
-        let cost = cost::estimate(
-            clip.width,
-            clip.height,
-            clip.frames.len(),
-            anim_opts.bank_size,
-        );
+        // The resampled frame count isn't knowable from the *stream* (see
+        // `AdaptedSource::info`, whose hint is `None` once the rate changes),
+        // but it is computable from the source's length plus the scalars --
+        // counts and timings only, no frame data. `estimated_frame_count` is
+        // pinned to `FpsStream`'s real output by a test sweep, so this is the
+        // number the render will actually produce, not an approximation.
+        let est_frames =
+            estimated_frame_count(clip.frames.len(), clip.fps, fps, start, duration, max_frames);
+
+        // Deliberately checked BEFORE the cost line, and against the
+        // unclamped count. Clamping to `max_frames` and printing anyway
+        // would report the cap as though it were the real answer and then
+        // have the render immediately refuse the same request -- a cost
+        // line the CLI itself does not believe. `resample_fps` used to
+        // error before this block was ever reached; this restores that
+        // ordering now that the refusal happens mid-stream instead. The
+        // message comes from `scale::max_frames_error`, the same one
+        // `FpsStream` would emit, so the two can never drift.
+        if est_frames > max_frames {
+            return error!("{}", max_frames_error(max_frames));
+        }
+
+        let info = adapted.info();
+
+        let cost = cost::estimate(info.width, info.height, est_frames, anim_opts.bank_size);
         info!(
             "Estimated cost: {} pixel(s), {} gate(s), {} wire(s), {} brick(s), {} chunk(s), {} bank(s), {} frame(s)",
             cost.pixels, cost.gates, cost.wires, cost.bricks, cost.chunks, cost.banks, cost.frames
         );
 
-        let world = match build_brick_world(&clip, &anim_opts) {
-            Ok(w) => w,
-            Err(e) => return error!("{e}"),
-        };
+        let world =
+            match build_brick_world(&adapted, &anim_opts, &mut progress_cli::CliProgress::new()) {
+                Ok(w) => w,
+                Err(e) => return error!("{e}"),
+            };
 
         info!("Writing Save to {}", out_file);
         if let Err(e) = write_world(&world, &out_file) {

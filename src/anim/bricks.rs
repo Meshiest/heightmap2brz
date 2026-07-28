@@ -6,8 +6,9 @@
 use super::chip;
 use super::clock::{self, gate};
 use super::layout::{GATE_HALF, STAGE_PITCH, lattice_pos_staged};
-use super::pack::{self, BANK_FRAMES, HEX_STRIDE, pack};
-use crate::video::Clip;
+use super::pack::{self, BANK_FRAMES, HEX_STRIDE};
+use crate::progress::Progress;
+use crate::video::stream::FrameSource;
 use brdb::{
     Direction, Rotation,
     AsBrdbValue, Brick, BrickSize, BrickType, IntVector, Position, Vector3f, WirePort, World,
@@ -166,31 +167,65 @@ impl Default for AnimOptions {
     }
 }
 
-/// A pixel is emitted only if it is opaque enough in at least one frame.
-fn visible(clip: &Clip, col: u32, row: u32, threshold: u8) -> bool {
-    clip.frames.iter().any(|f| f.get_pixel(col, row).0[3] >= threshold)
-}
+pub fn build_brick_world(
+    source: &dyn FrameSource,
+    opts: &AnimOptions,
+    progress: &mut dyn Progress,
+) -> Result<World, String> {
+    let info = source.info();
+    let (w, h) = (info.width as i32, info.height as i32);
 
-pub fn build_brick_world(clip: &Clip, opts: &AnimOptions) -> Result<World, String> {
-    // A zero-frame clip (reachable via `--start`/`--duration` past the
+    // One fused streaming pass builds both the per-chunk frame strings and
+    // the per-pixel visibility bitmap, so no frame is ever retained (see
+    // `pack::Packer`'s doc comment) -- this replaces the old two whole-clip
+    // passes (`pack(clip, ...)` plus a `visible()` scan per pixel). A
+    // `stream.next()` error is FATAL and propagates immediately: treating a
+    // mid-stream failure as end-of-clip would silently write a save missing
+    // its tail.
+    progress.begin("packing frames", info.frame_count_hint.map(|n| n as u64));
+    let mut packer = pack::Packer::new(info.width, info.height, opts.alpha_threshold, HEX_STRIDE);
+    // The whole pull loop is wrapped in an immediately-invoked closure so
+    // `progress.finish()` below runs on every exit, not only the success
+    // path: `source.open()?`, `stream.next()?` and `packer.push_frame(&frame)?`
+    // can all propagate an error, and without this a mid-stream failure would
+    // print under a bar that never called `finish()` -- left visually
+    // "stuck" rather than closed out, even though the render itself did stop.
+    let seen: Result<u64, String> = (|| {
+        let mut stream = source.open()?;
+        let mut seen: u64 = 0;
+        while let Some(frame) = stream.next()? {
+            packer.push_frame(&frame)?;
+            // Borrows the frame's own buffer -- no copy here. `Progress::frame`'s
+            // default body is a no-op, so a reporter that doesn't override it
+            // (every one except `ChannelProgress`) pays for one virtual call and
+            // nothing else.
+            progress.frame(frame.width(), frame.height(), frame.as_raw());
+            seen += 1;
+            progress.tick(seen);
+        }
+        Ok(seen)
+    })();
+    progress.finish();
+    let seen = seen?;
+    let (chunks, visible) = packer.finish();
+    let frame_count = seen as usize;
+
+    // A zero-frame source (reachable via `--start`/`--duration` past the
     // source's end, or the GUI's Start slider dragged past it -- see
-    // `video::scale::resample_fps`, which returns `Ok` with an empty
-    // `frames` rather than erroring) must not fall through to a "successful"
+    // `video::scale::FpsStream`, which ends with no frames emitted rather
+    // than erroring) must not fall through to a "successful"
     // build: with no display bricks and `clock::build_clock` inlining
     // `Modulo.InputB = frame_count as f64 = 0.0`, the save would open fine
     // and silently divide by zero in-game on every tick. Caught once here so
     // both the CLI and GUI entry points, which both funnel through this
     // function, get the same clear error instead of a broken file.
-    if clip.frames.is_empty() {
+    if frame_count == 0 {
         return Err(
             "clip has 0 frames -- nothing to render (check --start/--duration, or the GUI's \
              Start/Duration, against the source's length)"
                 .to_string(),
         );
     }
-
-    let chunks = pack(clip, opts.alpha_threshold)?;
-    let (w, h) = (clip.width as i32, clip.height as i32);
 
     let mut world = World::new();
     world.meta.bundle.description = "Animation generated from image frames".to_string();
@@ -216,7 +251,7 @@ pub fn build_brick_world(clip: &Clip, opts: &AnimOptions) -> Result<World, Strin
     let pitch = 2 * footprint;
     for row in 0..h {
         for col in 0..w {
-            if !visible(clip, col as u32, row as u32, opts.alpha_threshold) {
+            if !visible[(row * w + col) as usize] {
                 continue;
             }
             let (brick, id) = Brick {
@@ -314,7 +349,7 @@ pub fn build_brick_world(clip: &Clip, opts: &AnimOptions) -> Result<World, Strin
         let pin = chip::add_input_pin(&mut chip, "Frame", service(0, -1));
         chip::pin_source(pin, true)
     } else {
-        clock::build_clock(&mut world, &mut chip, clip.fps, clip.frames.len(), service(0, -2))
+        clock::build_clock(&mut world, &mut chip, info.fps, frame_count, service(0, -2))
             .frame_index
     };
 
@@ -333,7 +368,7 @@ pub fn build_brick_world(clip: &Clip, opts: &AnimOptions) -> Result<World, Strin
 
     // --- 5. Arrays and gets, one per (chunk, bank) --------------------------
     let bank_size = opts.bank_size.max(1);
-    let n_banks = clip.frames.len().div_ceil(bank_size).max(1);
+    let n_banks = frame_count.div_ceil(bank_size).max(1);
 
     // Per-bank index. Bank 0 reads the frame index directly; bank k subtracts
     // k*bank_size so its own array is addressed from zero.

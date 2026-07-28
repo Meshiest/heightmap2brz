@@ -1,4 +1,4 @@
-use heightmap::anim::pack::{Chunk, HEX_STRIDE, PIXELS_PER_CHUNK, pack, slice_of};
+use heightmap::anim::pack::{Chunk, HEX_STRIDE, PIXELS_PER_CHUNK, Packer, pack, slice_of};
 use heightmap::video::Clip;
 use image::{Rgba, RgbaImage};
 
@@ -296,4 +296,292 @@ fn over_the_absolute_cap_errors_naming_both_limits() {
     let err = heightmap::anim::pack::pack(&clip, 128).expect_err("must refuse");
     assert!(err.contains(&MAX_FRAMES.to_string()), "error must name the cap: {err}");
     assert!(err.contains(&BANK_FRAMES.to_string()), "error must name the bank size: {err}");
+}
+
+// --- Task 3: the fused Packer ---------------------------------------------
+
+/// The regression gate for the whole change: the fused packer must agree with
+/// today's two-pass `pack` + `visible` byte for byte. Uses a clip with a
+/// pixel that is transparent in some frames and opaque in others, plus one
+/// transparent throughout, so visibility is not trivially all-true.
+#[test]
+fn the_fused_packer_matches_the_two_pass_result_exactly() {
+    let (w, h, n) = (5u32, 4u32, 6usize);
+    let mut frames = Vec::new();
+    for f in 0..n {
+        let mut img = image::RgbaImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                // pixel (0,0) is never opaque; (1,0) only on odd frames
+                let a = match (x, y) {
+                    (0, 0) => 0u8,
+                    (1, 0) => if f % 2 == 1 { 255 } else { 0 },
+                    _ => 255,
+                };
+                img.put_pixel(x, y, image::Rgba([(x * 7) as u8, (y * 11) as u8, f as u8, a]));
+            }
+        }
+        frames.push(img);
+    }
+    let clip = heightmap::video::Clip { width: w, height: h, fps: 10.0, frames };
+
+    let want_chunks = heightmap::anim::pack::pack(&clip, 128).expect("pack");
+    let want_visible: Vec<bool> = (0..(w * h) as usize)
+        .map(|i| {
+            let (col, row) = ((i as u32) % w, (i as u32) / w);
+            clip.frames.iter().any(|f| f.get_pixel(col, row).0[3] >= 128)
+        })
+        .collect();
+
+    let mut p = Packer::new(w, h, 128, HEX_STRIDE);
+    for f in &clip.frames {
+        p.push_frame(f).expect("push");
+    }
+    let (got_chunks, got_visible) = p.finish();
+
+    assert_eq!(got_chunks.len(), want_chunks.len(), "chunk count");
+    for (g, wc) in got_chunks.iter().zip(&want_chunks) {
+        assert_eq!(g.first_pixel, wc.first_pixel);
+        assert_eq!(g.pixel_count, wc.pixel_count);
+        assert_eq!(g.frames, wc.frames, "frame strings must be byte-identical");
+    }
+    assert_eq!(got_visible, want_visible, "visibility must match the old scan");
+    assert!(!got_visible[0], "a never-opaque pixel must be invisible");
+    assert!(got_visible[1], "a sometimes-opaque pixel must be visible");
+}
+
+/// A culled pixel still reserves its stride in every frame string, so every
+/// surviving pixel's offset stays a plain `pixel_in_chunk * stride`.
+#[test]
+fn a_culled_pixel_still_reserves_its_slot() {
+    let img = image::RgbaImage::from_pixel(3, 1, image::Rgba([0, 0, 0, 0]));
+    let mut p = Packer::new(3, 1, 128, HEX_STRIDE);
+    p.push_frame(&img).expect("push");
+    let (chunks, visible) = p.finish();
+    assert_eq!(chunks[0].frames[0].len(), 3 * HEX_STRIDE);
+    assert_eq!(visible, vec![false; 3]);
+}
+
+#[test]
+fn pushing_past_the_frame_cap_errors() {
+    let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+    let mut p = Packer::new(1, 1, 128, HEX_STRIDE);
+    for _ in 0..heightmap::anim::pack::MAX_FRAMES {
+        p.push_frame(&img).expect("within the cap");
+    }
+    assert!(p.push_frame(&img).is_err(), "one past the cap must error");
+}
+
+#[test]
+fn a_zero_frame_packer_still_produces_its_chunks() {
+    let (chunks, visible) = Packer::new(4, 2, 128, HEX_STRIDE).finish();
+    assert_eq!(chunks.len(), 1);
+    assert!(chunks[0].frames.is_empty(), "no frames pushed, no frame strings");
+    assert_eq!(visible, vec![false; 8]);
+}
+
+// --- Important 4: `push_frame` must reject a frame that disagrees with the
+// dimensions `Packer::new` was built with, rather than panicking (undersized)
+// or silently cropping (oversized). Nothing in the `FrameStream` trait
+// enforced this before; `build_brick_world` sizes the `Packer` from
+// `source.info()` once and then indexes every subsequent frame with
+// `get_pixel(col, row)`, so a disagreeing frame reached that call unchecked.
+
+/// A 4x4 `Packer` fed a 2x2 frame used to panic inside `get_pixel` the moment
+/// it tried to read a column/row past the smaller frame's edge -- aborting
+/// the CLI process and killing the GUI's render thread. It must now return a
+/// descriptive `Err` instead, before any pixel is read.
+#[test]
+fn push_frame_rejects_an_undersized_frame_instead_of_panicking() {
+    let mut p = Packer::new(4, 4, 128, HEX_STRIDE);
+    let small = RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255]));
+    let err = p.push_frame(&small).expect_err("an undersized frame must error, not panic");
+    assert!(err.contains("4x4"), "error must name the expected size: {err}");
+    assert!(err.contains("2x2"), "error must name the actual size: {err}");
+}
+
+/// A 2x2 `Packer` fed a 4x4 frame used to silently succeed: `get_pixel`
+/// stayed in-bounds for the smaller footprint, so the extra rows/columns
+/// were read and then simply never referenced again -- no error, no
+/// indication anything was wrong, just a quietly cropped result.
+#[test]
+fn push_frame_rejects_an_oversized_frame_instead_of_silently_cropping() {
+    let mut p = Packer::new(2, 2, 128, HEX_STRIDE);
+    let big = RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 255]));
+    let err = p.push_frame(&big).expect_err("an oversized frame must error, not be cropped");
+    assert!(err.contains("2x2"), "error must name the expected size: {err}");
+    assert!(err.contains("4x4"), "error must name the actual size: {err}");
+}
+
+/// The dimension check must fire before the frame-count cap is otherwise
+/// exhausted -- i.e. it applies per push, not just once -- and must not
+/// corrupt a `Packer` that already has good frames pushed: a later mismatch
+/// errors without touching the chunks already built from valid frames.
+#[test]
+fn a_dimension_mismatch_after_valid_frames_still_errors_without_corrupting_prior_chunks() {
+    let mut p = Packer::new(2, 1, 128, HEX_STRIDE);
+    let good = RgbaImage::from_pixel(2, 1, Rgba([9, 9, 9, 255]));
+    p.push_frame(&good).expect("first frame matches info()");
+    let bad = RgbaImage::from_pixel(3, 1, Rgba([9, 9, 9, 255]));
+    assert!(p.push_frame(&bad).is_err(), "a later mismatched frame must still error");
+    let (chunks, _) = p.finish();
+    assert_eq!(chunks[0].frames.len(), 1, "the one valid push must be preserved, not rolled back");
+    assert_eq!(chunks[0].frames[0], "090909090909");
+}
+
+// --- Differential sweep: Packer vs. the two-pass pack()+visible() ---------
+//
+// The single regression test above pins one hand-picked clip. This sweep
+// goes wider: many widths/heights/frame-counts/alpha patterns, including
+// ones that straddle a chunk boundary, are fully transparent, are fully
+// opaque, or are a bare 1x1 clip -- run through both the old two-pass path
+// (`pack` + a re-implementation of `bricks::visible`'s rule) and the new
+// fused `Packer`, then diffed byte for byte.
+
+fn alpha_opaque(_x: u32, _y: u32, _f: usize) -> u8 {
+    255
+}
+fn alpha_transparent(_x: u32, _y: u32, _f: usize) -> u8 {
+    0
+}
+fn alpha_checkerboard(x: u32, y: u32, f: usize) -> u8 {
+    if (x + y + f as u32) % 2 == 0 { 255 } else { 0 }
+}
+fn alpha_threshold_boundary(x: u32, _y: u32, _f: usize) -> u8 {
+    if x % 2 == 0 { 127 } else { 128 }
+}
+fn alpha_odd_frames_only(_x: u32, _y: u32, f: usize) -> u8 {
+    if f % 2 == 1 { 255 } else { 0 }
+}
+/// A cheap deterministic bit-mixer, not a real PRNG -- just enough spread
+/// that (x, y, f) triples don't fall into an accidental pattern the other
+/// alpha functions might share.
+fn alpha_pseudo_random(x: u32, y: u32, f: usize) -> u8 {
+    let v = x
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add(y.wrapping_mul(40_503))
+        .wrapping_add(f as u32)
+        .wrapping_mul(2_246_822_519);
+    ((v >> 24) & 0xFF) as u8
+}
+
+struct SweepCase {
+    label: &'static str,
+    w: u32,
+    h: u32,
+    n: usize,
+    threshold: u8,
+    alpha: fn(u32, u32, usize) -> u8,
+}
+
+/// Builds a clip from `case`, runs it through the old two-pass path (`pack`
+/// plus a fresh re-implementation of `bricks::visible`'s rule -- `bricks.rs`
+/// is off limits for this task, so it is restated here rather than imported)
+/// and through `Packer`, and appends a description to `mismatches` for every
+/// place they disagree. Returns without mismatching only if every chunk's
+/// `first_pixel`/`pixel_count`/`frames` and the full visibility vector are
+/// identical.
+fn run_sweep_case(case: &SweepCase, mismatches: &mut Vec<String>) {
+    let SweepCase { label, w, h, n, threshold, alpha } = *case;
+    let mut frames = Vec::with_capacity(n);
+    for f in 0..n {
+        let mut img = image::RgbaImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let a = alpha(x, y, f);
+                img.put_pixel(x, y, image::Rgba([(x * 7) as u8, (y * 11) as u8, f as u8, a]));
+            }
+        }
+        frames.push(img);
+    }
+    let clip = heightmap::video::Clip { width: w, height: h, fps: 10.0, frames };
+
+    let want_chunks = match heightmap::anim::pack::pack(&clip, threshold) {
+        Ok(c) => c,
+        Err(e) => {
+            mismatches.push(format!("{label}: pack() itself errored: {e}"));
+            return;
+        }
+    };
+    let want_visible: Vec<bool> = (0..(w as usize * h as usize))
+        .map(|i| {
+            let (col, row) = ((i as u32) % w.max(1), (i as u32) / w.max(1));
+            clip.frames.iter().any(|fr| fr.get_pixel(col, row).0[3] >= threshold)
+        })
+        .collect();
+
+    let mut p = Packer::new(w, h, threshold, HEX_STRIDE);
+    for f in &clip.frames {
+        if let Err(e) = p.push_frame(f) {
+            mismatches.push(format!("{label}: Packer::push_frame errored unexpectedly: {e}"));
+            return;
+        }
+    }
+    let (got_chunks, got_visible) = p.finish();
+
+    if got_chunks.len() != want_chunks.len() {
+        mismatches.push(format!(
+            "{label}: chunk count {} != {}",
+            got_chunks.len(),
+            want_chunks.len()
+        ));
+        return;
+    }
+    for (i, (g, w)) in got_chunks.iter().zip(&want_chunks).enumerate() {
+        if g.first_pixel != w.first_pixel {
+            mismatches.push(format!("{label}: chunk {i} first_pixel differs"));
+        }
+        if g.pixel_count != w.pixel_count {
+            mismatches.push(format!("{label}: chunk {i} pixel_count differs"));
+        }
+        if g.frames != w.frames {
+            mismatches.push(format!("{label}: chunk {i} frame strings differ"));
+        }
+    }
+    if got_visible != want_visible {
+        mismatches.push(format!("{label}: visibility vector differs"));
+    }
+}
+
+#[test]
+fn a_differential_sweep_of_configurations_matches_the_two_pass_result() {
+    let cases = vec![
+        SweepCase { label: "1x1 opaque single frame", w: 1, h: 1, n: 1, threshold: 128, alpha: alpha_opaque },
+        SweepCase { label: "1x1 transparent single frame", w: 1, h: 1, n: 1, threshold: 128, alpha: alpha_transparent },
+        SweepCase { label: "1x1 zero frames", w: 1, h: 1, n: 0, threshold: 128, alpha: alpha_opaque },
+        SweepCase { label: "1x1 alternating across many frames", w: 1, h: 1, n: 10, threshold: 128, alpha: alpha_odd_frames_only },
+        SweepCase { label: "fully opaque clip", w: 6, h: 4, n: 5, threshold: 128, alpha: alpha_opaque },
+        SweepCase { label: "fully transparent clip", w: 6, h: 4, n: 5, threshold: 128, alpha: alpha_transparent },
+        SweepCase { label: "checkerboard alpha", w: 9, h: 7, n: 6, threshold: 128, alpha: alpha_checkerboard },
+        SweepCase { label: "alpha exactly at / one below threshold", w: 8, h: 1, n: 1, threshold: 128, alpha: alpha_threshold_boundary },
+        SweepCase { label: "pseudo-random alpha, mid threshold", w: 13, h: 11, n: 9, threshold: 128, alpha: alpha_pseudo_random },
+        SweepCase { label: "pseudo-random alpha, low threshold", w: 13, h: 11, n: 9, threshold: 1, alpha: alpha_pseudo_random },
+        SweepCase { label: "pseudo-random alpha, high threshold", w: 13, h: 11, n: 9, threshold: 255, alpha: alpha_pseudo_random },
+        SweepCase { label: "threshold zero keeps everything", w: 5, h: 5, n: 3, threshold: 0, alpha: alpha_transparent },
+        SweepCase { label: "chunk boundary exact width", w: PIXELS_PER_CHUNK as u32, h: 1, n: 2, threshold: 128, alpha: alpha_checkerboard },
+        SweepCase { label: "chunk boundary minus one", w: (PIXELS_PER_CHUNK - 1) as u32, h: 1, n: 2, threshold: 128, alpha: alpha_checkerboard },
+        SweepCase { label: "chunk boundary plus one", w: (PIXELS_PER_CHUNK + 1) as u32, h: 1, n: 2, threshold: 128, alpha: alpha_checkerboard },
+        SweepCase { label: "multi-row straddling several chunks", w: (PIXELS_PER_CHUNK * 2 + 5) as u32, h: 1, n: 2, threshold: 128, alpha: alpha_checkerboard },
+        SweepCase { label: "zero-frame multi-pixel clip", w: 5, h: 3, n: 0, threshold: 128, alpha: alpha_opaque },
+        SweepCase { label: "zero-width clip", w: 0, h: 5, n: 3, threshold: 128, alpha: alpha_opaque },
+        SweepCase { label: "zero-height clip", w: 5, h: 0, n: 3, threshold: 128, alpha: alpha_opaque },
+        SweepCase { label: "zero-width and zero-height clip", w: 0, h: 0, n: 3, threshold: 128, alpha: alpha_opaque },
+    ];
+
+    let mut mismatches = Vec::new();
+    for case in &cases {
+        run_sweep_case(case, &mut mismatches);
+    }
+    println!(
+        "differential sweep: {} configurations compared, {} diverged",
+        cases.len(),
+        mismatches.len()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} configurations diverged:\n{}",
+        mismatches.len(),
+        cases.len(),
+        mismatches.join("\n")
+    );
 }

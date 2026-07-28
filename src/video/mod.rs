@@ -1,9 +1,15 @@
 use image::RgbaImage;
 
 pub mod animated;
+pub mod backend;
+pub mod demux;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ffmpeg;
+pub mod rustvideo;
 pub mod scale;
 pub mod sequence;
 pub mod source;
+pub mod stream;
 
 /// A decoded sequence of frames at a fixed size and frame rate.
 ///

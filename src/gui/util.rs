@@ -79,6 +79,26 @@ pub fn pick_animated_bytes() -> Promise<Option<(String, Vec<u8>)>> {
     }
 }
 
+/// Pick a video file, returning its PATH rather than its bytes.
+///
+/// Deliberately not `pick_animated_bytes`'s shape: that reads the whole file
+/// into memory, and reading a 650 MB mp4 up front is exactly what the decode
+/// backends exist to avoid. The backends open the path and stream from it.
+///
+/// The filter is only offered on targets where a backend can actually decode
+/// these formats. A picker that accepts a file the tool then refuses is worse
+/// than one that never offered it.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn pick_video_path() -> Promise<Option<std::path::PathBuf>> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .add_filter("Video Files", &crate::video::source::VIDEO_EXTENSIONS);
+    let pick = async move {
+        let handle = dialog.pick_file().await?;
+        Some(handle.path().to_path_buf())
+    };
+    Promise::spawn_thread("pick_video_path", move || pollster::block_on(pick))
+}
+
 /// Small square thumbnail for a picked image, served via egui's bytes loader.
 pub fn thumb(ui: &mut egui::Ui, img: &PickedImage) {
     let uri = format!("bytes://thumb/{}", img.name);
