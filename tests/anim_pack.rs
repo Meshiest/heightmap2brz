@@ -120,7 +120,7 @@ fn exceeding_the_array_limit_is_an_error() {
 /// whether a culled slot is blacked out or left at its source color. This
 /// pins the choice made here: a pixel below threshold in a given frame
 /// encodes as `000000` in *that* frame's string (its real color carries no
-/// meaning there — nothing displays it), independent of what it encodes to
+/// meaning there -- nothing displays it), independent of what it encodes to
 /// in frames where it clears the threshold.
 #[test]
 fn a_culled_pixel_encodes_as_black_not_its_source_color() {
@@ -136,7 +136,7 @@ fn a_culled_pixel_encodes_as_black_not_its_source_color() {
 /// Pins the boundary direction: alpha exactly equal to the threshold counts
 /// as opaque enough (`>=`), matching the codebase's existing convention in
 /// `text.rs` (`p[3] < opts.alpha_threshold` is the *culled* branch, so `>=`
-/// survives) — not the stricter `>` a naive reading of "below the threshold"
+/// survives) -- not the stricter `>` a naive reading of "below the threshold"
 /// might suggest for the excluded side.
 #[test]
 fn alpha_exactly_at_threshold_is_kept_one_below_is_culled() {
@@ -481,6 +481,15 @@ struct SweepCase {
 /// place they disagree. Returns without mismatching only if every chunk's
 /// `first_pixel`/`pixel_count`/`frames` and the full visibility vector are
 /// identical.
+///
+/// Every case is run with `linearize` BOTH off and on. `pack` has no
+/// `linearize` of its own, so the oracle for the `on` half is `pack` over a
+/// clip whose pixels have already been through `crate::util::to_linear_rgb`.
+/// That is a genuine oracle rather than a restatement of the optimized code:
+/// `to_linear_rgb` passes alpha through untouched (see its doc), so culling
+/// -- which reads alpha only, before any colour conversion -- is bit-for-bit
+/// the same decision on both clips, and the surviving pixels' encoded colour
+/// is exactly `to_linear_rgb(p)` either way.
 fn run_sweep_case(case: &SweepCase, mismatches: &mut Vec<String>) {
     let SweepCase { label, w, h, n, threshold, alpha } = *case;
     let mut frames = Vec::with_capacity(n);
@@ -489,20 +498,25 @@ fn run_sweep_case(case: &SweepCase, mismatches: &mut Vec<String>) {
         for y in 0..h {
             for x in 0..w {
                 let a = alpha(x, y, f);
-                img.put_pixel(x, y, image::Rgba([(x * 7) as u8, (y * 11) as u8, f as u8, a]));
+                // `x * 7` / `y * 11` wrap deliberately on the wide cases
+                // below, which is fine: the point is a spread of byte values,
+                // not a unique one per pixel.
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([
+                        (x.wrapping_mul(7)) as u8,
+                        (y.wrapping_mul(11)) as u8,
+                        (f as u32).wrapping_mul(29) as u8,
+                        a,
+                    ]),
+                );
             }
         }
         frames.push(img);
     }
     let clip = heightmap::video::Clip { width: w, height: h, fps: 10.0, frames };
 
-    let want_chunks = match heightmap::anim::pack::pack(&clip, threshold) {
-        Ok(c) => c,
-        Err(e) => {
-            mismatches.push(format!("{label}: pack() itself errored: {e}"));
-            return;
-        }
-    };
     let want_visible: Vec<bool> = (0..(w as usize * h as usize))
         .map(|i| {
             let (col, row) = ((i as u32) % w.max(1), (i as u32) / w.max(1));
@@ -510,36 +524,67 @@ fn run_sweep_case(case: &SweepCase, mismatches: &mut Vec<String>) {
         })
         .collect();
 
-    let mut p = Packer::new(w, h, threshold, HEX_STRIDE);
-    for f in &clip.frames {
-        if let Err(e) = p.push_frame(f) {
-            mismatches.push(format!("{label}: Packer::push_frame errored unexpectedly: {e}"));
+    for linearize in [false, true] {
+        let label = format!("{label} [linearize={linearize}]");
+
+        // The oracle clip: identical pixels for `linearize=false`, and the
+        // sRGB->linear transfer already applied for `linearize=true`.
+        let oracle = if linearize {
+            let frames = clip
+                .frames
+                .iter()
+                .map(|fr| {
+                    let mut out = fr.clone();
+                    for px in out.pixels_mut() {
+                        px.0 = heightmap::util::to_linear_rgb(px.0);
+                    }
+                    out
+                })
+                .collect();
+            heightmap::video::Clip { width: w, height: h, fps: 10.0, frames }
+        } else {
+            clip.clone()
+        };
+
+        let want_chunks = match heightmap::anim::pack::pack(&oracle, threshold) {
+            Ok(c) => c,
+            Err(e) => {
+                mismatches.push(format!("{label}: pack() itself errored: {e}"));
+                return;
+            }
+        };
+
+        let mut p = Packer::new(w, h, threshold, HEX_STRIDE).linearize(linearize);
+        for f in &clip.frames {
+            if let Err(e) = p.push_frame(f) {
+                mismatches.push(format!("{label}: Packer::push_frame errored unexpectedly: {e}"));
+                return;
+            }
+        }
+        let (got_chunks, got_visible) = p.finish();
+
+        if got_chunks.len() != want_chunks.len() {
+            mismatches.push(format!(
+                "{label}: chunk count {} != {}",
+                got_chunks.len(),
+                want_chunks.len()
+            ));
             return;
         }
-    }
-    let (got_chunks, got_visible) = p.finish();
-
-    if got_chunks.len() != want_chunks.len() {
-        mismatches.push(format!(
-            "{label}: chunk count {} != {}",
-            got_chunks.len(),
-            want_chunks.len()
-        ));
-        return;
-    }
-    for (i, (g, w)) in got_chunks.iter().zip(&want_chunks).enumerate() {
-        if g.first_pixel != w.first_pixel {
-            mismatches.push(format!("{label}: chunk {i} first_pixel differs"));
+        for (i, (g, wc)) in got_chunks.iter().zip(&want_chunks).enumerate() {
+            if g.first_pixel != wc.first_pixel {
+                mismatches.push(format!("{label}: chunk {i} first_pixel differs"));
+            }
+            if g.pixel_count != wc.pixel_count {
+                mismatches.push(format!("{label}: chunk {i} pixel_count differs"));
+            }
+            if g.frames != wc.frames {
+                mismatches.push(format!("{label}: chunk {i} frame strings differ"));
+            }
         }
-        if g.pixel_count != w.pixel_count {
-            mismatches.push(format!("{label}: chunk {i} pixel_count differs"));
+        if got_visible != want_visible {
+            mismatches.push(format!("{label}: visibility vector differs"));
         }
-        if g.frames != w.frames {
-            mismatches.push(format!("{label}: chunk {i} frame strings differ"));
-        }
-    }
-    if got_visible != want_visible {
-        mismatches.push(format!("{label}: visibility vector differs"));
     }
 }
 
@@ -562,6 +607,18 @@ fn a_differential_sweep_of_configurations_matches_the_two_pass_result() {
         SweepCase { label: "chunk boundary minus one", w: (PIXELS_PER_CHUNK - 1) as u32, h: 1, n: 2, threshold: 128, alpha: alpha_checkerboard },
         SweepCase { label: "chunk boundary plus one", w: (PIXELS_PER_CHUNK + 1) as u32, h: 1, n: 2, threshold: 128, alpha: alpha_checkerboard },
         SweepCase { label: "multi-row straddling several chunks", w: (PIXELS_PER_CHUNK * 2 + 5) as u32, h: 1, n: 2, threshold: 128, alpha: alpha_checkerboard },
+        // Every chunk-boundary case above is a single row, so a chunk always
+        // began at column 0 -- the one arrangement in which "a chunk is a
+        // contiguous run of the frame buffer" is trivially true. These are
+        // taller than one row AND not a whole number of chunks per row, so
+        // chunk seams land in the MIDDLE of a row and a chunk spans a row
+        // wrap. That is exactly the case a flat-slice walk of `as_raw()` (or
+        // any surviving `col`/`row` arithmetic) can get wrong.
+        SweepCase { label: "chunk seams mid-row, odd width", w: 97, h: 53, n: 3, threshold: 128, alpha: alpha_pseudo_random },
+        SweepCase { label: "chunk seam exactly one row in", w: PIXELS_PER_CHUNK as u32, h: 4, n: 2, threshold: 128, alpha: alpha_checkerboard },
+        SweepCase { label: "chunk seam one pixel past a row", w: (PIXELS_PER_CHUNK - 1) as u32, h: 4, n: 2, threshold: 128, alpha: alpha_pseudo_random },
+        SweepCase { label: "many rows, several chunks, all opaque", w: 64, h: 64, n: 2, threshold: 128, alpha: alpha_opaque },
+        SweepCase { label: "many rows, several chunks, all culled", w: 64, h: 64, n: 2, threshold: 128, alpha: alpha_transparent },
         SweepCase { label: "zero-frame multi-pixel clip", w: 5, h: 3, n: 0, threshold: 128, alpha: alpha_opaque },
         SweepCase { label: "zero-width clip", w: 0, h: 5, n: 3, threshold: 128, alpha: alpha_opaque },
         SweepCase { label: "zero-height clip", w: 5, h: 0, n: 3, threshold: 128, alpha: alpha_opaque },
@@ -584,4 +641,75 @@ fn a_differential_sweep_of_configurations_matches_the_two_pass_result() {
         cases.len(),
         mismatches.join("\n")
     );
+}
+
+// --- --srgb-to-linear --------------------------------------------------------
+
+/// **`--srgb-to-linear` must actually convert.**
+///
+/// `Packer::linearize` had no behavioural test at all: emptying its body left
+/// the whole suite green, so the flag could have been inert and nothing would
+/// have said so. Video frames are sRGB and whether the in-game `MakeColorHex`
+/// gate wants sRGB or linear is a property of the GAME -- nothing between this
+/// packer and that gate touches colour -- so this flag is the only thing that
+/// can compensate, and it has to be the exact transfer `crate::util` defines
+/// rather than approximately darker.
+#[test]
+fn srgb_to_linear_rewrites_every_visible_pixel_with_the_linear_transfer() {
+    // Mid-tones, where the sRGB transfer bites hardest. 0 and 255 are fixed
+    // points of it, so a test built only on black and white would pass against
+    // a no-op.
+    let source = vec![[0x80, 0x40, 0xC0, 255], [0x10, 0xF0, 0x7F, 255]];
+    let build = |on: bool| -> String {
+        let mut p = Packer::new(2, 1, 128, HEX_STRIDE).linearize(on);
+        let mut img = RgbaImage::new(2, 1);
+        for (i, c) in source.iter().enumerate() {
+            img.put_pixel(i as u32, 0, Rgba(*c));
+        }
+        p.push_frame(&img).expect("push");
+        let (chunks, _) = p.finish();
+        chunks[0].frames[0].clone()
+    };
+
+    let plain = build(false);
+    let linear = build(true);
+    assert_ne!(plain, linear, "the flag must change the bytes the gate receives");
+
+    // Exactly the transfer, pixel by pixel -- not merely "different".
+    let expected: String = source
+        .iter()
+        .map(|c| {
+            let l = heightmap::util::to_linear_rgb(*c);
+            format!("{:02X}{:02X}{:02X}", l[0], l[1], l[2])
+        })
+        .collect();
+    assert_eq!(linear, expected, "every channel must be the sRGB->linear transfer");
+    assert_eq!(plain, "8040C010F07F", "off must still be the raw sRGB bytes");
+
+    // And it really is a DARKENING transfer, so a `linearize` that silently
+    // ran the inverse would not pass either. Black is a fixed point, which is
+    // why this test's source is all mid-tones -- a black-and-white clip could
+    // not tell the transfer from a no-op.
+    assert_eq!(heightmap::util::to_linear_rgb([0, 0, 0, 255])[0], 0);
+    assert!(
+        heightmap::util::to_linear_rgb([0x80, 0x80, 0x80, 255])[0] < 0x80,
+        "mid grey must come out darker"
+    );
+}
+
+/// A culled pixel writes its `'0'` padding either way: the flag governs
+/// COLOUR, not the reserved-slot invariant every `Substring` offset depends on.
+#[test]
+fn srgb_to_linear_does_not_disturb_a_culled_pixels_reserved_slot() {
+    for on in [false, true] {
+        let mut p = Packer::new(2, 1, 128, HEX_STRIDE).linearize(on);
+        let mut img = RgbaImage::new(2, 1);
+        img.put_pixel(0, 0, Rgba([0, 0, 0, 0])); // below the threshold
+        img.put_pixel(1, 0, Rgba([0x80, 0x80, 0x80, 255]));
+        p.push_frame(&img).expect("push");
+        let (chunks, _) = p.finish();
+        let frame = &chunks[0].frames[0];
+        assert_eq!(frame.len(), 2 * HEX_STRIDE, "linearize {on}: stride must be untouched");
+        assert_eq!(&frame[..HEX_STRIDE], "000000", "linearize {on}: culled slot stays zeroed");
+    }
 }

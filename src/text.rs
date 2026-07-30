@@ -20,7 +20,7 @@ pub enum FontPreset {
     /// `██` / two spaces per pixel is square; monospace. Calibrated from the
     /// user's reference clipboards (2026-07-04).
     IosevkaTerm,
-    /// Single `█` per pixel is square, halving the char budget — but the font
+    /// Single `█` per pixel is square, halving the char budget -- but the font
     /// is proportional, so space-based transparency does NOT line up.
     Orbitron,
 }
@@ -112,7 +112,7 @@ impl FontPreset {
     }
 }
 
-/// TextDisplay material (`EBRTextMaterial` — declaration order matches the
+/// TextDisplay material (`EBRTextMaterial` -- declaration order matches the
 /// game's enum values). Unlit and Graffiti have no shading settings; only
 /// Graffiti projects onto nearby bricks (depth/angle limit, priority).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,7 +172,7 @@ impl TextMaterial {
     }
 }
 
-/// TextDisplay edge shading style (`EBRTextShading` — declaration order
+/// TextDisplay edge shading style (`EBRTextShading` -- declaration order
 /// matches the game's enum values). Unavailable for Unlit/Graffiti.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextShading {
@@ -228,11 +228,11 @@ pub struct TextOptions {
     pub line_offset: f32,
     /// Component Kerning.
     pub kerning: f32,
-    /// Component Offset.X — glyph-fit nudge.
+    /// Component Offset.X -- glyph-fit nudge.
     pub offset_x: f32,
-    /// Component Offset.Y — glyph-fit nudge.
+    /// Component Offset.Y -- glyph-fit nudge.
     pub offset_y: f32,
-    /// Component Offset.Z — out-of-plane: pushes the text off the anchor
+    /// Component Offset.Z -- out-of-plane: pushes the text off the anchor
     /// wall's face so the cubes hide behind the image.
     pub offset_z: f32,
     /// Horizontal rendered size / nominal pixel size: tile spacing along the
@@ -253,10 +253,10 @@ pub struct TextOptions {
     pub tile_override: Option<u32>,
     /// Component material.
     pub material: TextMaterial,
-    /// Material Intensity — glow brightness / metal, glass, translucency
+    /// Material Intensity -- glow brightness / metal, glass, translucency
     /// strength. Inert for Unlit and Plastic.
     pub material_intensity: i32,
-    /// Scuff width — worn-edge wear on the glyphs.
+    /// Scuff width -- worn-edge wear on the glyphs.
     pub scuff: f32,
     /// Graffiti only: projection depth limit in cm.
     pub graffiti_depth_limit: f32,
@@ -406,7 +406,7 @@ const BLOCK_SPRITES: &str = " ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█";
 pub enum PixelMode {
     /// One colored glyph run per pixel (full color).
     Color,
-    /// Monochrome braille: each char is a 2-wide × 4-tall pixel cell —
+    /// Monochrome braille: each char is a 2-wide × 4-tall pixel cell --
     /// eight pixels per character, no color tags.
     Braille,
     /// Monochrome quadrant blocks: each char is a 2×2 pixel cell.
@@ -433,7 +433,7 @@ impl PixelMode {
         }
     }
 
-    /// Tile edge in pixels. Mono modes pack 4–8 pixels per char, so their
+    /// Tile edge in pixels. Mono modes pack 4-8 pixels per char, so their
     /// tiles are larger for the same char budget (fewer anchor bricks).
     pub fn tile_px(&self) -> u32 {
         match self {
@@ -509,7 +509,7 @@ pub struct TextTile {
 /// Tile the image into square patches across BOTH axes (patch size per
 /// [`PixelMode::tile_px`]), banding each patch at the char budget
 /// (worst-case color patches split into a couple of bands; mono patches are
-/// always one). Patches with nothing visible are skipped entirely — no
+/// always one). Patches with nothing visible are skipped entirely -- no
 /// brick, no component.
 pub fn encode_tiles(img: &RgbaImage, opts: &TextOptions) -> Result<Vec<TextTile>, String> {
     let (w, h) = img.dimensions();
@@ -560,6 +560,18 @@ fn row_too_wide(y: u32, chars: usize) -> String {
     )
 }
 
+/// The two halves of a `<color="RRGGBB">` tag, and its character cost.
+///
+/// Spelled out as literals, and the cost DERIVED from them, so the count and
+/// the text it counts cannot drift apart. All three parts are ASCII, so `len()`
+/// (bytes) and the char count are the same number -- which is what makes
+/// `COLOR_TAG_CHARS` a constant rather than a `chars().count()` per tag.
+/// `the_colour_tag_is_exactly_what_the_format_string_produced` pins both the
+/// text and the count against the `format!` they replaced.
+const COLOR_TAG_OPEN: &str = "<color=\"";
+const COLOR_TAG_CLOSE: &str = "\">";
+const COLOR_TAG_CHARS: usize = COLOR_TAG_OPEN.len() + 6 + COLOR_TAG_CLOSE.len();
+
 /// Encode one image row. Updates `last_color` with the final emitted tag so
 /// color runs can continue into following rows.
 fn encode_row(
@@ -571,36 +583,50 @@ fn encode_row(
     let (w, _) = img.dimensions();
     let mut out = String::new();
     let mut chars = 0usize;
+    // One pixel's worth of each glyph, built once per row rather than pushed
+    // one `char` at a time per pixel. `String::push` on a `char` is a UTF-8
+    // encode plus a copy, and the default glyphs are multi-byte, so it is not
+    // free at video frame rates.
+    let fill_run: String = std::iter::repeat_n(opts.fill_char, opts.char_repeat).collect();
+    let empty_run: String = std::iter::repeat_n(opts.empty_char, opts.char_repeat).collect();
+    // An `RgbaImage`'s buffer is row-major RGBA with no padding, so row `y` is
+    // one flat slice of it -- no per-pixel coordinate arithmetic and no
+    // bounds-checked `get_pixel`.
+    let row_start = y as usize * w as usize * 4;
+    let row = &img.as_raw()[row_start..row_start + w as usize * 4];
     // Transparent pixels are buffered so a trailing run can be trimmed when the
     // empty glyph is a space (invisible at line end); any other glyph is kept.
     let mut pending_empty = 0usize;
-    for x in 0..w {
-        let p = img.get_pixel(x, y).0;
+    for p in row.chunks_exact(4) {
         if p[3] < opts.alpha_threshold {
             pending_empty += 1;
             continue;
         }
-        for _ in 0..pending_empty * opts.char_repeat {
-            out.push(opts.empty_char);
+        for _ in 0..pending_empty {
+            out.push_str(&empty_run);
         }
         chars += pending_empty * opts.char_repeat;
         pending_empty = 0;
 
         let rgb = [p[0], p[1], p[2]];
         if *last_color != Some(rgb) {
-            let tag = format!("<color=\"{:02X}{:02X}{:02X}\">", rgb[0], rgb[1], rgb[2]);
-            chars += tag.chars().count();
-            out.push_str(&tag);
+            // Byte-for-byte the `format!("<color=\"{:02X}{:02X}{:02X}\">", ..)`
+            // this replaced -- see `crate::util::hex_pair` for why the
+            // formatting machinery is worth keeping out of a per-pixel path.
+            out.push_str(COLOR_TAG_OPEN);
+            out.push_str(crate::util::hex_pair(rgb[0]));
+            out.push_str(crate::util::hex_pair(rgb[1]));
+            out.push_str(crate::util::hex_pair(rgb[2]));
+            out.push_str(COLOR_TAG_CLOSE);
+            chars += COLOR_TAG_CHARS;
             *last_color = Some(rgb);
         }
-        for _ in 0..opts.char_repeat {
-            out.push(opts.fill_char);
-        }
+        out.push_str(&fill_run);
         chars += opts.char_repeat;
     }
     if opts.empty_char != ' ' {
-        for _ in 0..pending_empty * opts.char_repeat {
-            out.push(opts.empty_char);
+        for _ in 0..pending_empty {
+            out.push_str(&empty_run);
         }
         chars += pending_empty * opts.char_repeat;
     }
@@ -630,6 +656,54 @@ impl AsBrdbValue for Vector2f {
     }
 }
 
+/// `Component_TextDisplay`'s `Anchor`: which point OF THE TEXT BLOCK the
+/// anchor cube's position names, in normalized block coordinates. `(0, 0)` is
+/// the block's top-left, so the glyphs draw down and to the right of the cube --
+/// what every pixel-art placement in this crate wants, since each tile's cube
+/// sits at its patch's top-left image position.
+pub const ANCHOR_TOP_LEFT: Vector2f = Vector2f { x: 0.0, y: 0.0 };
+
+/// Anchor for a line meant to sit ON something rather than hang off it:
+/// horizontally CENTRED (X 0.5) and anchored at the block's BOTTOM edge
+/// (Y 1.0), so the text spreads either side of the cube and grows UPWARD from
+/// it. [`crate::anim::subtitle_display`] uses this to lay a subtitle across the
+/// bottom of the picture; see its `SUBTITLE_ANCHOR`.
+pub const ANCHOR_BOTTOM_CENTRE: Vector2f = Vector2f { x: 0.5, y: 1.0 };
+
+/// `EBRTextOutline::None` -- no outline at all.
+///
+/// The `Outline` property of `Component_TextDisplay` is typed as the game's
+/// `EBRTextOutline` in the save schema, which
+/// `brdb/crates/brdb/schemas/BRSavedComponentChunkSoA_max.schema` declares as
+/// `None = 0, Inlined = 1, Outlined = 2, HollowInlined = 3, HollowOutlined = 4`.
+/// These constants are read off that file rather than guessed, the same way
+/// [`FACE_X_POSITIVE`] is read off `EBrickDirection`.
+pub const OUTLINE_NONE: u8 = 0;
+/// `EBRTextOutline::Outlined` -- a solid outline drawn AROUND the glyph, using
+/// the component's `OutlineColor`/`OutlineWidth`. (`Inlined`, 1, eats into the
+/// glyph instead, which thins small text.) See [`OUTLINE_NONE`] for the source
+/// of these values.
+pub const OUTLINE_OUTLINED: u8 = 2;
+/// The `OutlineWidth` every text block in this crate draws with.
+///
+/// 4.0, chosen by the repository owner from a real render after seeing it on a
+/// subtitle. It was 2.0 until then, and briefly 4.0 for subtitles only -- but
+/// that was a distinction with no reason behind it, so there is one value.
+///
+/// Only affects blocks whose `Outline` is not [`OUTLINE_NONE`]; text mode's
+/// glyph bands draw the picture itself and carry no outline at all.
+pub const DEFAULT_OUTLINE_WIDTH: f32 = 4.0;
+
+/// Half-extent of the anchor cube every text block rides on, in world units.
+///
+/// The cube is a 1x1x1 micro brick, which is 2 world units on a side -- so its
+/// drawing face lies this far from its centre. Renderers that must put a text
+/// block *in front of* a surface rest the cube flush on that surface, i.e. put
+/// its centre one half-extent proud, which leaves the glyphs a full cube clear
+/// of it. Exported so those renderers can do that arithmetic against the real
+/// cube instead of a repeated literal.
+pub const ANCHOR_CUBE_HALF: i32 = 1;
+
 /// The invisible, collision-less anchor cube all text rides on.
 fn anchor_cube(position: Position, visible: bool) -> Brick {
     Brick {
@@ -651,9 +725,39 @@ fn anchor_cube(position: Position, visible: bool) -> Brick {
     }
 }
 
+/// Which face of the anchor cube a [`add_text_block`] block draws on. These
+/// are the game's `EBrickDirection` values, which is what the component's
+/// `Face` property is typed as in the save schema -- not an invented encoding.
+///
+/// A `TextDisplay` draws in the PLANE of the face it is given, so this is what
+/// decides whether a block stands up or lies flat. [`FACE_X_POSITIVE`] is the
+/// value every text render in this crate has always used (the glyph wall faces
+/// world +X, see [`add_text_tiles`]); [`FACE_Z_POSITIVE`] is the one a
+/// ground-flat screen needs, since such a screen presents its top to the
+/// viewer and a +X block over it would stand edge-on and be unreadable.
+///
+/// `Offset` stays in the component's own frame either way -- X/Y in the plane
+/// of the face, Z out of it (see [`TextOptions::offset_z`]) -- so changing the
+/// face does not change what any of the geometry options mean.
+pub const FACE_X_POSITIVE: u8 = 0;
+/// See [`FACE_X_POSITIVE`]. `EBrickDirection::Z_Positive`: the upward face,
+/// for text meant to lie flat in the ground plane.
+pub const FACE_Z_POSITIVE: u8 = 4;
+
 /// Add a TextDisplay block with explicit geometry (LineHeight/Kerning/Offset)
 /// on an anchor cube. `visible_anchor` shows the cube itself, useful when the
 /// block is meant to be compared against the cube's edges.
+///
+/// `face` is one of [`FACE_X_POSITIVE`] / [`FACE_Z_POSITIVE`] and decides
+/// which plane the glyphs are drawn in -- a caller placing text over a
+/// ground-flat build wants the latter.
+///
+/// Returns the anchor cube's brick id, which is the id a wire endpoint names --
+/// [`crate::anim::subtitle_display`] drives this component's `Text` port from
+/// a microchip, and there is no other way to reach the brick afterwards
+/// (`World::add_brick` consumes it). Callers that only want a static label can
+/// ignore the id; the brick carries one either way, exactly as every brick
+/// [`add_text_tiles`] places already does.
 pub fn add_text_block(
     world: &mut World,
     text: String,
@@ -662,8 +766,56 @@ pub fn add_text_block(
     kerning: f32,
     offset: Vector3f,
     visible_anchor: bool,
+    face: u8,
     opts: &TextOptions,
-) {
+) -> usize {
+    add_text_block_styled(
+        world,
+        text,
+        position,
+        line_height,
+        kerning,
+        offset,
+        visible_anchor,
+        face,
+        ANCHOR_TOP_LEFT,
+        OUTLINE_NONE,
+        DEFAULT_OUTLINE_WIDTH,
+        opts,
+    )
+}
+
+/// [`add_text_block`] with the two style properties a pixel-art block never
+/// varies made explicit: where in the text block the anchor cube sits
+/// ([`ANCHOR_TOP_LEFT`] / [`ANCHOR_BOTTOM_CENTRE`]) and whether the glyphs carry
+/// an outline ([`OUTLINE_NONE`] / [`OUTLINE_OUTLINED`]).
+///
+/// Everything else is identical, and [`add_text_block`] is exactly this call
+/// with the pixel-art values -- so a glyph band and an annotation keep the
+/// geometry they have always had, and only a caller that asks for a different
+/// anchor or outline gets one. The subtitle
+/// ([`crate::anim::subtitle_display`]) is the one caller that does: it is a
+/// LINE OF TEXT laid over the picture rather than a patch of pixels, so it
+/// centres itself on its cube, grows upward from it, and needs an outline to
+/// stay legible over arbitrary frame content.
+///
+/// `outline` is an `EBRTextOutline` value; `anchor` is the component's own
+/// normalized `Anchor`. Both are documented on their constants.
+#[allow(clippy::too_many_arguments)]
+pub fn add_text_block_styled(
+    world: &mut World,
+    text: String,
+    position: Position,
+    line_height: f32,
+    kerning: f32,
+    offset: Vector3f,
+    visible_anchor: bool,
+    face: u8,
+    anchor: Vector2f,
+    outline: u8,
+    outline_width: f32,
+    opts: &TextOptions,
+) -> usize {
     let (font_idx, _) = world
         .global_data
         .external_asset_references
@@ -673,35 +825,44 @@ pub fn add_text_block(
         kerning,
         ..opts.clone()
     };
-    world.add_brick(
-        anchor_cube(position, visible_anchor).with_component(text_display_component(
+    let (brick, id) = anchor_cube(position, visible_anchor)
+        .with_component(text_display_component(
             text,
             font_idx,
             offset,
             &block_opts,
-            0,
+            face,
             SavedBrickColor {
                 r: 255,
                 g: 255,
                 b: 255,
                 a: 255,
             },
-            Vector2f { x: 0.0, y: 0.0 },
+            anchor,
             0,
-            0,
-        )),
-    );
+            outline,
+            outline_width,
+        ))
+        .with_id_split();
+    world.add_brick(brick);
+    id
 }
 
-/// Add a readable TextDisplay label brick (for annotating generated saves) —
+/// Add a readable TextDisplay label brick (for annotating generated saves) --
 /// plain text at the given LineHeight, not pixel art.
+///
+/// Drawn on [`FACE_X_POSITIVE`], the same upright face every other text
+/// placement in this crate uses, so annotations read the same way they always
+/// have.
+///
+/// Returns the anchor's brick id, same as [`add_text_block`].
 pub fn add_annotation(
     world: &mut World,
     text: String,
     position: Position,
     line_height: f32,
     opts: &TextOptions,
-) {
+) -> usize {
     add_text_block(
         world,
         text,
@@ -714,8 +875,9 @@ pub fn add_annotation(
             z: 0.0,
         },
         false,
+        FACE_X_POSITIVE,
         opts,
-    );
+    )
 }
 
 /// Brickadia's number Variable gate brick.
@@ -762,7 +924,7 @@ Z",
 /// Build the live calibration save: a 128×128 checkerboard rendered exactly
 /// like a normal export (color, braille, and blocks modes alike), plus one
 /// number Variable gate per tunable geometry field, wired into EVERY text
-/// component — edit a variable in-game and the whole grid updates at once.
+/// component -- edit a variable in-game and the whole grid updates at once.
 /// Each variable carries an upward-facing (+Z) label so it's clear which is
 /// which. `cube_spacing` sets the world distance between tile anchors
 /// (tiny spacing = tiny text displays, large = billboards).
@@ -771,7 +933,7 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
     const CELL_PX: u32 = 8;
 
     // force small tiles in every mode (mono modes normally use 128px tiles)
-    // so the checkerboard splits into a seamed grid — tile overlap/gaps are
+    // so the checkerboard splits into a seamed grid -- tile overlap/gaps are
     // exactly what calibration needs to expose
     let tile_px = TILE_PX.min(CHECKER_PX) as f32;
     // scale the export geometry so a tile's rendering matches the requested
@@ -812,7 +974,7 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
     let text_ids = add_text_tiles(&mut world, tiles, &cal);
 
     // sufficiently small displays depth-stagger their cubes, whose per-cube
-    // Offset.Z compensation a shared wire would clobber — drop that
+    // Offset.Z compensation a shared wire would clobber -- drop that
     // variable entirely there (the collidable graffiti canvas also sits at
     // x > 0 without being a stagger, so only collisionless cubes count)
     let staggered = world
@@ -835,7 +997,7 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
         kerning: 0.0,
         // labels are plain text: never apply the mono modes' cell scaling
         mode: PixelMode::Color,
-        // nor the image's material — a Graffiti/Glow label is unreadable
+        // nor the image's material -- a Graffiti/Glow label is unreadable
         material: TextMaterial::Unlit,
         ..cal.clone()
     };
@@ -884,8 +1046,8 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
             Vector2f { x: 0.5, y: 0.5 },
             // bold
             1,
-            // outlined
-            2,
+            OUTLINE_OUTLINED,
+            DEFAULT_OUTLINE_WIDTH,
         ))
         .with_id_split();
         world.add_brick(brick);
@@ -914,7 +1076,7 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
 /// image. The anchor-cube grid already spans most of the image; each
 /// outermost tile's content extends up to one tile beyond its cube toward
 /// the text's right (world -Y) and downward (-Z), so the bounds pad those
-/// two edges — a ground placement then rests the image (not the cubes) on
+/// two edges -- a ground placement then rests the image (not the cubes) on
 /// the ground.
 pub fn make_text_prefab(world: &mut World, _img_w: u32, _img_h: u32, opts: &TextOptions) {
     let span_x = (TILE_PX as f32 * opts.line_world_height * opts.pitch_x).ceil() as i32;
@@ -946,7 +1108,7 @@ pub fn add_text_bricks(world: &mut World, bands: Vec<TextBand>, opts: &TextOptio
 }
 
 /// Add all tiles' bricks. Each tile's anchor cube sits AT its patch's image
-/// position (brick coordinates carry ALL the placement — the game does not
+/// position (brick coordinates carry ALL the placement -- the game does not
 /// honor large component Offset values), forming a sparse cube grid with
 /// the same footprint as the image, always covered by the rendered text.
 /// A multi-band tile stacks its extra cubes BACKWARD (world +X, behind the
@@ -962,11 +1124,11 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
         .insert_full(("BrickFontDescriptor".to_string(), opts.font.to_string()));
 
     // grid spacing follows the font's ACTUAL rendered size, not the nominal
-    // pixel size — tiles anchor where their neighbors' glyphs end. The CUBE
+    // pixel size -- tiles anchor where their neighbors' glyphs end. The CUBE
     // POSITION carries each tile's in-plane placement exactly (rounded to
     // the brick grid); component offsets stay pure glyph nudges. Any cube
-    // that would intersect an already-placed one — crowded tiles at tiny
-    // pixel sizes, or a tile's extra bands — steps BACKWARD (world +X) one
+    // that would intersect an already-placed one -- crowded tiles at tiny
+    // pixel sizes, or a tile's extra bands -- steps BACKWARD (world +X) one
     // cube at a time, its text returning via local Z.
     let tile_px = opts.tile_px() as usize;
     let step_true_x = tile_px as f32 * opts.line_world_height * opts.pitch_x;
@@ -987,7 +1149,7 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
         .max()
         .unwrap_or(0) as i32;
     // world +X points TOWARD the viewer (verified in-game), and bricks
-    // cannot use negative coordinates — so depth slots are assigned first,
+    // cannot use negative coordinates -- so depth slots are assigned first,
     // then the whole grid is arranged with the front plane at the deepest
     // slot used and crowded cubes stepping down toward x=0 (away from the
     // viewer), their text coming forward by their distance behind the
@@ -1028,7 +1190,7 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
     // graffiti renders only where it projects onto a collision surface, so
     // those exports get an invisible collidable wall flush in front of the
     // text plane. The wall must cover the content hanging one tile span
-    // below/right of the outermost anchors — and negative brick coordinates
+    // below/right of the outermost anchors -- and negative brick coordinates
     // are forbidden, so the whole grid first shifts up/left by that overhang.
     let span_y = step_true_x.ceil() as i32;
     let span_z = step_true_z.ceil() as i32;
@@ -1066,9 +1228,10 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
                 b: 255,
                 a: 255,
             },
-            Vector2f { x: 0.0, y: 0.0 },
+            ANCHOR_TOP_LEFT,
             0,
-            0,
+            OUTLINE_NONE,
+            DEFAULT_OUTLINE_WIDTH,
         ))
         .with_id_split();
         ids.push(id);
@@ -1088,7 +1251,7 @@ pub fn add_text_tiles(world: &mut World, tiles: Vec<TextTile>, opts: &TextOption
     ids
 }
 
-/// Graffiti projects onto collision surfaces — build one: invisible,
+/// Graffiti projects onto collision surfaces -- build one: invisible,
 /// collidable micro-brick slabs covering the image rectangle (the anchor
 /// grid plus the one-tile content overhang toward -Y/-Z), their back faces
 /// flush against the text plane (the front cubes' viewer-side face).
@@ -1131,8 +1294,13 @@ fn graffiti_canvas(
 }
 
 /// TextDisplay component data mirroring the user's calibrated reference
-/// clipboards: Anchor top-left, glyph-fit Offset, LineHeight sized so pixel
-/// rows land on world units — all seeded by the selected [`FontPreset`].
+/// clipboards: the caller's `anchor` (pixel art wants [`ANCHOR_TOP_LEFT`]),
+/// glyph-fit Offset, LineHeight sized so pixel rows land on world units -- all
+/// seeded by the selected [`FontPreset`].
+///
+/// `OutlineColor`/`OutlineWidth`, `bOverrideOutlineColor` and `bSharpOutlines`
+/// are written unconditionally, so an outline appears the moment `outline` is
+/// something other than [`OUTLINE_NONE`] -- nothing else has to be turned on.
 fn text_display_component(
     text: String,
     font_idx: usize,
@@ -1143,6 +1311,7 @@ fn text_display_component(
     anchor: Vector2f,
     typeface: u8,
     outline: u8,
+    outline_width: f32,
 ) -> LiteralComponent {
     LiteralComponent::new("Component_TextDisplay").with_data([
         ("Text", Box::new(text) as Box<dyn AsBrdbValue>),
@@ -1166,7 +1335,7 @@ fn text_display_component(
                 a: 255,
             }),
         ),
-        ("OutlineWidth", Box::new(2.0f32)),
+        ("OutlineWidth", Box::new(outline_width)),
         ("ScuffWidth", Box::new(opts.scuff)),
         ("GraffitiDepthLimit", Box::new(opts.graffiti_depth_limit)),
         ("GraffitiAngleLimit", Box::new(opts.graffiti_angle_limit)),
@@ -1219,6 +1388,26 @@ mod tests {
     #[test]
     fn single_opaque_pixel() {
         assert_eq!(text(&img(&[&[RED]])), "<color=\"FF0000\">██");
+    }
+
+    /// The hand-assembled colour tag must be byte-identical to the `format!`
+    /// it replaced, and `COLOR_TAG_CHARS` must be that tag's real character
+    /// count -- the encoder budgets every band against
+    /// `MAX_COMPONENT_CHARS` with it, so a count one too low would let a band
+    /// exceed the limit and be silently truncated in game.
+    #[test]
+    fn the_colour_tag_is_exactly_what_the_format_string_produced() {
+        for rgb in [[0u8, 0, 0], [255, 255, 255], [0x12, 0x34, 0x56], [1, 0xAB, 0xF0]] {
+            let want = format!("<color=\"{:02X}{:02X}{:02X}\">", rgb[0], rgb[1], rgb[2]);
+            let got = format!(
+                "{COLOR_TAG_OPEN}{}{}{}{COLOR_TAG_CLOSE}",
+                crate::util::hex_pair(rgb[0]),
+                crate::util::hex_pair(rgb[1]),
+                crate::util::hex_pair(rgb[2])
+            );
+            assert_eq!(got, want, "{rgb:?}");
+            assert_eq!(COLOR_TAG_CHARS, want.chars().count(), "tag char cost for {rgb:?}");
+        }
     }
 
     #[test]
@@ -1430,7 +1619,7 @@ mod tests {
     #[test]
     fn tiny_pixel_sizes_never_overlap_cubes() {
         // 0.02 units/px: a 32px tile renders ~0.6 units wide, far below the
-        // 2-unit cube size — crowded cubes must step BACKWARD (world +X)
+        // 2-unit cube size -- crowded cubes must step BACKWARD (world +X)
         // instead of spreading in-plane, keeping their true y/z placement
         let opts = TextOptions {
             line_world_height: 0.02,
@@ -1469,7 +1658,7 @@ mod tests {
 
     /// Graffiti projects onto collision surfaces, so those exports carry an
     /// invisible collidable wall flush in front of the text plane, covering
-    /// the image rectangle — with the grid shifted up/left so the wall's
+    /// the image rectangle -- with the grid shifted up/left so the wall's
     /// bricks stay in non-negative coordinates.
     #[test]
     fn graffiti_gets_invisible_collision_canvas() {
@@ -1576,7 +1765,7 @@ mod tests {
             .expect("calibration world must encode to brz");
 
         // braille mode: tiles are forced down to 32px so seams exist to
-        // check — same 4x4 grid, fully wired
+        // check -- same 4x4 grid, fully wired
         let opts = TextOptions {
             mode: PixelMode::Braille,
             ..Default::default()

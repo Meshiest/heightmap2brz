@@ -1,7 +1,10 @@
 use crate::{
     gui::{
         SharedOptions,
-        util::{PickedImage, deliver_save, pick_images, thumb},
+        util::{
+            PickedImage, deliver_save, deliver_world, draw_out_file_warnings, pick_images,
+            refuse_bad_out_file, thumb,
+        },
     },
     text::{
         FontPreset, PixelMode, TILE_PX, TextMaterial, TextOptions, TextShading, add_text_tiles,
@@ -36,7 +39,7 @@ pub struct TextApp {
     invert: bool,
     /// world units between calibration tile anchors (tiny = tiny displays)
     cube_spacing: u32,
-    // material; not reseeded by presets — a user choice, not calibration
+    // material; not reseeded by presets -- a user choice, not calibration
     material: TextMaterial,
     material_intensity: i32,
     scuff: f32,
@@ -155,7 +158,7 @@ impl TextApp {
     }
 
     /// The calibration grid spacing matching the current mode, pixel size,
-    /// and grid pitch — one tile's rendered span.
+    /// and grid pitch -- one tile's rendered span.
     fn natural_spacing(&self) -> u32 {
         // the calibration grid always uses TILE_PX tiles (mono modes force
         // seams), so spacing is one 32px tile's span regardless of mode
@@ -205,11 +208,11 @@ impl TextApp {
         make_text_prefab(&mut world, img_w, img_h, &opts);
 
         info!("Writing Save to {}", shared.out_file);
-        let data = match world.to_brz_vec() {
-            Ok(d) => d,
-            Err(e) => return error!("failed to encode brz: {e}"),
-        };
-        if let Err(e) = deliver_save(data, &shared.out_file, shared.out_clipboard) {
+        // `deliver_world`, not `to_brz_vec` + `deliver_save`: the destination's
+        // extension decides the container. This pane shares `out_file` with the
+        // other four, and its own warning fires only when the name ends in
+        // NEITHER extension -- so `.brdb` was endorsed here and written as BRZ.
+        if let Err(e) = deliver_world(&world, &shared.out_file, shared.out_clipboard) {
             return error!("{e}");
         }
         info!("Done!");
@@ -217,7 +220,7 @@ impl TextApp {
 
     fn draw_settings(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
         ui.heading("Settings");
-        ui.label("Render an image as TextDisplay component bricks — one colored glyph per pixel.");
+        ui.label("Render an image as TextDisplay component bricks -- one colored glyph per pixel.");
 
         egui::Grid::new("text_settings_grid")
             .striped(true)
@@ -234,12 +237,7 @@ impl TextApp {
                     ui.add(egui::TextEdit::singleline(&mut shared.out_file).hint_text("File Name"));
                 });
                 ui.end_row();
-                let out_file_lowercase = shared.out_file.to_lowercase();
-                if !out_file_lowercase.ends_with(".brz") && !out_file_lowercase.ends_with(".brdb") {
-                    ui.label("Warning:");
-                    ui.colored_label(Color32::RED, "Output file must end with .brz or .brdb");
-                    ui.end_row();
-                }
+                draw_out_file_warnings(ui, &shared.out_file);
 
                 ui.label("Font")
                     .on_hover_text("Font preset; selecting one reseeds glyphs and calibration");
@@ -332,7 +330,7 @@ impl TextApp {
                                 .speed(0.01)
                                 .range(0.0..=4.0),
                         )
-                        .on_hover_text("Worn-edge wear on the glyphs (0–4)");
+                        .on_hover_text("Worn-edge wear on the glyphs (0-4)");
                     });
                     ui.add_enabled_ui(self.material.is_graffiti(), |ui| {
                         ui.horizontal(|ui| {
@@ -410,7 +408,7 @@ impl TextApp {
                         ui.label("Font Size");
                         ui.add(egui::DragValue::new(&mut self.line_height).speed(0.01))
                             .on_hover_text(
-                                "The TextDisplay LineHeight field — the game's font size.                                  Scales the glyphs; presets derive it from Pixel Size",
+                                "The TextDisplay LineHeight field -- the game's font size.                                  Scales the glyphs; presets derive it from Pixel Size",
                             );
                         ui.label("LineOffset");
                         ui.add(egui::DragValue::new(&mut self.line_offset).speed(0.05));
@@ -456,7 +454,7 @@ impl TextApp {
                             .on_hover_text(
                                 "Writes calibrate.brz: a 128px checkerboard rendered like a \
                                  normal export (current mode included), with labeled number \
-                                 Variable gates wired into EVERY text component — edit a \
+                                 Variable gates wired into EVERY text component -- edit a \
                                  variable in-game and the whole grid updates live.",
                             )
                             .clicked()
@@ -501,6 +499,10 @@ impl TextApp {
     }
 
     fn draw_submit(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
+        // Refused before the button is offered -- see `util::refuse_bad_out_file`.
+        if refuse_bad_out_file(ui, &shared.out_file) {
+            return;
+        }
         if self.image.is_some() {
             if ui
                 .add(Button::new("Generate image2text save").fill(Color32::from_rgb(50, 90, 50)))
@@ -528,5 +530,84 @@ impl TextApp {
         self.draw_settings(ui, shared);
         ui.separator();
         self.draw_submit(ui, shared);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A pane with an image already picked, so `generate` can run without a
+    /// file dialog. Tiny on purpose -- the encode is not what is under test.
+    fn with_image() -> TextApp {
+        let mut img = image::RgbaImage::new(4, 4);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgba([(x * 60) as u8, (y * 60) as u8, 0x40, 0xFF]);
+        }
+        TextApp {
+            image: Some(PickedImage { name: "test.png".to_string(), image: Arc::new(img) }),
+            ..Default::default()
+        }
+    }
+
+    /// **This pane writes the container its destination names.**
+    ///
+    /// `generate` had its own inline `to_brz_vec()` + `deliver_save`, so a
+    /// `.brdb` destination -- which the pane's own warning explicitly endorses,
+    /// firing only when the name ends in NEITHER extension -- received a BRZ
+    /// archive. `out_file` is shared with the other four panes, so simply
+    /// switching tabs was enough to reach it. Asserted on the file magic, which
+    /// nothing about how the bytes were produced can fake.
+    #[test]
+    fn the_output_extension_decides_the_container() {
+        let base = std::env::temp_dir().join(format!("h2b_text_pane_{}", std::process::id()));
+        let brz = base.with_extension("brz");
+        let brdb = base.with_extension("brdb");
+        for p in [&brz, &brdb] {
+            let _ = std::fs::remove_file(p);
+        }
+        let app = with_image();
+
+        for path in [&brz, &brdb] {
+            app.generate(&SharedOptions {
+                out_file: path.to_string_lossy().to_string(),
+                out_clipboard: false,
+            });
+        }
+
+        let brz_bytes = std::fs::read(&brz).expect("the .brz destination must be written");
+        let brdb_bytes = std::fs::read(&brdb).expect("the .brdb destination must be written");
+        assert!(
+            brz_bytes.starts_with(b"BRZ"),
+            "a .brz destination must hold a BRZ archive, got {:02x?}",
+            &brz_bytes[..brz_bytes.len().min(16)]
+        );
+        assert!(
+            brdb_bytes.starts_with(b"SQLite format 3"),
+            "a .brdb destination must hold a brdb (SQLite) database, not BRZ bytes under a \
+             .brdb name -- got {:02x?}",
+            &brdb_bytes[..brdb_bytes.len().min(16)]
+        );
+
+        for p in [&brz, &brdb] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// A destination with neither extension is refused, not written to: the
+    /// pane draws that rule in red, and writing the file anyway would
+    /// contradict its own warning.
+    #[test]
+    fn a_destination_with_no_known_extension_is_refused() {
+        let path = std::env::temp_dir().join(format!("h2b_text_pane_{}_noext", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        with_image().generate(&SharedOptions {
+            out_file: path.to_string_lossy().to_string(),
+            out_clipboard: false,
+        });
+
+        assert!(!path.exists(), "an unknown extension must write nothing at all");
     }
 }

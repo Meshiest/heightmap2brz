@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_variables)]
 
 use super::logger;
+use crate::gui::audio::AudioApp;
 use crate::gui::heightmap::HeightmapApp;
 use crate::gui::text::TextApp;
 use crate::gui::video::VideoApp;
@@ -17,6 +18,7 @@ pub struct BrzApp {
     heightmap: HeightmapApp,
     text: TextApp,
     video: VideoApp,
+    audio: AudioApp,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25,6 +27,7 @@ enum Menu {
     Text,
     Heightmap,
     Video,
+    Audio,
 }
 
 impl AsRef<str> for Menu {
@@ -34,6 +37,7 @@ impl AsRef<str> for Menu {
             Menu::Text => "Image2Text",
             Menu::Heightmap => "Heightmap",
             Menu::Video => "Video2Brick",
+            Menu::Audio => "Audio2Brick",
         }
     }
 }
@@ -47,6 +51,9 @@ impl Menu {
                 "Select a heightmap and colormap to generate optimized brick terrain"
             }
             Menu::Video => "Convert an animated image or frame sequence into wired, animated bricks",
+            Menu::Audio => {
+                "Turn a song into a cluster of wired, pitched speaker bricks that play it back"
+            }
         }
     }
 }
@@ -60,6 +67,7 @@ impl Default for BrzApp {
             heightmap: HeightmapApp::default(),
             text: TextApp::default(),
             video: VideoApp::default(),
+            audio: AudioApp::default(),
         }
     }
 }
@@ -131,6 +139,7 @@ impl App for BrzApp {
                 self.menu(ui, Menu::Heightmap);
                 self.menu(ui, Menu::Text);
                 self.menu(ui, Menu::Video);
+                self.menu(ui, Menu::Audio);
             });
             ui.separator();
             ScrollArea::vertical()
@@ -140,6 +149,7 @@ impl App for BrzApp {
                     Menu::Heightmap => self.heightmap.draw(ui, ctx, frame, &mut self.shared, false),
                     Menu::Text => self.text.draw(ui, &mut self.shared),
                     Menu::Video => self.video.draw(ui, &mut self.shared),
+                    Menu::Audio => self.audio.draw(ui, &mut self.shared),
                 });
 
             TopBottomPanel::bottom(Id::new("logs"))

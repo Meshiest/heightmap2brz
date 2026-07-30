@@ -140,6 +140,8 @@ fn clock_emits_four_gates_and_three_pins_without_collision() {
         &mut c,
         15.0,
         90,
+        // LOOPING, the default: this test pins the free-running Limit.
+        true,
         Position { x: 5, y: 5, z: 2 },
     );
     assert_eq!(c.placed().len() - before, 9, "4 clock gates + 3 control pins + Rate in + Done out");
@@ -159,7 +161,7 @@ fn clock_emits_four_gates_and_three_pins_without_collision() {
     //
     // The chip's inner grid gets its own *persistent* id assigned at write
     // time, distinct from the placeholder `Chip::entity_id` minted before
-    // writing (`Brick::next_id()`) — so, like `wire_integrity`'s own grid
+    // writing (`Brick::next_id()`) -- so, like `wire_integrity`'s own grid
     // discovery, find it by reading entities back rather than reusing the
     // pre-write id.
     let db = brdb::Brz::open(&path).expect("reopen").into_reader();
@@ -196,6 +198,142 @@ fn clock_emits_four_gates_and_three_pins_without_collision() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Build a standalone clock chip at `fps`/`frames` with the given looping
+/// setting, and return the `Timer.Limit` it actually SERIALIZES -- read back
+/// out of a written `.brz` the way the game's loader would see it -- plus the
+/// inner-grid brick count, so a caller can check the graph's shape at the same
+/// time.
+///
+/// Reading the file back is the only honest check available. `.brz` bytes are
+/// not reproducible run to run, so a hash or a byte count would prove nothing;
+/// and a `Limit` that never reaches the file is exactly the failure the
+/// looping test above exists to catch, since an unset field falls back to the
+/// schema's `1.0` rather than to `0.0`.
+fn written_clock(fps: f32, frames: usize, loop_playback: bool, tag: &str) -> (f64, usize) {
+    let mut world = World::new();
+    let mut c = chip::new_chip(
+        &mut world,
+        Position { x: 0, y: 0, z: 6 },
+        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
+        IntVector { x: 60, y: 60, z: 20 },
+    );
+    let before = c.placed().len();
+    build_clock(
+        &mut world,
+        &mut c,
+        fps,
+        frames,
+        loop_playback,
+        Position { x: 5, y: 5, z: 2 },
+    );
+    let placed = c.placed().len() - before;
+    chip::finish(&mut world, c).expect("clock layout must be collision-free");
+    // AFTER `chip::finish`, never before: it has to see every brick, grid and
+    // wire first.
+    world.register_used_components();
+
+    let path = std::env::temp_dir().join(format!("h2b_clock_{tag}_{}.brz", std::process::id()));
+    std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
+    wire_integrity::assert_wires_valid(&path);
+
+    let db = brdb::Brz::open(&path).expect("reopen").into_reader();
+    let mut chip_grid_id = None;
+    for index in db.entity_chunk_index().expect("entity chunk index") {
+        for e in db.entity_chunk(index).expect("entity chunk") {
+            if e.is_microchip_grid() {
+                chip_grid_id = e.id;
+            }
+        }
+    }
+    let chip_grid_id = chip_grid_id.expect("clock chip must publish exactly one microchip grid");
+
+    let mut limit = None;
+    for chunk in &db.brick_chunk_index(chip_grid_id).expect("chip grid chunk index") {
+        let (_soa, structs) = db
+            .component_chunk(chip_grid_id, chunk.index)
+            .expect("component chunk");
+        for s in &structs {
+            if s.get_name() == "BrickComponentData_WireGraphPseudo_Timer" {
+                if let Some(brdb::schema::BrdbValue::F64(v)) = s.get("Limit") {
+                    limit = Some(*v);
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    (
+        limit.expect("the clock must write exactly one Timer carrying a Limit"),
+        placed,
+    )
+}
+
+/// Looping OFF must write a real limit, derived from the frame count and the
+/// fps, where a looping clock writes the free-running 0 -- and it must land on
+/// the LAST frame.
+///
+/// The frame index is `floor(Time * fps) % frame_count`, so the whole question
+/// is which frame is on screen when the timer expires. The clip's exact
+/// duration, `frames / fps`, is the obvious choice and the wrong one: it gives
+/// `frames % frames`, which is 0, so a render told to stop at the end would
+/// show its FIRST frame. The index here is recomputed from the value actually
+/// read back out of the save, so a wrong limit reaching the file fails this
+/// test even if `stop_limit` still looks right in isolation.
+#[test]
+fn a_non_looping_clock_writes_a_limit_landing_on_the_last_frame() {
+    const FPS: f32 = 15.0;
+    const FRAMES: usize = 90;
+
+    let (limit, _) = written_clock(FPS, FRAMES, false, "noloop");
+
+    assert_eq!(
+        limit,
+        (FRAMES as f64 - 0.5) / FPS as f64,
+        "the serialized Limit must be (frames - 0.5) / fps"
+    );
+    assert!(limit > 0.0, "a stop limit must never collide with the free-running 0.0");
+
+    let index = ((limit * FPS as f64).floor() as i64).rem_euclid(FRAMES as i64);
+    assert_eq!(
+        index,
+        FRAMES as i64 - 1,
+        "the written limit must leave the frame index on the LAST frame"
+    );
+    assert_ne!(index, 0, "landing on frame 0 is the bug this limit exists to avoid");
+
+    // The trap, from the same numbers, so the reason is visible here too.
+    let naive = FRAMES as f64 / FPS as f64;
+    assert_eq!(
+        ((naive * FPS as f64).floor() as i64).rem_euclid(FRAMES as i64),
+        0,
+        "the exact duration really would snap back to frame 0 -- which is why it is not used"
+    );
+}
+
+/// Turning looping off must change the `Limit` and NOTHING else.
+///
+/// The cost readout has to describe the graph that actually gets built, and
+/// the estimators count a flat 4 clock gates and 8 clock wires without ever
+/// seeing this flag. That stays correct only while both settings emit the
+/// identical structure, which is what this pins -- separately from the limit
+/// value, so a future change that bought "stop at the end" with an extra gate
+/// fails here rather than silently making every estimate wrong.
+#[test]
+fn looping_and_non_looping_clocks_differ_only_in_the_limit() {
+    const FPS: f32 = 15.0;
+    const FRAMES: usize = 90;
+
+    let (looping_limit, looping_bricks) = written_clock(FPS, FRAMES, true, "shape_loop");
+    let (stopping_limit, stopping_bricks) = written_clock(FPS, FRAMES, false, "shape_stop");
+
+    assert_eq!(looping_limit, 0.0, "a looping clock is free-running");
+    assert_ne!(stopping_limit, looping_limit, "the two settings must differ somewhere");
+    assert_eq!(
+        looping_bricks, stopping_bricks,
+        "same gates and pins either way -- the flag changes one inlined value, not the graph"
+    );
+    assert_eq!(looping_bricks, 9, "4 clock gates + 3 control pins + Rate in + Done out");
+}
+
 // --- Task 6 spike: structural validation -----------------------------------
 //
 // `examples/spike_anim.rs` hand-builds a 2x2-pixel, 3-frame animation to
@@ -203,14 +341,14 @@ fn clock_emits_four_gates_and_three_pins_without_collision() {
 // convention, 3D gate layering inside a chip, remote-wire fan-out across the
 // chip boundary, and the 65535 array-length limit. Only a human pasting the
 // result into the game can confirm those; this section covers what a test
-// *can* confirm — that the graph the spike describes serializes into a save
+// *can* confirm -- that the graph the spike describes serializes into a save
 // where every wire endpoint actually resolves.
 //
 // The graph is rebuilt here rather than shelling out to the example or
 // reading its `main`, deliberately: a `#[test]` must not depend on another
 // cargo target having already been run (that ordering isn't guaranteed by
 // `cargo test`, and would break on a fresh checkout). The duplication is the
-// price of that independence — keep this in sync with
+// price of that independence -- keep this in sync with
 // `examples/spike_anim.rs` if the spike's graph changes before Task 11
 // replaces both with the real generator.
 
@@ -258,7 +396,7 @@ fn build_spike_world() -> (World, usize) {
     );
     let service = |col: i32, row: i32| lattice_pos(col, row, 2, h, GATE_HALF);
 
-    let clock = build_clock(&mut world, &mut c, 2.0, frames.len(), service(0, -2));
+    let clock = build_clock(&mut world, &mut c, 2.0, frames.len(), true, service(0, -2));
     let detector = gate(
         &mut c,
         "B_1x1_Gate_Expr_ChangeDetectorExec",
@@ -304,7 +442,7 @@ fn build_spike_world() -> (World, usize) {
                 // the `WireVariant` tagged union `Multiply`/`ModuloFloored`
                 // use (`BrickComponentData_WireGraph_Expr_String_Substring`
                 // in brdb's `component_db.rs` registers bare `0i64`
-                // defaults) — a `WireVariant::Int` here fails to encode with
+                // defaults) -- a `WireVariant::Int` here fails to encode with
                 // `UnimplementedCast("i64", "WireVariant")`. This is the one
                 // deviation from the task brief's inline listing, found by
                 // actually running the spike.
@@ -374,7 +512,7 @@ fn count_bricks_and_wires(path: &std::path::Path) -> (u64, u64) {
 /// endpoint resolves to a brick that actually carries the referenced
 /// component (`wire_integrity::assert_wires_valid`), and the brick/wire
 /// counts match what hand-tracing the graph predicts. This is the permanent
-/// regression test for Task 6 — see the module-level comment above for why
+/// regression test for Task 6 -- see the module-level comment above for why
 /// it rebuilds the graph instead of reading the example's output file.
 #[test]
 fn spike_anim_graph_is_structurally_valid() {
@@ -398,8 +536,8 @@ fn spike_anim_graph_is_structurally_valid() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Validates the literal artifact `cargo run --example spike_anim` writes —
-/// the exact bytes a human pastes into the game — rather than a freshly
+/// Validates the literal artifact `cargo run --example spike_anim` writes --
+/// the exact bytes a human pastes into the game -- rather than a freshly
 /// rebuilt copy. Ignored by default because it depends on that example
 /// having already been run in this checkout (an ordering `cargo test` does
 /// not guarantee); run explicitly after `cargo run --example spike_anim`:
@@ -844,7 +982,7 @@ fn a_screen_wider_than_one_chunk_gets_more_arrays() {
 //
 // Task 10's review flagged a gap: no test exercised `slice_of`/content
 // correctness in a SECOND chunk (`first_pixel > 0`) with varying per-pixel
-// colours — exactly where a `first_pixel` vs `pixel_in_chunk` (global vs
+// colours -- exactly where a `first_pixel` vs `pixel_in_chunk` (global vs
 // chunk-local index) confusion in `build_brick_world`'s Substring `Start`
 // math would hide. `a_screen_wider_than_one_chunk_gets_more_arrays` above
 // only counts gates; it never reads a single `Start` value back.
@@ -860,7 +998,7 @@ fn a_screen_wider_than_one_chunk_gets_more_arrays() {
 use heightmap::anim::pack::{self, HEX_STRIDE};
 
 /// Every pixel gets a color that encodes its own global column index across
-/// R:G (16 bits — plenty of headroom for `PIXELS_PER_CHUNK + 10` columns) and
+/// R:G (16 bits -- plenty of headroom for `PIXELS_PER_CHUNK + 10` columns) and
 /// the frame number in B, so every (pixel, frame) pair decodes to a distinct,
 /// independently-reconstructable hex string without relying on `pack` at all.
 fn multi_chunk_clip(width: u32, frames: usize) -> Clip {
@@ -881,7 +1019,7 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
     let opts = AnimOptions::default();
 
     // Ground truth for what the chunks *should* contain, independent of
-    // `build_brick_world` — `pack` already has its own Task 10 coverage.
+    // `build_brick_world` -- `pack` already has its own Task 10 coverage.
     let chunks = pack::pack(&clip, opts.alpha_threshold).expect("pack");
     assert_eq!(chunks.len(), 2, "test assumes exactly two pack chunks");
     assert_eq!(
@@ -905,7 +1043,7 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
     let chip_grid_id = chip_grid_id.expect("renderer must publish exactly one microchip grid");
 
     // Pull every Substring's `Start` and every ArrayVar's `Value` straight
-    // out of the encoded save — no brick position or wire-graph decoding
+    // out of the encoded save -- no brick position or wire-graph decoding
     // needed for either.
     let mut starts: Vec<i64> = Vec::new();
     let mut arrays: Vec<Vec<String>> = Vec::new();
@@ -946,7 +1084,7 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
     // local pixel 3. If chunk 2's gates wrongly computed
     // `(chunk.first_pixel + local) * HEX_STRIDE` instead of
     // `local * HEX_STRIDE`, chunk 2's first ten pixels would start at
-    // `1666 * 6 = 9996` and up — never producing 18 again — so `Start == 18`
+    // `1666 * 6 = 9996` and up -- never producing 18 again -- so `Start == 18`
     // would appear once across the whole save, not twice.
     let local3_start = (3 * HEX_STRIDE) as i64;
     let count = starts.iter().filter(|&&s| s == local3_start).count();
@@ -958,7 +1096,7 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
          instead of resetting per chunk"
     );
 
-    // Identify chunk 2's own ArrayVar by its actual persisted content — no
+    // Identify chunk 2's own ArrayVar by its actual persisted content -- no
     // position or wire-graph decoding needed: it's the one array whose
     // per-frame strings equal `pack`'s own chunk-2 output.
     let chunk2_array = arrays
@@ -967,7 +1105,7 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
         .expect("chunk 2's ArrayVar content must appear in the saved world");
 
     // Slicing that array at the just-verified offset must yield exactly the
-    // 6 hex characters `pack` assigned to local pixel 3 of chunk 2 — the same
+    // 6 hex characters `pack` assigned to local pixel 3 of chunk 2 -- the same
     // offset the corresponding Substring gate is wired to read.
     let expected = pack::slice_of(&chunks[1], 0, 3);
     let start = local3_start as usize;
@@ -979,7 +1117,7 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
 
 /// Negative inner-grid coordinates break bricks in-game: a chip built that way
 /// loses those gates entirely, while gates at positive coordinates survive.
-/// It bit twice — once via a content-centring pass that pushed the low-x
+/// It bit twice -- once via a content-centring pass that pushed the low-x
 /// pixel gates negative, and once latently for short screens, where
 /// `lattice_pos`'s `x = (h-1-row)*CELL + half.x` sends a positive service row
 /// negative (at `h = 1`, `row = 1` lands at `x = -5`).
@@ -1006,7 +1144,7 @@ fn no_inner_brick_lands_at_a_negative_coordinate() {
             assert!(
                 center.x - half.x >= 0 && center.y - half.y >= 0 && center.z - half.z >= 0,
                 "{w}x{h}: inner brick centred at {center:?} reaches ({},{},{}), which is \
-                 negative — negative inner-grid coordinates break bricks in-game",
+                 negative -- negative inner-grid coordinates break bricks in-game",
                 center.x - half.x,
                 center.y - half.y,
                 center.z - half.z
@@ -1437,6 +1575,147 @@ fn the_render_reports_progress() {
     assert_eq!(rec.finished, rec.began.len(), "every phase begun must be finished");
 }
 
+/// A source that cannot report an exact frame count but CAN estimate one must
+/// still get a real denominator on its bar.
+///
+/// This is the `.mkv` case, and the bug that started this: Matroska stores no
+/// frame count, so `frame_count_hint` is honestly `None` -- and the renderers
+/// passed exactly that to `Progress::begin`, so the bar had no total, rendered
+/// as an indeterminate spinner, and sat there looking frozen for minutes on a
+/// long render. The source knew its DURATION the whole time.
+///
+/// Asserted on all three renderers, because all three had the same line.
+#[test]
+fn a_source_with_only_an_estimate_still_gets_a_total_on_its_bar() {
+    // `frame_count_hint: None` (nothing exact to say), but 7 frames really do
+    // come out, and the source estimates 7.
+    struct Estimating;
+    impl FrameSource for Estimating {
+        fn info(&self) -> heightmap::video::stream::SourceInfo {
+            heightmap::video::stream::SourceInfo {
+                width: 4,
+                height: 3,
+                fps: 10.0,
+                frame_count_hint: None,
+            }
+        }
+        fn open(&self) -> Result<Box<dyn heightmap::video::stream::FrameStream + '_>, String> {
+            tiny_clip(4, 3, 7).open().map(|s| -> Box<dyn heightmap::video::stream::FrameStream> {
+                // The borrow is of the temporary clip, so materialize instead.
+                let mut frames = Vec::new();
+                let mut s = s;
+                while let Some(f) = s.next().expect("tiny clip never fails") {
+                    frames.push(f);
+                }
+                Box::new(VecStream(frames.into_iter()))
+            })
+        }
+        fn frame_count_estimate(&self) -> Option<usize> {
+            Some(7)
+        }
+    }
+    struct VecStream(std::vec::IntoIter<RgbaImage>);
+    impl heightmap::video::stream::FrameStream for VecStream {
+        fn next(&mut self) -> Result<Option<RgbaImage>, String> {
+            Ok(self.0.next())
+        }
+    }
+
+    for (what, build) in [
+        (
+            "hex",
+            &build_brick_world
+                as &dyn Fn(
+                    &dyn FrameSource,
+                    &AnimOptions,
+                    &mut dyn heightmap::progress::Progress,
+                ) -> Result<brdb::World, String>,
+        ),
+        ("colour-array", &heightmap::anim::color_bricks::build_color_array_world),
+        ("text", &heightmap::anim::text_bricks::build_text_world),
+    ] {
+        let mut rec = PhaseRecorder::default();
+        build(&Estimating, &AnimOptions::default(), &mut rec)
+            .map(|_| ())
+            .unwrap_or_else(|e| panic!("{what}: build failed: {e}"));
+        let packing = rec
+            .began
+            .iter()
+            .find(|(label, _)| label.starts_with("packing frames"))
+            .unwrap_or_else(|| panic!("{what}: no packing phase was begun"));
+        assert_eq!(
+            packing.1,
+            Some(7),
+            "{what}: the estimate must reach the bar as its total, not be dropped for a \
+             totalless spinner ({:?})",
+            packing.0
+        );
+        assert!(
+            packing.0.contains("estimated"),
+            "{what}: a bar built on an estimate must say so: {:?}",
+            packing.0
+        );
+    }
+}
+
+/// And with nothing to go on at all, the spinner must SAY it has no total.
+/// An unlabelled indeterminate spinner is indistinguishable from a hung one,
+/// which is the whole complaint.
+#[test]
+fn a_source_with_no_count_and_no_estimate_gets_a_spinner_that_explains_itself() {
+    struct Blind;
+    impl FrameSource for Blind {
+        fn info(&self) -> heightmap::video::stream::SourceInfo {
+            heightmap::video::stream::SourceInfo {
+                width: 2,
+                height: 2,
+                fps: 10.0,
+                frame_count_hint: None,
+            }
+        }
+        fn open(&self) -> Result<Box<dyn heightmap::video::stream::FrameStream + '_>, String> {
+            Ok(Box::new(OneFrame(false)))
+        }
+    }
+    struct OneFrame(bool);
+    impl heightmap::video::stream::FrameStream for OneFrame {
+        fn next(&mut self) -> Result<Option<RgbaImage>, String> {
+            if self.0 {
+                return Ok(None);
+            }
+            self.0 = true;
+            Ok(Some(RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255]))))
+        }
+    }
+
+    let mut rec = PhaseRecorder::default();
+    build_brick_world(&Blind as &dyn FrameSource, &AnimOptions::default(), &mut rec)
+        .expect("build");
+    let (label, total) = rec
+        .began
+        .iter()
+        .find(|(l, _)| l.starts_with("packing frames"))
+        .expect("a packing phase must be begun");
+    assert_eq!(*total, None, "nothing to go on means no denominator, never an invented one");
+    assert!(
+        label.contains("unknown"),
+        "the spinner must say why it has no total, got {label:?}"
+    );
+}
+
+/// Records every `begin` so a test can assert on a phase's label and total.
+#[derive(Default)]
+struct PhaseRecorder {
+    began: Vec<(String, Option<u64>)>,
+}
+impl heightmap::progress::Progress for PhaseRecorder {
+    fn begin(&mut self, label: &str, total: Option<u64>) {
+        self.began.push((label.to_string(), total));
+    }
+    fn tick(&mut self, _n: u64) {}
+    fn finish(&mut self) {}
+}
+
 /// A stream that fails partway must abort the render, not write a save
 /// silently missing its tail.
 #[test]
@@ -1510,4 +1789,270 @@ fn visibility_indexing_follows_the_packers_row_major_layout_on_a_non_square_clip
         "the opaque pixel at (col=2, row=1) must render at its row-major position (4, 2), \
          not the column-major transposition (6, 2)"
     );
+}
+
+// --- The estimate against a real render -------------------------------------
+
+use heightmap::anim::cost;
+
+/// The number the CLI (`log_cost`) and the GUI's readout print must be the
+/// number `build_brick_world` really emits -- not merely a self-consistent
+/// arithmetic identity.
+///
+/// This is the hex-mode twin of
+/// `tests/anim_color.rs::the_cost_estimate_matches_a_real_render`, and its
+/// absence is precisely why hex mode's wire estimate spent its whole life
+/// exactly 3 wires short of every render it described (a 6-wire clock against
+/// `build_clock`'s 8, and an exec chain counted as `chunks * banks - 1`
+/// against the renderer's `chunks * banks`). Every other hex test in
+/// `cost.rs` was arithmetic written against the same wrong constant, so all of
+/// them agreed with each other and none of them agreed with the renderer.
+///
+/// The clips are fully opaque, which is what makes the estimate EXACT here
+/// rather than merely an upper bound (a pixel transparent across the whole
+/// clip is culled and emits nothing -- see `cost::estimate`'s doc).
+#[test]
+fn the_hex_cost_estimate_matches_a_real_render() {
+    for (w, h, n, bank) in [
+        (4u32, 3u32, 5usize, usize::MAX),
+        (2, 2, 7, 2),
+        (3, 3, 9, 3),
+        (7, 5, 4, 1),
+    ] {
+        let clip = tiny_clip(w, h, n);
+        let opts = AnimOptions { bank_size: bank, ..AnimOptions::default() };
+        let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
+        let est = cost::estimate(w, h, n, &opts);
+
+        // Gates are every inner-grid brick that is not one of the clock's five
+        // I/O pins (Pause, Restart, Resume, Rate, Done).
+        let inner = world.grids[0].1.len();
+        assert_eq!(
+            inner - 5,
+            est.gates,
+            "{w}x{h}x{n} bank {bank}: estimate said {} gates, the render emitted {}",
+            est.gates,
+            inner - 5
+        );
+        assert_eq!(
+            world.wires.len(),
+            est.wires,
+            "{w}x{h}x{n} bank {bank}: estimate said {} wires, the render emitted {}",
+            est.wires,
+            world.wires.len()
+        );
+        assert_eq!(world.bricks.len(), est.bricks, "{w}x{h}x{n} bank {bank}: brick count");
+    }
+}
+
+/// The same, on a screen wide enough to span two `pack` chunks. The exec-chain
+/// term is `chunks * banks`, so a single-chunk render cannot tell a per-chunk
+/// error from a constant one.
+#[test]
+fn the_hex_cost_estimate_matches_a_real_multi_chunk_render() {
+    let w = (PIXELS_PER_CHUNK + 10) as u32;
+    let clip = multi_chunk_clip(w, 4);
+    let opts = AnimOptions { bank_size: 2, ..AnimOptions::default() };
+    let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
+    let est = cost::estimate(w, 1, 4, &opts);
+    assert_eq!(est.chunks, 2, "the test assumes two pack chunks");
+    assert_eq!(est.banks, 2, "the test assumes two banks");
+    assert_eq!(world.grids[0].1.len() - 5, est.gates, "gate count");
+    assert_eq!(world.wires.len(), est.wires, "wire count");
+    assert_eq!(world.bricks.len(), est.bricks, "brick count");
+}
+
+/// A subtitled render must match too: the subtitle track's own gates and
+/// wires are counted by `cost::subtitle_cost`, and a render is the only thing
+/// that can say whether that count is the one actually built.
+#[test]
+fn the_hex_cost_estimate_matches_a_subtitled_render() {
+    use heightmap::subs::{Cue, Subtitles};
+    use std::sync::Arc;
+    for bank in [usize::MAX, 2] {
+        let clip = tiny_clip(4, 5, 6);
+        let opts = AnimOptions {
+            bank_size: bank,
+            subtitles: Some(Arc::new(Subtitles::new(vec![Cue {
+                start_s: 0.0,
+                end_s: 1.0,
+                text: "hi".to_string(),
+            }]))),
+            ..AnimOptions::default()
+        };
+        let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
+        let est = cost::estimate(4, 5, 6, &opts);
+        assert_eq!(world.grids[0].1.len() - 5, est.gates, "bank {bank}: gate count");
+        assert_eq!(world.wires.len(), est.wires, "bank {bank}: wire count");
+        assert_eq!(world.bricks.len(), est.bricks, "bank {bank}: brick count");
+    }
+}
+
+// --- --srgb-to-linear and --external-clock, end to end -----------------------
+
+/// Every string `ArrayVar` inside a written render's chip, in save order.
+fn saved_string_arrays(mut world: brdb::World, tag: &str) -> Vec<Vec<String>> {
+    world.register_used_components();
+    let path = std::env::temp_dir().join(format!(
+        "h2b_anim_{tag}_{}_{:?}.brz",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let db = brdb::Brz::open(&path).expect("reopen").into_reader();
+        let mut gid = None;
+        for index in db.entity_chunk_index().expect("entity chunk index") {
+            for e in db.entity_chunk(index).expect("entity chunk") {
+                if e.is_microchip_grid() {
+                    gid = e.id;
+                }
+            }
+        }
+        let gid = gid.expect("a render must publish one microchip grid");
+        let mut arrays = Vec::new();
+        for chunk in db.brick_chunk_index(gid).expect("chunk index") {
+            let (_soa, structs) = db.component_chunk(gid, chunk.index).expect("components");
+            for s in &structs {
+                if s.get_name() == "BrickComponentData_WireGraphPseudo_ArrayVar"
+                    && let Some(value) = s.get("Value")
+                {
+                    let variant: WireArrayVariant =
+                        value.try_into().expect("ArrayVar Value must decode");
+                    if let WireArrayVariant::StringArray(v) = variant {
+                        arrays.push(v);
+                    }
+                }
+            }
+        }
+        arrays
+    }));
+    let _ = std::fs::remove_file(&path);
+    match out {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
+/// **`--srgb-to-linear` must reach the bytes the game actually receives.**
+///
+/// `pack`'s own test pins the transfer; this pins the WIRING -- that
+/// `AnimOptions::srgb_to_linear` reaches `Packer::linearize` and therefore the
+/// hex written into the arrays. Without it the flag could be parsed, printed
+/// and plumbed through every layer except the one that matters, with the whole
+/// suite still green.
+#[test]
+fn srgb_to_linear_reaches_the_hex_a_render_writes() {
+    // A mid-tone clip: 0 and 255 are fixed points of the transfer, so a
+    // black/white clip could not tell it from a no-op.
+    let img = RgbaImage::from_pixel(2, 2, Rgba([0x80, 0x40, 0xC0, 255]));
+    let clip = Clip { width: 2, height: 2, fps: 10.0, frames: vec![img] };
+
+    let plain = build_brick_world(
+        &clip,
+        &AnimOptions { srgb_to_linear: false, ..AnimOptions::default() },
+        &mut NoProgress,
+    )
+    .expect("build");
+    let linear = build_brick_world(
+        &clip,
+        &AnimOptions { srgb_to_linear: true, ..AnimOptions::default() },
+        &mut NoProgress,
+    )
+    .expect("build");
+
+    let plain = saved_string_arrays(plain, "srgb_off");
+    let linear = saved_string_arrays(linear, "srgb_on");
+    assert_eq!(plain.len(), 1, "one chunk, one bank, one array");
+    assert_eq!(linear.len(), 1);
+
+    let expect = |c: [u8; 4]| {
+        let px = format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+        px.repeat(4)
+    };
+    assert_eq!(plain[0][0], expect([0x80, 0x40, 0xC0, 255]), "off writes raw sRGB");
+    assert_eq!(
+        linear[0][0],
+        expect(heightmap::util::to_linear_rgb([0x80, 0x40, 0xC0, 255])),
+        "on must write the sRGB->linear transfer of every channel"
+    );
+    assert_ne!(plain[0][0], linear[0][0], "the flag must change the render");
+}
+
+/// **`--external-clock` must actually replace the clock.**
+///
+/// It had no behavioural test of any kind: the flag could have built the
+/// four-gate timer chain anyway, or built neither clock nor pin, and nothing
+/// would have said so. What it promises is exactly this swap -- the whole
+/// `Timer -> Multiply -> BitwiseOR -> ModuloFloored` chain and its five
+/// control pins out, ONE `Frame` input pin in, and the graph downstream of the
+/// frame index otherwise untouched.
+#[test]
+fn external_clock_replaces_the_whole_timer_chain_with_one_frame_pin() {
+    let clip = tiny_clip(4, 3, 5);
+    let internal = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
+    let external = build_brick_world(
+        &clip,
+        &AnimOptions { external_clock: true, ..AnimOptions::default() },
+        &mut NoProgress,
+    )
+    .unwrap();
+
+    let count = |w: &brdb::World, needle: &str| {
+        w.grids[0]
+            .1
+            .iter()
+            .filter(|b| {
+                b.components.iter().any(|c| {
+                    c.component_type().is_some_and(|t| t.to_string().contains(needle))
+                })
+            })
+            .count()
+    };
+
+    for class in ["Pseudo_Timer", "MathMultiply", "BitwiseOR", "MathModuloFloored"] {
+        assert_eq!(count(&internal, class), 1, "the built-in clock has one {class}");
+        assert_eq!(count(&external, class), 0, "--external-clock must build no {class}");
+    }
+    // Five pins become one: Pause/Restart/Resume/Rate go, Done (an OUTPUT pin)
+    // goes with them, and a single `Frame` INPUT pin arrives.
+    assert_eq!(count(&internal, "MicrochipInput"), 4, "Pause, Restart, Resume, Rate");
+    assert_eq!(count(&internal, "MicrochipOutput"), 1, "Done");
+    assert_eq!(count(&external, "MicrochipInput"), 1, "just Frame");
+    assert_eq!(count(&external, "MicrochipOutput"), 0, "no timer, no Done");
+
+    // 4 clock gates + 5 pins out, 1 pin in: 8 fewer inner bricks.
+    assert_eq!(
+        internal.grids[0].1.len() - external.grids[0].1.len(),
+        8,
+        "the swap must cost exactly the clock chain and its pins"
+    );
+    // ...and the clock's 8 wires go with it, replaced by nothing: the pin's
+    // own output IS the frame index, so no extra wire is needed to reach the
+    // detector or the Gets.
+    assert_eq!(
+        internal.wires.len() - external.wires.len(),
+        8,
+        "exactly the clock's own 8 wires"
+    );
+    // The screen itself is untouched.
+    assert_eq!(internal.bricks.len(), external.bricks.len(), "same display bricks and shell");
+}
+
+/// The same swap in colour-array mode, which builds its own copy of the
+/// clock-versus-pin branch.
+#[test]
+fn external_clock_replaces_the_timer_chain_in_colour_array_mode_too() {
+    use heightmap::anim::color_bricks::build_color_array_world;
+    let clip = tiny_clip(3, 2, 4);
+    let internal =
+        build_color_array_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
+    let external = build_color_array_world(
+        &clip,
+        &AnimOptions { external_clock: true, ..AnimOptions::default() },
+        &mut NoProgress,
+    )
+    .unwrap();
+    assert_eq!(internal.grids[0].1.len() - external.grids[0].1.len(), 8);
+    assert_eq!(internal.wires.len() - external.wires.len(), 8);
 }

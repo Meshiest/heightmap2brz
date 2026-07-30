@@ -31,6 +31,32 @@ pub fn ffmpeg_available() -> bool {
     ffmpeg_sidecar::command::ffmpeg_is_installed()
 }
 
+/// Keep a spawned helper process from flashing a console window on Windows.
+///
+/// **Every `ffprobe` spawn in this crate goes through here.** Without
+/// `CREATE_NO_WINDOW`, a console-subsystem child launched from the GUI (which
+/// is built `windows_subsystem = "windows"` and so has no console of its own)
+/// gets one allocated for it, and the user sees a black box blink open and
+/// shut -- most visibly when picking an audio file, which probes it for a
+/// duration before anything else happens.
+///
+/// `FfmpegCommand` needs no such call: `ffmpeg-sidecar` sets the same flag in
+/// its own constructor, and so does the `ffmpeg_is_installed` above. It is only
+/// the raw `std::process::Command` spawns that are ours to remember.
+///
+/// A no-op off Windows, where the flag does not exist and no window is created
+/// in the first place.
+pub fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        // winbase.h's CREATE_NO_WINDOW, spelled out rather than pulling in a
+        // winapi crate for one constant.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::os::windows::process::CommandExt::creation_flags(cmd, CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// How much permission the caller has given [`ensure_ffmpeg`] to fetch and
 /// run a downloaded `ffmpeg` binary.
 ///
@@ -75,7 +101,7 @@ fn resolve_consent(consent: DownloadConsent, stdin_is_terminal: bool) -> Downloa
 /// alone tells the user nothing they can act on.
 fn refusal() -> String {
     "ffmpeg was not found and downloading it was declined. Install ffmpeg yourself and \
-     make sure it is on PATH, or run with --backend rust to use the pure-Rust decode \
+     make sure it is on PATH, or run with --backend builtin to use the builtin decode \
      path instead."
         .to_string()
 }
@@ -151,6 +177,9 @@ pub struct FfmpegSource {
     height: u32,
     out_fps: f32,
     frame_count_hint: Option<usize>,
+    /// The approximate frame count for a progress denominator, when the exact
+    /// one above is unavailable. See [`FrameSource::frame_count_estimate`].
+    frame_count_estimate: Option<usize>,
 }
 
 /// Metadata read from `ffprobe`, before folding in any target size/fps.
@@ -220,6 +249,33 @@ impl FfmpegSource {
             _ => probed.nb_frames,
         };
 
+        // A denominator for the progress bar when the exact count above came
+        // out `None` -- which is the COMMON case for Matroska, whose container
+        // stores no frame count at all. `duration * out_fps` is then what the
+        // render really produces (measured: within a frame on a 6s/30fps mkv
+        // resampled to 10fps), and a bar a frame or two out is enormously
+        // better than a spinner that looks frozen for minutes. Nothing
+        // refuses or allocates off this -- see
+        // `FrameSource::frame_count_estimate`'s doc for that line.
+        //
+        // **Not for a VFR source**, though, even though its duration is known
+        // too. `out_fps` there is the AVERAGE rate, while `open`'s default
+        // output timing conforms the stream to a fixed rate by DUPLICATING
+        // frames -- so `duration * average` is systematically low, not
+        // approximately right. Measured on the 6fps+24fps concat clip
+        // `tests::sample_vfr_clip` builds: it estimates 27 against 50 frames
+        // actually emitted, 46% short. A bar that fills at 54% of the way
+        // through and then keeps growing is a worse lie than an honest
+        // spinner that says it has no total, so this leaves VFR to the
+        // spinner.
+        let out_fps = fps.unwrap_or(probed.fps);
+        let frame_count_estimate = frame_count_hint.or_else(|| {
+            probed
+                .duration
+                .filter(|_| !probed.is_vfr && out_fps.is_finite() && out_fps > 0.0)
+                .map(|d| (d * out_fps as f64).round().max(0.0) as usize)
+        });
+
         Ok(Self {
             path: path.to_path_buf(),
             target,
@@ -228,8 +284,9 @@ impl FfmpegSource {
             fps,
             width,
             height,
-            out_fps: fps.unwrap_or(probed.fps),
+            out_fps,
             frame_count_hint,
+            frame_count_estimate,
         })
     }
 
@@ -290,6 +347,10 @@ impl FrameSource for FfmpegSource {
             fps: self.out_fps,
             frame_count_hint: self.frame_count_hint,
         }
+    }
+
+    fn frame_count_estimate(&self) -> Option<usize> {
+        self.frame_count_estimate
     }
 
     fn open(&self) -> Result<Box<dyn FrameStream + '_>, String> {
@@ -361,6 +422,7 @@ impl FrameSource for FfmpegSource {
             width: self.width,
             height: self.height,
             done: false,
+            scratch: Vec::new(),
         }))
     }
 }
@@ -374,6 +436,16 @@ struct FfmpegFrameStream {
     width: u32,
     height: u32,
     done: bool,
+    /// One frame's worth of bytes, reused by [`FrameStream::advance`] for the
+    /// frames it only passes over. Allocated on first use so a stream that is
+    /// never `advance`d past more than one frame at a time never pays for it.
+    ///
+    /// The bytes still have to come off the pipe -- ffmpeg has already
+    /// produced them and there is no way to un-ask -- but a passed-over frame
+    /// need not get its own fresh multi-megabyte allocation and `RgbaImage`
+    /// on top. At 1080p that is 8.3 MB mapped, faulted in and dropped again
+    /// per frame, two of every three on a 30fps→10fps render.
+    scratch: Vec<u8>,
 }
 
 impl FfmpegFrameStream {
@@ -459,14 +531,97 @@ impl FrameStream for FfmpegFrameStream {
             .ok_or_else(|| "decoded frame buffer had the wrong size".to_string())?;
         Ok(Some(frame))
     }
+
+    /// Read `n` frames off the pipe, but allocate an image for only one.
+    ///
+    /// The bytes themselves cannot be skipped: ffmpeg has already decoded and
+    /// written them, and the pipe has to be drained in order or the next read
+    /// lands mid-frame. What CAN be skipped is everything `next` does around
+    /// the read -- a fresh `frame_bytes`-sized allocation, faulted in a page
+    /// at a time as it fills, and an `RgbaImage` built over it -- for the
+    /// `n - 1` frames being passed over. At 1080p that is 8.3 MB per frame,
+    /// and on a 30fps→10fps render it is two frames in every three.
+    ///
+    /// `n <= 1` delegates straight to `next`, because there is nothing to
+    /// pass over and routing it through the scratch buffer would ADD a copy.
+    /// The drain paths hand back whatever is in the scratch buffer, which is
+    /// the last frame actually read -- exactly what the default body would
+    /// have returned, and what `FpsStream` repeats when a source ends between
+    /// two output times.
+    fn advance(&mut self, n: usize) -> Result<(usize, Option<RgbaImage>), String> {
+        if n <= 1 {
+            let f = self.next()?;
+            return Ok((usize::from(f.is_some()), f));
+        }
+        if self.scratch.len() != self.frame_bytes {
+            self.scratch = vec![0u8; self.frame_bytes];
+        }
+
+        // The last frame read into `scratch` during THIS call, rebuilt as an
+        // image only if the stream drains before the final `next` below.
+        let held = |s: &Self| {
+            RgbaImage::from_raw(s.width, s.height, s.scratch.clone())
+                .ok_or_else(|| "decoded frame buffer had the wrong size".to_string())
+        };
+
+        let mut got = 0;
+        for _ in 0..n - 1 {
+            if self.done {
+                return Ok((got, if got > 0 { Some(held(self)?) } else { None }));
+            }
+            // `read_frame_bytes` needs `&mut self`, so the buffer is moved out
+            // and put straight back -- including on the error path, so a
+            // subsequent call still finds a correctly sized scratch.
+            let mut buf = std::mem::take(&mut self.scratch);
+            let read = self.read_frame_bytes(&mut buf);
+            self.scratch = buf;
+            let filled = read?;
+
+            if filled == 0 {
+                // Same as `next`: this is the clean-end-of-stream check, and
+                // `finish` still turns a non-zero exit or any stderr text
+                // into a fatal error rather than a quiet end.
+                self.finish()?;
+                return Ok((got, if got > 0 { Some(held(self)?) } else { None }));
+            }
+            if filled != self.frame_bytes {
+                self.done = true;
+                return Err(format!(
+                    "ffmpeg's output ended mid-frame: got {filled} of {} bytes for a {}x{} \
+                     rgba frame",
+                    self.frame_bytes, self.width, self.height
+                ));
+            }
+            got += 1;
+        }
+
+        match self.next()? {
+            Some(f) => Ok((got + 1, Some(f))),
+            None => Ok((got, if got > 0 { Some(held(self)?) } else { None })),
+        }
+    }
 }
 
 impl Drop for FfmpegFrameStream {
     /// Best-effort cleanup for a stream dropped before it drained -- e.g. a
     /// caller that errors out elsewhere mid-render. A no-op error (ignored)
     /// if the process already exited via `finish`.
+    ///
+    /// `kill()` alone only SIGNALS the child -- `ffmpeg-sidecar`'s `kill`
+    /// forwards straight to `std::process::Child::kill`, which does not reap.
+    /// Without the `wait()` below the process is never collected: a zombie on
+    /// Unix, and on Windows a race against the input file's handle being
+    /// released, since nothing confirms the process actually exited. That was
+    /// always latent (a stream dropped mid-render), and the GUI's mid-render
+    /// cancel -- which drops the stream at an arbitrary frame rather than
+    /// only at clean end of stream -- makes it routine. `wait()` cannot
+    /// deadlock here: stderr is drained by its own thread from `open`, so
+    /// there is no full pipe for the child to block on. The result is
+    /// ignored because the process is being torn down and a failure to reap
+    /// is not actionable.
     fn drop(&mut self) {
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -480,7 +635,10 @@ impl Drop for FfmpegFrameStream {
 /// into the `fps` value itself.
 fn probe_metadata(path: &Path) -> Result<ProbedInfo, String> {
     let ffprobe_bin = ffmpeg_sidecar::ffprobe::ffprobe_path();
-    let output = std::process::Command::new(&ffprobe_bin)
+    let mut cmd = std::process::Command::new(&ffprobe_bin);
+    // No console window: see `hide_console`.
+    hide_console(&mut cmd);
+    let output = cmd
         .args([
             "-v",
             "error",
@@ -611,10 +769,10 @@ pub(crate) mod tests {
 
     /// Generates a tiny clip with ffmpeg itself, then decodes it back. Skips
     /// (rather than fails) when ffmpeg is absent, so the suite still runs on a
-    /// machine without it — but prints a clear notice, because a silently
+    /// machine without it -- but prints a clear notice, because a silently
     /// skipped test is a test that never runs.
     ///
-    /// `pub(crate)` so the demux, rustvideo and backend tests can reuse it.
+    /// `pub(crate)` so the demux, builtin and backend tests can reuse it.
     pub(crate) fn sample_clip(name: &str, secs: u32, w: u32, h: u32, fps: u32) -> Option<std::path::PathBuf> {
         sample_clip_args(name, &[], secs, w, h, fps)
     }
@@ -692,6 +850,86 @@ pub(crate) mod tests {
                 "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=24:duration=1",
                 "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[outv]",
                 "-map", "[outv]", "-fps_mode", "vfr", "-pix_fmt", "yuv420p", "-coder", "1",
+            ])
+            .arg(&path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(path)
+    }
+
+    /// **The `.mkv` progress-bar case.** Matroska stores no frame count, so
+    /// ffprobe's `nb_frames` is `N/A` and `frame_count_hint` is honestly
+    /// `None` -- which left the render's bar with no total at all, drawn as an
+    /// indeterminate spinner that reads as a hang. The duration IS known, and
+    /// for constant-rate content `duration * fps` is what the stream really
+    /// emits; the estimate has to be within a frame or two of that or it is
+    /// not worth showing.
+    #[test]
+    fn an_mkv_has_no_hint_but_estimates_a_total_that_matches_what_it_emits() {
+        let Some(path) = sample_mkv("ffmpeg_mkv_estimate", 2, 64, 48, 10) else { return };
+        let src = FfmpegSource::probe(&path, None, FitMode::Contain, Filter::Lanczos, None)
+            .expect("probe");
+        assert_eq!(
+            src.info().frame_count_hint,
+            None,
+            "matroska states no frame count; if that changes this test is moot"
+        );
+
+        let mut stream = src.open().expect("open");
+        let mut actual = 0usize;
+        while stream.next().expect("next").is_some() {
+            actual += 1;
+        }
+
+        let est = src.frame_count_estimate().expect("a known duration must yield an estimate");
+        assert!(
+            est.abs_diff(actual) <= 2,
+            "the estimate ({est}) must be within a frame or two of the {actual} frames \
+             actually emitted, or it is not a useful denominator"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A VFR source gets NO estimate, deliberately.
+    ///
+    /// Its duration is known, so an estimate is available -- and it is wrong
+    /// in a specific, systematic direction: `out_fps` is the AVERAGE rate
+    /// while `open`'s conformance duplicates frames up to a fixed one, so
+    /// `duration * average` comes out ~46% SHORT on this exact clip (27
+    /// against 50, measured). A bar that fills barely halfway through and then
+    /// keeps growing is a worse lie than a spinner that admits it has no
+    /// total, so `probe` withholds the estimate here. This test is what stops
+    /// a future "we know the duration, just use it" simplification from
+    /// quietly reintroducing that.
+    #[test]
+    fn a_variable_frame_rate_clip_gets_no_estimate_rather_than_a_systematically_short_one() {
+        let Some(path) = sample_vfr_clip("vfr_no_estimate") else { return };
+        let src = FfmpegSource::probe(&path, None, FitMode::Contain, Filter::Lanczos, None)
+            .expect("probe");
+        assert_eq!(src.info().frame_count_hint, None, "the VFR hint is None by design");
+        assert_eq!(
+            src.frame_count_estimate(),
+            None,
+            "an average-rate estimate is systematically short of what conformance emits"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An `.mkv` of `secs` seconds at `fps`, or `None` when ffmpeg is missing.
+    /// Matroska specifically: an `.mp4`'s sample table gives an exact frame
+    /// count, so it cannot exercise the no-`nb_frames` case above.
+    fn sample_mkv(name: &str, secs: u32, w: u32, h: u32, fps: u32) -> Option<std::path::PathBuf> {
+        if !ffmpeg_available() {
+            eprintln!("SKIPPING {name}: ffmpeg not on PATH");
+            return None;
+        }
+        let path = std::env::temp_dir().join(format!("h2b_{name}_{}.mkv", std::process::id()));
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-y", "-f", "lavfi", "-i",
+                &format!("testsrc2=size={w}x{h}:rate={fps}"),
+                "-t", &secs.to_string(), "-pix_fmt", "yuv420p", "-coder", "1",
             ])
             .arg(&path)
             .status()
@@ -798,6 +1036,41 @@ pub(crate) mod tests {
         let b = drain();
         assert_eq!(a.len(), 5);
         assert_eq!(a, b, "two opens must agree frame for frame");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// [`FrameStream::advance`]'s override on this stream reads passed-over
+    /// frames into a reused scratch buffer instead of giving each one its own
+    /// allocation and `RgbaImage`. That must be invisible: same frames, same
+    /// counts, same drain point as the default body's `n` calls to `next`.
+    ///
+    /// Every step size from 1 up is swept because the override has three
+    /// distinct paths -- `n <= 1` delegates straight to `next`, a full run
+    /// ends on `next`, and a run that hits the end of the pipe part-way has
+    /// to hand back the last frame sitting in the scratch buffer.
+    #[test]
+    fn advance_matches_repeated_next() {
+        let Some(path) = sample_clip("fadv", 1, 32, 24, 8) else { return };
+        let src = FfmpegSource::probe(&path, None, FitMode::Contain, Filter::Lanczos, None)
+            .expect("probe");
+        for step in 1..=5 {
+            let mut by_next = src.open().expect("open");
+            let mut by_advance = src.open().expect("open");
+            loop {
+                let mut want_n = 0;
+                let mut want_last = None;
+                for _ in 0..step {
+                    match by_next.next().expect("next") {
+                        Some(f) => { want_last = Some(f); want_n += 1; }
+                        None => break,
+                    }
+                }
+                let (got_n, got_last) = by_advance.advance(step).expect("advance");
+                assert_eq!(got_n, want_n, "step {step}: pulled count");
+                assert_eq!(got_last, want_last, "step {step}: kept frame");
+                if want_n == 0 { break }
+            }
+        }
         let _ = std::fs::remove_file(&path);
     }
 

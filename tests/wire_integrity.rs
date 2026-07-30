@@ -7,7 +7,7 @@
 //!   3. the referenced port index resolves to a registered wire-port name.
 //!
 //! Check 2 is the one that matters most: the writer resolves a `WirePort`'s
-//! component type by *name lookup in global data alone* — it never verifies the
+//! component type by *name lookup in global data alone* -- it never verifies the
 //! brick carries that component. So wiring to the wrong brick (e.g. a
 //! microchip's shell instead of its inner pin brick) produces a save that opens
 //! fine, passes a range-only check, and silently does nothing in game.
@@ -88,7 +88,7 @@ pub fn assert_wires_valid(path: &Path) {
                     type_indices.len(),
                     csoa.component_brick_indices.len(),
                     "grid {gid} chunk {:?}: {} component type counter instances but {} component \
-                     brick indices — component SoA is internally inconsistent",
+                     brick indices -- component SoA is internally inconsistent",
                     chunk.index,
                     type_indices.len(),
                     csoa.component_brick_indices.len(),
@@ -176,7 +176,7 @@ pub fn assert_wires_valid(path: &Path) {
         }
     }
 
-    assert!(checked > 0, "save contains no wires — nothing was validated");
+    assert!(checked > 0, "save contains no wires -- nothing was validated");
 }
 
 /// Validate one wire endpoint against the chunk contents gathered in pass 1.
@@ -233,7 +233,7 @@ fn check_endpoint(
         .unwrap_or(&[]);
     assert!(
         carried.contains(&component_type_index),
-        "{at} references {wanted}, but that brick does not carry that component type — it \
+        "{at} references {wanted}, but that brick does not carry that component type -- it \
          carries {}",
         if carried.is_empty() {
             "no components at all".to_string()
@@ -283,7 +283,7 @@ fn write_fixture(path: &Path, target_component_is_wrong: bool) {
     world.add_bricks([a, b]);
     // Brick b carries the BoolNot gate component, not a Rerouter. Aiming the
     // rerouter input port at brick b is in range but references a component
-    // that brick does not carry — the microchip pin-vs-shell failure mode.
+    // that brick does not carry -- the microchip pin-vs-shell failure mode.
     let target_brick = if target_component_is_wrong { b_id } else { a_id };
     world.add_wire_connection(
         brdb::assets::components::LogicGate::BoolNot.output_of(b_id),
@@ -303,7 +303,7 @@ fn helper_accepts_a_known_good_wired_save() {
 }
 
 /// The check must reject a wire whose endpoint names a component the target
-/// brick does not carry — a range-only check reports this as green.
+/// brick does not carry -- a range-only check reports this as green.
 #[test]
 #[should_panic(expected = "does not carry that component type")]
 fn helper_rejects_a_wire_to_a_brick_lacking_the_component() {

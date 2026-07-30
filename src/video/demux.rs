@@ -1,8 +1,8 @@
 //! Pure-Rust container demux: yields CODED (not decoded) video packets plus
 //! track metadata, off of `re_mp4` (MP4/MOV) and `matroska-demuxer`
-//! (MKV/WebM). Both are pure Rust and must build on wasm, which is why this
+//! (MKV/WebM). Both are builtin and must build on wasm, which is why this
 //! module carries no decoder dependency at all -- decoding whatever
-//! [`Packet`] bytes come out of here is Task 5's job (`video::rustvideo`),
+//! [`Packet`] bytes come out of here is Task 5's job (`video::builtin`),
 //! wired to whichever crate that task's own evaluation picked.
 //!
 //! The one piece of this file that is more than plumbing is
@@ -18,8 +18,8 @@ use std::path::Path;
 ///
 /// Not informational: `rust_h264` decodes CAVLC streams to visibly wrong
 /// pixels while returning no error, so this decides which backend may handle
-/// the file at all. `Unknown` must be treated as unsafe for the pure-Rust
-/// path — a guess that lands on CABAC when the stream is CAVLC produces a
+/// the file at all. `Unknown` must be treated as unsafe for the builtin
+/// path -- a guess that lands on CABAC when the stream is CAVLC produces a
 /// wrong render with no warning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntropyCoding {
@@ -44,6 +44,17 @@ pub struct VideoTrack {
     pub height: u32,
     pub fps: f32,
     pub frame_count: Option<usize>,
+    /// Track length in seconds, when the container states one.
+    ///
+    /// Distinct from `frame_count` and held to a LOOSER standard on purpose:
+    /// this is only ever used to size a progress bar
+    /// ([`crate::video::stream::FrameSource::frame_count_estimate`]), never to
+    /// refuse or truncate a render. Matroska is precisely the case that needs
+    /// it -- the container has no frame count at all, so `frame_count` is
+    /// honestly `None`, but it does declare a Duration, and `duration * fps`
+    /// is a perfectly good denominator for a bar that would otherwise be an
+    /// indeterminate spinner for the whole render.
+    pub duration_s: Option<f64>,
     pub entropy: EntropyCoding,
 }
 
@@ -57,9 +68,9 @@ pub struct Packet {
     pub data: Vec<u8>,
 }
 
-/// A re-openable-per-file (not per-stream — see [`Demuxer::open`]) cursor
+/// A re-openable-per-file (not per-stream -- see [`Demuxer::open`]) cursor
 /// over one video file's container, dispatched to whichever of the two pure
-/// Rust backends can parse it.
+/// the builtin backend can parse it.
 pub struct Demuxer {
     track: VideoTrack,
     backend: Backend,
@@ -69,7 +80,7 @@ pub struct Demuxer {
     /// track that has no out-of-band config to read (see
     /// `entropy_coding_from_avcc`'s doc for the same gap). This is the exact
     /// same byte layout `entropy_coding_from_avcc` below already parses one
-    /// bit out of -- Task 5's `RustVideoSource` needs the rest of it (the
+    /// bit out of -- Task 5's `BuiltinVideoSource` needs the rest of it (the
     /// SPS/PPS NAL units themselves) to actually decode, not just to read the
     /// entropy coding mode.
     avc_config: Option<Vec<u8>>,
@@ -136,14 +147,14 @@ impl Demuxer {
         }
     }
 
-    /// The track's metadata. Cheap to call repeatedly — it is computed once
+    /// The track's metadata. Cheap to call repeatedly -- it is computed once
     /// in [`Demuxer::open`] and cloned out, not re-derived.
     pub fn track(&self) -> VideoTrack {
         self.track.clone()
     }
 
     /// The raw AVCDecoderConfigurationRecord bytes for an H.264 track with
-    /// out-of-band parameter sets — `None` for every other case (see the
+    /// out-of-band parameter sets -- `None` for every other case (see the
     /// field's own doc). [`Packet`]s carry only sample data, never the SPS/PPS
     /// that live out-of-band in this record, so a decoder needs both.
     pub fn avc_decoder_config(&self) -> Option<&[u8]> {
@@ -155,7 +166,7 @@ impl Demuxer {
     /// `None`, matching [`crate::video::stream::FrameStream::next`]'s
     /// contract even though this type does not implement that trait itself
     /// (it yields coded packets, not decoded [`image::RgbaImage`] frames --
-    /// Task 5's `RustVideoSource` is the actual `FrameStream`, built on top
+    /// Task 5's `BuiltinVideoSource` is the actual `FrameStream`, built on top
     /// of this).
     pub fn next_packet(&mut self) -> Result<Option<Packet>, String> {
         match &mut self.backend {
@@ -174,7 +185,7 @@ enum Sniff {
 /// Sniffs a container from its own bytes: the EBML magic number
 /// (`1A 45 DF A3`) for Matroska/WebM, or an ISO base media `ftyp` box (its
 /// type field at byte offset 4) for MP4/MOV. Deliberately not extension
-/// based — a wrong extension must not make an otherwise-valid file
+/// based -- a wrong extension must not make an otherwise-valid file
 /// unreadable, and a garbage file with a `.mp4` name must not be handed to
 /// `re_mp4` just because of its name.
 fn sniff(bytes: &[u8]) -> Sniff {
@@ -252,8 +263,6 @@ fn open_mp4(file: File, path: &Path) -> Result<Demuxer, String> {
         .find(|t| t.kind == Some(re_mp4::TrackKind::Video))
         .ok_or_else(|| "mp4/mov container has no video track".to_string())?;
 
-    let width = u32::from(track.width);
-    let height = u32::from(track.height);
     let frame_count = Some(track.samples.len());
 
     // `fps` comes from the track's own total duration (mdhd, authoritative)
@@ -273,29 +282,59 @@ fn open_mp4(file: File, path: &Path) -> Result<Demuxer, String> {
         ));
     }
 
-    let (codec, entropy, avc_config) = match &track.trak(&mp4).mdia.minf.stbl.stsd.contents {
+    // Dimensions come from the SAMPLE DESCRIPTION (`stsd`), not the track
+    // header (`tkhd`).
+    //
+    // `re_mp4::Track::width`/`height` are `tkhd.width`/`height`, which is the
+    // PRESENTATION size: coded size times the pixel aspect ratio. For
+    // square-pixel content the two agree, which is why this went unnoticed;
+    // for anamorphic content (AVCHD/HDV-style 1440x1080 stored for 1920x1080
+    // display) they differ, and it is the CODED size a decoder emits.
+    // Reporting the display size made `BuiltinVideoSource::open_path` accept
+    // such a file -- it never decodes a frame -- and then made
+    // `BuiltinFrameStream::accept` fail on frame 0 with "decoded frame
+    // 1440x1080 does not match the container's reported 1920x1080". Because
+    // `Backend::Auto` returns as soon as the builtin backend OPENS, that
+    // failure landed mid-render instead of triggering the ffmpeg fallback.
+    //
+    // A `0` in the sample entry means the box did not carry a size at all
+    // (legal, if rare), and `tkhd` is then the only thing left to go on.
+    let (codec, entropy, avc_config, coded) = match &track.trak(&mp4).mdia.minf.stbl.stsd.contents {
         re_mp4::StsdBoxContent::Avc1(c) => (
             "h264".to_string(),
             entropy_coding_from_avcc(&c.avcc.raw),
             Some(c.avcc.raw.clone()),
+            (c.width, c.height),
         ),
-        re_mp4::StsdBoxContent::Hvc1(_) | re_mp4::StsdBoxContent::Hev1(_) => {
-            ("h265".to_string(), EntropyCoding::Unknown, None)
+        re_mp4::StsdBoxContent::Hvc1(c) | re_mp4::StsdBoxContent::Hev1(c) => {
+            ("h265".to_string(), EntropyCoding::Unknown, None, (c.width, c.height))
         }
-        re_mp4::StsdBoxContent::Vp08(_) => ("vp8".to_string(), EntropyCoding::Unknown, None),
-        re_mp4::StsdBoxContent::Vp09(_) => ("vp9".to_string(), EntropyCoding::Unknown, None),
-        re_mp4::StsdBoxContent::Av01(_) => ("av1".to_string(), EntropyCoding::Unknown, None),
+        re_mp4::StsdBoxContent::Vp08(c) => {
+            ("vp8".to_string(), EntropyCoding::Unknown, None, (c.width, c.height))
+        }
+        re_mp4::StsdBoxContent::Vp09(c) => {
+            ("vp9".to_string(), EntropyCoding::Unknown, None, (c.width, c.height))
+        }
+        re_mp4::StsdBoxContent::Av01(c) => {
+            ("av1".to_string(), EntropyCoding::Unknown, None, (c.width, c.height))
+        }
         // Only video-kind `StsdBoxContent` variants can reach here (the
         // `find` above filtered on `TrackKind::Video`); this arm exists so
         // the match stays exhaustive against future/audio variants without
         // panicking, not because it is expected to run.
-        _ => ("unknown".to_string(), EntropyCoding::Unknown, None),
+        _ => ("unknown".to_string(), EntropyCoding::Unknown, None, (0, 0)),
     };
+    let width = u32::from(if coded.0 != 0 { coded.0 } else { track.width });
+    let height = u32::from(if coded.1 != 0 { coded.1 } else { track.height });
 
     let samples = track.samples.clone();
 
+    // Both non-zero: checked above, where the same two fields are what the
+    // frame rate is derived from.
+    let duration_s = Some(track.duration as f64 / track.timescale as f64);
+
     Ok(Demuxer {
-        track: VideoTrack { codec, width, height, fps, frame_count, entropy },
+        track: VideoTrack { codec, width, height, fps, frame_count, duration_s, entropy },
         backend: Backend::Mp4(Mp4Demux { file, samples, next_index: 0 }),
         avc_config,
     })
@@ -387,8 +426,25 @@ fn open_mkv(raw_file: File) -> Result<Demuxer, String> {
 
     let video_track = track.track_number().get();
 
+    // Matroska's Segment `Duration` is a float in TimestampScale units, and
+    // TimestampScale is nanoseconds -- so this is the one length signal the
+    // container gives, and the only reason `frame_count: None` above does not
+    // have to mean a totalless progress bar. Absent or non-finite stays
+    // `None`; nothing here guesses.
+    let duration_s = file.info().duration().filter(|d| d.is_finite() && *d > 0.0).map(|d| {
+        d * file.info().timestamp_scale().get() as f64 / 1_000_000_000.0
+    });
+
     Ok(Demuxer {
-        track: VideoTrack { codec, width, height, fps, frame_count: None, entropy },
+        track: VideoTrack {
+            codec,
+            width,
+            height,
+            fps,
+            frame_count: None,
+            duration_s,
+            entropy,
+        },
         backend: Backend::Mkv(MkvDemux { file, video_track }),
         avc_config,
     })
@@ -406,8 +462,8 @@ fn open_mkv(raw_file: File) -> Result<Demuxer, String> {
 
 /// Extracts the H.264 entropy coding mode from a raw
 /// AVCDecoderConfigurationRecord. Returns [`EntropyCoding::Unknown`] on
-/// anything that does not parse cleanly — truncated data, an empty PPS list,
-/// whatever — never a guess. See [`EntropyCoding`]'s own doc for why a wrong
+/// anything that does not parse cleanly -- truncated data, an empty PPS list,
+/// whatever -- never a guess. See [`EntropyCoding`]'s own doc for why a wrong
 /// guess here is worse than admitting ignorance.
 fn entropy_coding_from_avcc(avcc: &[u8]) -> EntropyCoding {
     first_pps(avcc)
@@ -457,6 +513,18 @@ fn entropy_coding_from_pps_nal(pps: &[u8]) -> Option<EntropyCoding> {
     Some(if bits.read_bit()? == 1 { EntropyCoding::Cabac } else { EntropyCoding::Cavlc })
 }
 
+/// Undoes the `00 00 03` -> `00 00` escaping every NAL unit's RBSP uses.
+///
+/// `zero_run` SATURATES rather than wrapping. It was a `u8` that only ever
+/// reset on a `0x03` after two zeros, so 256 consecutive zero bytes overflowed
+/// it -- `attempt to add with overflow`, a panic in any build with debug
+/// assertions on, which is every `cargo test` run and every `cargo build`
+/// without `--release`. A valid H.264 stream cannot contain three consecutive
+/// zero bytes, but this input is not validated: `first_pps` hands over
+/// whatever byte range the avcC record's PPS-length field points at, and
+/// `Demuxer::open` runs on the DEFAULT `--backend auto` path, so a corrupt or
+/// crafted `.mp4` reaches it. Only the "have we seen two zeros" question is
+/// ever asked of this counter, so saturating loses nothing.
 fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut zero_run = 0u8;
@@ -465,7 +533,7 @@ fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
             zero_run = 0;
             continue;
         }
-        zero_run = if b == 0 { zero_run + 1 } else { 0 };
+        zero_run = if b == 0 { zero_run.saturating_add(1) } else { 0 };
         out.push(b);
     }
     out
@@ -474,7 +542,7 @@ fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
 /// A minimal big-endian, MSB-first bitstream reader for H.264's Exp-Golomb
 /// and fixed-width fields.
 ///
-/// `pub(crate)` rather than private because [`crate::video::rustvideo`] walks
+/// `pub(crate)` rather than private because [`crate::video::builtin`] walks
 /// an SPS RBSP with it to read the VUI colour-description fields (which
 /// decide the YUV→RGB matrix). That is a longer walk than the two `ue(v)`s
 /// this file needs, hence [`BitReader::read_bits`] and [`BitReader::read_se`]
@@ -571,12 +639,57 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Anamorphic content is the case where `tkhd` (display size) and `stsd`
+    /// (coded size) part company. `-aspect 8:3` on a 64x48 encode gives a
+    /// pixel aspect ratio of 2:1, so `tkhd` says 128x48 while the decoder
+    /// emits 64x48. Reporting `tkhd` made `BuiltinVideoSource::open_path`
+    /// accept the file and `BuiltinFrameStream::accept` then kill the render
+    /// on frame 0 -- past the point where `Backend::Auto` could still fall
+    /// back to ffmpeg.
+    #[test]
+    fn anamorphic_mp4_reports_its_coded_size_not_its_display_size() {
+        let Some(path) = crate::video::ffmpeg::tests::sample_clip_args(
+            "demux_anamorphic", &["-aspect", "8:3"], 1, 64, 48, 10,
+        ) else { return };
+        let track = Demuxer::open(&path).expect("open").track();
+        assert_eq!(
+            (track.width, track.height),
+            (64, 48),
+            "the coded size is what a decoder emits; tkhd would say 128x48"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_non_video_file_errors_rather_than_panicking() {
         let path = std::env::temp_dir().join(format!("h2b_notvideo_{}.mp4", std::process::id()));
         std::fs::write(&path, b"this is not a container").expect("write");
         assert!(Demuxer::open(&path).is_err(), "garbage must error");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A long zero run used to overflow the `u8` zero counter and panic under
+    /// debug assertions -- i.e. in every `cargo test` and every non-release
+    /// build. Reachable from a corrupt `.mp4` on the default `--backend auto`
+    /// path, since `first_pps` reads an unvalidated length out of the avcC
+    /// record and hands the bytes straight here.
+    #[test]
+    fn a_long_zero_run_does_not_overflow_the_escape_counter() {
+        let out = remove_emulation_prevention(&vec![0u8; 300]);
+        assert_eq!(out.len(), 300, "no 0x03 to remove, so nothing is removed");
+        assert!(out.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn emulation_prevention_bytes_are_still_removed_after_a_long_zero_run() {
+        // 300 zeros, then `03`, then a payload byte: the `03` is an escape
+        // (it follows at least two zeros) and must go; the rest must stay.
+        let mut input = vec![0u8; 300];
+        input.push(0x03);
+        input.push(0xAB);
+        let out = remove_emulation_prevention(&input);
+        assert_eq!(out.len(), 301);
+        assert_eq!(out[300], 0xAB, "the escape is dropped, the payload kept");
     }
 
     /// The load-bearing assertion this whole task exists for: Task 6's guard

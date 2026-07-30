@@ -107,12 +107,49 @@ impl<'a> ResizeStream<'a> {
     }
 }
 
+impl ResizeStream<'_> {
+    /// Resize `f`, unless it is already exactly the target size.
+    ///
+    /// This skip is what lets a backend do its own scaling without this
+    /// stream redoing it. `FfmpegSource` scales inside its own filtergraph
+    /// when handed a target, which is enormously cheaper: it then pipes
+    /// target-sized frames instead of piping native-resolution ones for this
+    /// to shrink. On a 1080p source that is ~8.3 MB per frame over the pipe
+    /// versus ~9 KB at 64x36 -- for a 24-minute episode, ~280 GB of pipe
+    /// traffic versus ~300 MB.
+    ///
+    /// `BuiltinVideoSource` takes no size parameter at all, so its frames
+    /// arrive at native resolution and are resized here exactly as before.
+    /// Both backends therefore still end at the same dimensions -- the
+    /// property `main.rs` was protecting by passing `None` and resizing only
+    /// here, so that `--width`/`--height` can never work on one backend and
+    /// silently do nothing on the other.
+    fn fit_frame(&self, f: RgbaImage) -> RgbaImage {
+        if f.width() == self.w && f.height() == self.h {
+            return f;
+        }
+        resize_frame(&f, self.w, self.h, self.fit, self.filter)
+    }
+}
+
 impl FrameStream for ResizeStream<'_> {
     fn next(&mut self) -> Result<Option<RgbaImage>, String> {
-        Ok(self
-            .inner
-            .next()?
-            .map(|f| resize_frame(&f, self.w, self.h, self.fit, self.filter)))
+        Ok(self.inner.next()?.map(|f| self.fit_frame(f)))
+    }
+
+    /// One resize per `advance`, not `n` of them.
+    ///
+    /// The default body would call `next` `n` times and throw away all but
+    /// the last result -- i.e. run a full Lanczos resize on `n - 1` frames
+    /// nobody ever looks at. `FpsStream` sits directly on top of this stream
+    /// (see `AdaptedSource::open`) and passes over exactly those frames on
+    /// every downsampling render, so this is the common case, not a corner
+    /// one. Forwarding the `advance` down and resizing only the frame that
+    /// comes back is identical in output -- selecting frames and resizing
+    /// them are independent per-frame operations -- and does `1/n` the work.
+    fn advance(&mut self, n: usize) -> Result<(usize, Option<RgbaImage>), String> {
+        let (got, last) = self.inner.advance(n)?;
+        Ok((got, last.map(|f| self.fit_frame(f))))
     }
 }
 
@@ -293,27 +330,41 @@ impl<'a> FpsStream<'a> {
 
     /// Pull source frames until `want` has been read, holding the last.
     ///
-    /// Returns false only when the source yielded NOTHING AT ALL — a genuine
+    /// Returns false only when the source yielded NOTHING AT ALL -- a genuine
     /// end of stream. Running past the last index is not that: `resample_fps`
     /// clamps its index with `.clamp(0, n - 1)`, so an upsample whose output
     /// time still falls inside the source repeats the final frame. Collapsing
     /// the two cases into one "false" silently truncated every upsample whose
     /// target rate did not evenly divide the clip.
+    ///
+    /// Expressed as ONE [`FrameStream::advance`] call rather than a `next()`
+    /// loop, because the frames strictly between `pulled` and `want` are
+    /// passed over: nothing ever looks at them. `advance`'s default body is
+    /// that same `next()` loop, so this is unchanged for any stream that
+    /// does not override it; the streams that do (`ResizeStream` above, the
+    /// builtin decoder's own) skip the per-frame work for the ones being
+    /// passed over. The bookkeeping below reproduces the old loop exactly:
+    /// `held` becomes the last frame actually pulled (unchanged when none
+    /// were), `pulled` advances by however many were read, and a short read
+    /// is the drain that fixes `source_end`.
     fn advance_to(&mut self, want: usize) -> Result<bool, String> {
-        while self.pulled <= want {
-            match self.inner.next()? {
-                Some(f) => {
-                    self.held = Some(f);
-                    self.pulled += 1;
-                }
-                None => {
-                    // Drained: the source's true length is now known, so
-                    // record the duration that bounds the output. `held` is
-                    // the last frame, which is what `want` clamps onto.
-                    self.source_end = Some(self.pulled as f32 / self.source_fps);
-                    return Ok(self.held.is_some());
-                }
-            }
+        if self.pulled > want {
+            // The old `while` loop's condition, false on entry: already past
+            // `want`, so nothing to pull and `held` is already the right frame.
+            return Ok(true);
+        }
+        let need = want + 1 - self.pulled;
+        let (got, last) = self.inner.advance(need)?;
+        self.pulled += got;
+        if last.is_some() {
+            self.held = last;
+        }
+        if got < need {
+            // Drained: the source's true length is now known, so record the
+            // duration that bounds the output. `held` is the last frame,
+            // which is what `want` clamps onto.
+            self.source_end = Some(self.pulled as f32 / self.source_fps);
+            return Ok(self.held.is_some());
         }
         Ok(true)
     }
@@ -357,6 +408,135 @@ impl FrameStream for FpsStream<'_> {
         }
         self.emitted += 1;
         Ok(self.held.clone())
+    }
+}
+
+#[cfg(test)]
+mod advance_tests {
+    use super::*;
+    use crate::video::stream::FrameStream;
+    use image::{Rgba, RgbaImage};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A source stream that records which of the two pull APIs was used on
+    /// it. It DOES override `advance`, so a caller that forwards reaches the
+    /// override and a caller that falls back to the default body does not --
+    /// which is exactly the distinction these tests need to see.
+    struct Recording {
+        frames: Vec<RgbaImage>,
+        at: usize,
+        nexts: Rc<Cell<usize>>,
+        advances: Rc<Cell<usize>>,
+    }
+
+    impl FrameStream for Recording {
+        fn next(&mut self) -> Result<Option<RgbaImage>, String> {
+            self.nexts.set(self.nexts.get() + 1);
+            let out = self.frames.get(self.at).cloned();
+            if out.is_some() {
+                self.at += 1;
+            }
+            Ok(out)
+        }
+
+        fn advance(&mut self, n: usize) -> Result<(usize, Option<RgbaImage>), String> {
+            self.advances.set(self.advances.get() + 1);
+            let take = n.min(self.frames.len() - self.at);
+            self.at += take;
+            Ok((take, take.gt(&0).then(|| self.frames[self.at - 1].clone())))
+        }
+    }
+
+    fn frames(n: usize) -> Vec<RgbaImage> {
+        (0..n).map(|i| RgbaImage::from_pixel(4, 4, Rgba([i as u8, 1, 2, 255]))).collect()
+    }
+
+    /// `ResizeStream::advance` is an optimization, so it must agree with the
+    /// default body -- `n` calls to `next`, keeping the last -- frame for
+    /// frame and count for count, including once the source has drained.
+    #[test]
+    fn resize_stream_advance_matches_repeated_next() {
+        for step in 1..=4 {
+            let (nexts, advances) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+            let src = |a: &Rc<Cell<usize>>, b: &Rc<Cell<usize>>| Recording {
+                frames: frames(7),
+                at: 0,
+                nexts: a.clone(),
+                advances: b.clone(),
+            };
+            let mut by_next = ResizeStream::new(
+                Box::new(src(&nexts, &advances)),
+                3,
+                2,
+                FitMode::Exact,
+                Filter::Nearest,
+            );
+            let mut by_advance = ResizeStream::new(
+                Box::new(src(&nexts, &advances)),
+                3,
+                2,
+                FitMode::Exact,
+                Filter::Nearest,
+            );
+            loop {
+                let mut want_n = 0;
+                let mut want_last = None;
+                for _ in 0..step {
+                    match by_next.next().expect("next") {
+                        Some(f) => {
+                            want_last = Some(f);
+                            want_n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                let (got_n, got_last) = by_advance.advance(step).expect("advance");
+                assert_eq!((got_n, got_last), (want_n, want_last), "step {step}");
+                if want_n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The whole point of the `advance` path, stated as a property rather
+    /// than a timing: on a downsampling render the chain must ask the SOURCE
+    /// to pass over the frames it is dropping, instead of pulling each one
+    /// through `next` and resizing it first.
+    ///
+    /// A regression here -- someone reverting `ResizeStream::advance`, or
+    /// rewriting `FpsStream::advance_to` back into a `next` loop -- is
+    /// invisible in output and only shows up as the render getting ~2x
+    /// slower, so it is worth pinning directly.
+    #[test]
+    fn a_downsampling_chain_passes_frames_over_instead_of_resizing_them() {
+        let (nexts, advances) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let inner = Recording {
+            frames: frames(30),
+            at: 0,
+            nexts: nexts.clone(),
+            advances: advances.clone(),
+        };
+        // 30fps source, 10fps target: two frames in three are passed over.
+        let resized = ResizeStream::new(Box::new(inner), 3, 2, FitMode::Exact, Filter::Nearest);
+        let mut fps = FpsStream::new(Box::new(resized), 30.0, 10.0, 0.0, None, 1000).expect("fps");
+        let mut emitted = 0;
+        while fps.next().expect("next").is_some() {
+            emitted += 1;
+        }
+        assert_eq!(emitted, 10, "30 frames at 30fps resampled to 10fps");
+        assert_eq!(
+            nexts.get(),
+            0,
+            "no frame may be pulled one at a time -- that is the path that resizes every \
+             source frame, including the 20 this render never looks at"
+        );
+        assert!(
+            advances.get() <= emitted + 1,
+            "at most one advance per emitted frame (plus the one that finds the end), got {}",
+            advances.get()
+        );
     }
 }
 

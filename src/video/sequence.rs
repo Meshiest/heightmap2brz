@@ -13,6 +13,17 @@ use super::Clip;
 ///
 /// This makes "frame_2" sort before "frame_10" despite lexicographic ordering.
 /// Zero-padding is irrelevant: "f_0002" and "f_2" sort identically.
+///
+/// A name with NO trailing digits gets `0`, so `frame.png` sorts before
+/// `frame1.png` -- the order every file manager and `ls -v` gives, and the
+/// order this doc has always claimed. The previous code ran the empty digit
+/// run through the same `parse().unwrap_or(u64::MAX)` the overflow case uses,
+/// so an unnumbered first frame sorted LAST among its siblings and a rendered
+/// sequence opened on what should have been its final frame. The existing
+/// tests missed it: `names_without_numbers_fall_back_to_lexicographic` uses
+/// two unnumbered names (both got `u64::MAX`, so the prefix decided it), and
+/// `digit_run_overflow_caps_to_u64_max` pins the fallback that the empty case
+/// was wrongly sharing.
 pub fn natural_key(name: &str) -> (String, u64) {
     let stem = Path::new(name)
         .file_stem()
@@ -28,10 +39,16 @@ pub fn natural_key(name: &str) -> (String, u64) {
     let prefix = stem[..end].to_string();
     let trailing_digits = &stem[end..];
 
-    // Parse the trailing digits, capping to u64::MAX on overflow
-    let number = trailing_digits
-        .parse::<u64>()
-        .unwrap_or(u64::MAX);
+    let number = if trailing_digits.is_empty() {
+        // No number at all is not the same thing as a number too large to
+        // hold -- see this function's doc.
+        0
+    } else {
+        // A digit run wider than u64 caps rather than wrapping; such a name
+        // sorts last among its siblings, which is the least surprising place
+        // for something unrepresentable to land.
+        trailing_digits.parse::<u64>().unwrap_or(u64::MAX)
+    };
 
     (prefix, number)
 }
@@ -104,6 +121,38 @@ mod tests {
         let mut names = vec!["beta.png", "alpha.png"];
         names.sort_by_key(|n| natural_key(n));
         assert_eq!(names, vec!["alpha.png", "beta.png"]);
+    }
+
+    #[test]
+    fn an_unnumbered_name_sorts_before_its_numbered_siblings() {
+        // The unnumbered name used to share the overflow fallback and get
+        // u64::MAX, so it sorted LAST -- a sequence whose first frame is
+        // `frame.png` played it at the end.
+        let mut names = vec!["frame2.png", "frame.png", "frame10.png", "frame1.png"];
+        names.sort_by_key(|n| natural_key(n));
+        assert_eq!(names, vec!["frame.png", "frame1.png", "frame2.png", "frame10.png"]);
+    }
+
+    #[test]
+    fn an_absent_number_is_zero_not_the_overflow_sentinel() {
+        assert_eq!(natural_key("intro.png"), ("intro".to_string(), 0));
+        // ...and the overflow sentinel is still reserved for real overflow.
+        assert_eq!(natural_key("intro99999999999999999999.png").1, u64::MAX);
+    }
+
+    #[test]
+    fn decode_sequence_puts_an_unnumbered_frame_first() {
+        // The ordering bug's actual consequence: the frames come out in the
+        // wrong order, and nothing anywhere reports it.
+        let mut first = RgbaImage::new(1, 1);
+        first.put_pixel(0, 0, image::Rgba([1, 0, 0, 255]));
+        let mut second = RgbaImage::new(1, 1);
+        second.put_pixel(0, 0, image::Rgba([2, 0, 0, 255]));
+
+        let named = vec![("f1.png".to_string(), second), ("f.png".to_string(), first)];
+        let clip = decode_sequence(named, 10.0).unwrap();
+        assert_eq!(clip.frames[0].get_pixel(0, 0)[0], 1, "f.png is frame 0");
+        assert_eq!(clip.frames[1].get_pixel(0, 0)[0], 2);
     }
 
     #[test]

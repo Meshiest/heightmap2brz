@@ -23,7 +23,7 @@ pub fn is_video_path(path: &std::path::Path) -> bool {
 }
 
 /// True when the bytes are a container that can hold multiple frames. A
-/// single-frame GIF still counts — `decode_animated` handles it and yields a
+/// single-frame GIF still counts -- `decode_animated` handles it and yields a
 /// one-frame clip.
 pub fn is_animated(bytes: &[u8]) -> bool {
     matches!(

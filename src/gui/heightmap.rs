@@ -4,7 +4,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use crate::{
     gui::{
         SharedOptions,
-        util::{PickedImage, deliver_save, maps_from_images, pick_images, thumb},
+        util::{
+            PickedImage, deliver_world, draw_out_file_warnings, maps_from_images, pick_images,
+            refuse_bad_out_file, thumb,
+        },
     },
     opt::*,
     util::{bricks_to_save, *},
@@ -17,6 +20,47 @@ use log::{error, info};
 use poll_promise::Promise;
 
 type Progress = (&'static str, f32);
+
+/// Why a render stopped early.
+///
+/// The two are NOT the same outcome and must not share one `Err(String)`: a
+/// failure is the user's to see and fix, while a cancellation is the user's own
+/// doing and `progress.rs` requires that it "must never surface as an error
+/// dialog or a crash-looking exit". `From<String>` is what lets every fallible
+/// step in the worker keep its plain `?`.
+enum Halt {
+    Cancelled,
+    Failed(String),
+}
+
+impl From<String> for Halt {
+    fn from(e: String) -> Self {
+        Halt::Failed(e)
+    }
+}
+
+/// What the worker's promise carries, from how the render ended.
+///
+/// **A cancelled render reports SUCCESS.** `progress.rs` states the policy --
+/// a cancel "must never surface as an error dialog or a crash-looking exit" --
+/// and the Video and Audio panes follow it
+/// (`gui::util::deliver_world_unless_cancelled` logs INFO and returns `Ok`).
+/// This pane was the odd one out: Stop produced `Err("Stopped by user")`, which
+/// `draw_progress` painted as a red "Error: Stopped by user" with an ok button,
+/// so pressing the button the UI offered looked like a crash.
+///
+/// A free function rather than a `match` inside the closure so the policy can
+/// be asserted without spawning a worker thread and racing its cancel flag.
+fn finish(result: Result<(), Halt>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(Halt::Cancelled) => {
+            info!("Render cancelled -- no save written");
+            Ok(())
+        }
+        Err(Halt::Failed(e)) => Err(e),
+    }
+}
 
 /// Which selection an in-flight file pick fills.
 #[derive(Clone, Copy, PartialEq)]
@@ -165,7 +209,13 @@ impl HeightmapApp {
         let colormap = self.colormap.clone();
 
         let progress_tx = self.progress_channel.0.clone();
-        let progress = move |status, p| progress_tx.send((status, p)).unwrap();
+        // Send failures are IGNORED, as in the Video and Audio panes: a closed
+        // channel means the UI went away, which must never take a render that
+        // is otherwise fine down with it. This used to `.unwrap()`, i.e. panic
+        // the worker thread on a dropped receiver.
+        let progress = move |status, p| {
+            let _ = progress_tx.send((status, p));
+        };
 
         // handle interrupts
         let (tx, rx) = mpsc::channel::<()>();
@@ -179,13 +229,9 @@ impl HeightmapApp {
             progress("Reading", 0.);
             let end_progress = progress.clone();
 
-            let work = move || -> Result<(), String> {
-                let stopped = || -> Result<(), String> {
-                    if is_stopped() {
-                        Err("Stopped by user".to_string())
-                    } else {
-                        Ok(())
-                    }
+            let render = move || -> Result<(), Halt> {
+                let stopped = || -> Result<(), Halt> {
+                    if is_stopped() { Err(Halt::Cancelled) } else { Ok(()) }
                 };
 
                 info!("Reading image files...");
@@ -205,30 +251,21 @@ impl HeightmapApp {
                 progress("Writing", 0.95);
                 let data = bricks_to_save(bricks);
 
-                if out_file.to_lowercase().ends_with(".brz") {
-                    let brz = data
-                        .to_brz_vec()
-                        .map_err(|e| format!("failed to encode brz: {e}"))?;
-                    deliver_save(brz, &out_file, is_clipboard)?;
-                } else if out_file.to_lowercase().ends_with(".brdb") {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        data.write_brdb(&out_file)
-                            .map_err(|e| format!("failed to write file: {e}"))?;
-                        if is_clipboard {
-                            crate::gui::util::copy_path_to_clipboard(&out_file)?;
-                        }
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    return Err("only .brz output is supported on the web".to_string());
-                } else {
-                    return Err("output file must end with .brz or .brdb".to_string());
-                }
+                // This pane's own extension branch, now shared with the other
+                // four -- see `gui::util::deliver_world`. It was the only one
+                // that honoured the extension at all, so making it the shared
+                // implementation is what stops the panes disagreeing again.
+                deliver_world(&data, &out_file, is_clipboard)?;
 
                 stopped()?;
                 info!("Done!");
                 Ok(())
             };
+
+            // The cancel is turned back into a success HERE rather than inside
+            // `render`, so every `?` above still short-circuits the work. See
+            // [`finish`] for the policy and why this pane needed changing.
+            let work = move || -> Result<(), String> { finish(render()) };
 
             #[cfg(not(target_arch = "wasm32"))]
             std::thread::spawn(move || {
@@ -282,13 +319,7 @@ impl HeightmapApp {
                     ui.add(egui::TextEdit::singleline(&mut shared.out_file).hint_text("File Name"));
                 });
                 ui.end_row();
-                let out_file_lowercase = shared.out_file.to_lowercase();
-                let is_brz = out_file_lowercase.ends_with(".brz");
-                if !is_brz && !out_file_lowercase.ends_with(".brdb") {
-                    ui.label("Warning:");
-                    ui.colored_label(Color32::RED, "Output file must end with .brz or .brdb");
-                    ui.end_row();
-                }
+                draw_out_file_warnings(ui, &shared.out_file);
 
                 ui.label("Horizontal Scale")
                     .on_hover_text("The size of each pixel in studs (or microbricks)");
@@ -511,6 +542,13 @@ impl HeightmapApp {
             return;
         }
 
+        // Refused before the button is offered -- see `util::refuse_bad_out_file`.
+        // This pane already honoured the extension when it WROTE the file, but
+        // only after the whole render, and only as an error dialog afterwards.
+        if refuse_bad_out_file(ui, &shared.out_file) {
+            return;
+        }
+
         if img_only {
             if colormap_ok {
                 if ui
@@ -562,5 +600,55 @@ impl HeightmapApp {
         if !self.draw_progress(ctx, ui) {
             self.draw_submit(ui, shared, img_only);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Stop is not an error, on this pane either.**
+    ///
+    /// `draw_progress` paints any `Err` the worker's promise carries as a red
+    /// "Error: ..." with an ok button, and this pane used to hand it
+    /// `Err("Stopped by user")` -- so using the Stop button the UI offered
+    /// looked exactly like a crash. `progress.rs` states the opposite policy and
+    /// the other three panes follow it.
+    ///
+    /// Asserted on [`finish`] rather than by spawning a real worker and racing
+    /// its cancel flag: the outcome of that race is timing, and a test that
+    /// passes when the render simply finished first would prove nothing.
+    #[test]
+    fn a_cancelled_render_reports_success_rather_than_an_error_dialog() {
+        assert!(
+            finish(Err(Halt::Cancelled)).is_ok(),
+            "a cancel must never reach draw_progress as an Err -- that is the red \
+             'Error: Stopped by user' dialog the policy forbids"
+        );
+    }
+
+    /// The complementary case: a REAL failure must still be reported, or the
+    /// fix above would have swallowed every error on this pane.
+    #[test]
+    fn a_real_failure_still_reaches_the_error_dialog() {
+        assert_eq!(
+            finish(Err(Halt::Failed("no images selected".to_string()))),
+            Err("no images selected".to_string())
+        );
+        assert_eq!(finish(Ok(())), Ok(()));
+    }
+
+    /// Every fallible step in the worker keeps its plain `?`, which needs the
+    /// `String` errors those steps return to become `Halt::Failed` and not
+    /// `Halt::Cancelled`.
+    #[test]
+    fn a_string_error_converts_into_a_failure_not_a_cancellation() {
+        let halt: Halt = "failed to write file".to_string().into();
+        assert!(matches!(halt, Halt::Failed(ref e) if e == "failed to write file"));
+        assert_eq!(
+            finish(Err(halt)),
+            Err("failed to write file".to_string()),
+            "a converted error must still be reported to the user"
+        );
     }
 }

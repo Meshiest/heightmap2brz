@@ -5,7 +5,7 @@ pub mod backend;
 pub mod demux;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ffmpeg;
-pub mod rustvideo;
+pub mod builtin;
 pub mod scale;
 pub mod sequence;
 pub mod source;

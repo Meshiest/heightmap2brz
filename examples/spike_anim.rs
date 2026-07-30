@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The chip shell sits BESIDE the screen, not on it. A default display
     // brick is half-extent 5,5,6 (z span [-4,8] at z=2) while the shell is
-    // half-extent 5,5,2 — putting the shell at z=6 over the origin pixel
+    // half-extent 5,5,2 -- putting the shell at z=6 over the origin pixel
     // overlapped both, and the game silently dropped one, leaving a 3-brick
     // L with unconnectable wires. One clear cell of -X keeps them disjoint.
     // `chip::finish` now fully replaces this with the true extent it
@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let service = |col: i32, row: i32| lattice_pos(col, row, 2, h, GATE_HALF);
 
-    let clock = build_clock(&mut world, &mut c, 2.0, frames.len(), service(0, -2));
+    let clock = build_clock(&mut world, &mut c, 2.0, frames.len(), true, service(0, -2));
     let detector = gate(
         &mut c,
         "B_1x1_Gate_Expr_ChangeDetectorExec",

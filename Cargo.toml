@@ -1,6 +1,6 @@
 [package]
 name = "heightmap"
-version = "0.10.3"
+version = "0.11.0"
 authors = ["Isaac <gpg@reheatedcake.io>"]
 edition = "2024"
 rust-version = "1.88"
@@ -30,6 +30,22 @@ matroska-demuxer = "0.8"
 # project places on it (Task 1's evaluation of this crate found it silently
 # decodes CAVLC streams to wrong pixels).
 rust_h264 = "0.4.0"
+# FFT for audio band analysis (audio::stft). Pure Rust, builds for wasm, so
+# it belongs here rather than in the native-only block below.
+rustfft = "6.2"
+# Pure-Rust audio decode (audio::symphonia_src). Also pure Rust and also
+# required on wasm, where ffmpeg cannot exist -- so it belongs here, not in
+# the native-only block below.
+symphonia = { version = "0.5", default-features = false, features = [
+  "mp3",
+  "aac",
+  "isomp4",
+  "mkv",
+  "flac",
+  "vorbis",
+  "wav",
+  "pcm",
+] }
 
 # native: full brdb (brz + sqlite-backed brdb), CLI deps, sync dialogs
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -92,3 +108,11 @@ js-sys = ["dep:js-sys"]
 name = "heightmap_gui"
 path = "src/gui_main.rs"
 required-features = ["gui"]
+
+# The text-mode spike (examples/text_probe.rs) carries its own unit tests for
+# the fixed band layout. Examples are compiled but not test-harnessed by
+# default, so `test = true` is what actually runs them under `cargo test`.
+[[example]]
+name = "text_probe"
+path = "examples/text_probe.rs"
+test = true
