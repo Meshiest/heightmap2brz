@@ -125,6 +125,26 @@ pub struct AudioOptions {
     /// read there -- the speaker chip builds the shared clock like every other
     /// render does.
     pub loop_playback: bool,
+    /// Place the speaker cluster INSIDE the microchip's own inner grid rather
+    /// than beside it on the world's main grid (`false`, the default and every
+    /// render before this flag existed).
+    ///
+    /// On (`true`) the whole audio device is one portable microchip: the
+    /// speakers sit in their own block of the inner grid clear of the gate
+    /// lattice (see `speakers::speaker_inner_position`), and the per-band
+    /// volume/pitch wires that were cross-grid remote wires become same-grid
+    /// internal ones. Nothing else changes -- same speakers, same gates, same
+    /// wires, same baked emitter data.
+    ///
+    /// **The inner-grid layout is physical placement only, NOT spatialisation.**
+    /// An `AudioEmitter` on a microchip inner grid emits from the CHIP'S WORLD
+    /// POSITION regardless of where its brick sits inside the grid, so the
+    /// cluster's shape here buys none of the near-field equal-level geometry the
+    /// beside-the-chip layout does (which is moot anyway with
+    /// `bSpatialization = false`). Whether an in-chip speaker plays at all, and
+    /// that it plays from the chip origin, are game-runtime facts the owner must
+    /// confirm on a test render.
+    pub speakers_in_chip: bool,
 }
 
 impl Default for AudioOptions {
@@ -180,6 +200,9 @@ impl Default for AudioOptions {
             // LOOPING, matching `AnimOptions` and matching what every audio
             // render did before the flag existed.
             loop_playback: true,
+            // OFF: speakers beside the chip on the main grid, unchanged from
+            // every render before the flag. See the field doc.
+            speakers_in_chip: false,
         }
     }
 }

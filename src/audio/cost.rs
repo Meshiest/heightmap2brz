@@ -50,6 +50,21 @@ const CLOCK_GATES: usize = 4;
 /// (Pause/Restart/Resume), the Rate pin, and the Done output.
 const CLOCK_WIRES: usize = 8;
 
+/// The pause-mute detector's gates: a `BufferTicks`, a `CompareNotEqual` and a
+/// `Select`, shared by the whole bank (see
+/// [`crate::audio::speakers::scaffold`]). Flat -- +3 regardless of speaker
+/// count -- because the Select gates ONE master volume that every speaker's
+/// multiply then reads.
+const PAUSE_MUTE_GATES: usize = 3;
+
+/// The pause-mute detector's wires: `Time -> BufferTicks.Input`,
+/// `Time -> CompareNotEqual.InputA`, `BufferTicks.Output ->
+/// CompareNotEqual.InputB`, `CompareNotEqual.bOutput -> Select.bSelectB`, and
+/// the `Volume` pin into `Select.InputB`. The Select's OUTPUT reuses the wire
+/// each per-speaker multiply already spent on its `InputB` (it now sources from
+/// the Select instead of straight from the pin), so those are not new.
+const PAUSE_MUTE_WIRES: usize = 5;
+
 /// Every chip input/output pin an audio build carries: the clock's five
 /// (Pause, Restart, Resume, Rate, Done) plus the four `scaffold` adds
 /// (Inner Radius, Max Distance, Directional, Volume).
@@ -105,16 +120,18 @@ impl AudioCost {
 ///
 /// With `S` speakers, `T` streams and `N` banks (`boundaries = N - 1`):
 ///
-/// * **gates** = clock (4) + change detector (1) + one master-volume multiply
-///   per speaker + an `ArrayVar` and an `ArrayVar_Get` per stream per bank +
-///   an index subtract, a comparator and a branch per boundary + a `Select`
-///   per stream per boundary.
-/// * **wires** = clock (8) + three attenuation pins fanned out to every
-///   speaker (3S) + two per volume multiply (the Volume pin in, the emitter
-///   out) + the detector feed + `ArrayVarRef`/`Index` per stream per bank +
-///   the per-bank exec chain (one per stream per bank) + the final wire from
-///   each stream into its target + four per boundary (subtract and comparator
-///   `InputA`, branch `bCond` and `Exec`) + three per `Select`.
+/// * **gates** = clock (4) + pause-mute detector (3: BufferTicks, CompareNotEqual,
+///   Select) + change detector (1) + one master-volume multiply per speaker + an
+///   `ArrayVar` and an `ArrayVar_Get` per stream per bank + an index subtract, a
+///   comparator and a branch per boundary + a `Select` per stream per boundary.
+/// * **wires** = clock (8) + pause-mute detector (5: Time into the buffer and
+///   the comparator, the buffer into the comparator, the comparator into the
+///   Select, and the Volume pin into the Select) + three attenuation pins fanned
+///   out to every speaker (3S) + two per volume multiply (the gated master in,
+///   the emitter out) + the detector feed + `ArrayVarRef`/`Index` per stream per
+///   bank + the per-bank exec chain (one per stream per bank) + the final wire
+///   from each stream into its target + four per boundary (subtract and
+///   comparator `InputA`, branch `bCond` and `Exec`) + three per `Select`.
 /// * **bricks** = one emitter per speaker plus the chip shell.
 pub fn estimate(
     mode: AudioMode,
@@ -154,12 +171,14 @@ pub fn estimate(
         frames,
         banks,
         gates: CLOCK_GATES
+            + PAUSE_MUTE_GATES
             + 1
             + speakers
             + 2 * streams * banks
             + 3 * boundaries
             + streams * boundaries,
         wires: CLOCK_WIRES
+            + PAUSE_MUTE_WIRES
             + 3 * speakers
             + 2 * speakers
             + 1

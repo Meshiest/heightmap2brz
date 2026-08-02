@@ -1,3 +1,6 @@
+#[path = "wire_integrity.rs"]
+mod wire_integrity;
+
 use brdb::assets::LiteralComponent;
 use brdb::{AsBrdbValue, Brick, BrickType, Position, World, schema::WireArrayVariant};
 use std::collections::HashMap;
@@ -98,7 +101,7 @@ fn every_band_gets_one_speaker() {
 }
 
 #[test]
-fn a_single_bank_track_emits_no_branch_or_select_gates() {
+fn a_single_bank_track_emits_no_branch_and_only_the_pause_mute_select() {
     let opts = AudioOptions::default();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
@@ -108,7 +111,15 @@ fn a_single_bank_track_emits_no_branch_or_select_gates() {
         0,
         "a track inside one bank needs no branch cascade"
     );
-    assert_eq!(comps.iter().filter(|c| c.contains("Expr_Select")).count(), 0);
+    // The bank-VALUE cascade emits a Select per bank boundary, of which a
+    // single bank has none. The ONE Select here is the always-present
+    // pause-mute gate (see `scaffold`), which is shared by the whole bank and
+    // does not scale with banks.
+    assert_eq!(
+        comps.iter().filter(|c| c.contains("Expr_Select")).count(),
+        1,
+        "single bank: no value-cascade selects, only the shared pause-mute Select"
+    );
     assert_eq!(
         comps
             .iter()
@@ -137,8 +148,8 @@ fn a_multi_bank_track_emits_the_branch_and_select_cascade() {
     );
     assert_eq!(
         comps.iter().filter(|c| c.contains("Expr_Select")).count(),
-        track.plan.len() * (banks - 1),
-        "one select per band per boundary"
+        track.plan.len() * (banks - 1) + 1,
+        "one select per band per boundary, plus the one shared pause-mute Select"
     );
 }
 
@@ -201,9 +212,10 @@ use brdb::IntoReader;
 use brdb::schema::{BrdbStruct, BrdbValue, WireVariant};
 use heightmap::anim::bricks::{ARRAY_GET, ARRAY_VAR, BRANCH, SELECT};
 use heightmap::anim::chip::MICROCHIP_INPUT;
-use heightmap::anim::clock::MULTIPLY;
+use heightmap::anim::clock::{MULTIPLY, TIMER};
 use heightmap::audio::speakers::{
-    AUDIO_EMITTER, DEFAULT_INNER_RADIUS, cluster_dims, speaker_position,
+    AUDIO_EMITTER, BUFFER_TICKS, COMPARE_NE, cluster_dims, speaker_half, speaker_inner_position,
+    speaker_position,
 };
 use std::collections::HashSet;
 
@@ -646,6 +658,14 @@ fn the_select_cascade_puts_the_later_bank_on_inputb() {
 
     let mut cascaded = 0usize;
     for &sel in &selects {
+        // Skip the shared pause-mute Select: its InputA is a baked 0.0
+        // (unwired) and its InputB is the Volume pin, so it is not part of the
+        // bank-VALUE cascade this test is about. Every value-cascade Select has
+        // InputA wired, so an unwired InputA identifies the pause-mute one
+        // uniquely. It has its own test (`the_pause_mute_gate_...`).
+        if by_target.get(&(sel, "InputA".to_string())).is_none() {
+            continue;
+        }
         for (port, want) in [("InputA", "cascade"), ("InputB", "later bank")] {
             let srcs = by_target
                 .get(&(sel, port.to_string()))
@@ -946,25 +966,35 @@ fn the_three_attenuation_pins_reach_every_speaker_on_the_port_they_name() {
         }
     }
 
-    // The Volume pin deliberately does NOT touch an emitter: `VolumeMultiplier`
-    // is already driven by the band's value and an input never takes two
-    // sources.
+    // The Volume pin deliberately does NOT touch an emitter, and no longer fans
+    // out to every band: it now drives the SINGLE shared pause-mute Select
+    // (`scaffold`), whose gated output is what each per-band multiply reads.
     let &vol = pins
         .get("Volume")
         .expect("no input pin is labelled \"Volume\"");
     let out = outgoing(&world, vol, "RER_Output");
-    assert_eq!(out.len(), speakers.len(), "one multiply per band");
-    for (_, target, port) in &out {
-        assert!(
-            !speakers.contains(target),
-            "the Volume pin must never wire straight into an emitter"
-        );
-        assert_eq!(port, "InputB", "the Volume pin drives the multiply's InputB");
-    }
+    assert_eq!(
+        out.len(),
+        1,
+        "the Volume pin drives exactly the one shared pause-mute Select, not every band"
+    );
+    let comp = component_of(&world);
+    let (_, target, port) = &out[0];
+    assert!(
+        !speakers.contains(target),
+        "the Volume pin must never wire straight into an emitter"
+    );
+    assert_eq!(port, "InputB", "the Volume pin drives the Select's InputB");
+    assert_eq!(
+        comp.get(target).map(String::as_str),
+        Some(SELECT),
+        "the Volume pin must feed the pause-mute Select"
+    );
 }
 
 /// The master volume goes through one multiply per band, with the band's value
-/// on `InputA` and the pin on `InputB`.
+/// on `InputA` and the GATED master (the pause-mute Select's output) on
+/// `InputB`; that Select's own `InputB` is the raw `Volume` pin.
 ///
 /// Run against the multi-bank fixture so `InputA` is fed by the select cascade
 /// rather than a bare get -- the shape that actually ships for a long track.
@@ -1028,20 +1058,36 @@ fn the_volume_pin_scales_every_band_through_its_own_multiply() {
         assert_eq!(bee.len(), 1, "band {b}: InputB takes one wire");
         assert_eq!(
             comp.get(&bee[0].0).map(String::as_str),
-            Some(MICROCHIP_INPUT),
-            "band {b}: InputB must be driven by the Volume pin"
+            Some(SELECT),
+            "band {b}: InputB must be driven by the gated master (the pause-mute \
+             Select), not straight from the Volume pin"
         );
-        assert_eq!(bee[0].1, "RER_Output", "band {b}: from the pin's RER_Output");
+        assert_eq!(bee[0].1, "Output", "band {b}: from the Select's Output");
         pin_sources.insert(bee[0].0);
     }
     assert_eq!(
         pin_sources.len(),
         1,
-        "every band must be scaled by the SAME Volume pin -- {} distinct sources \
-         means the pin reaches only part of the bank",
+        "every band must read the SAME gated master -- {} distinct sources \
+         means the mute (or the volume) reaches only part of the bank",
         pin_sources.len()
     );
     assert_eq!(multiplies.len(), track.plan.len(), "one multiply per band");
+
+    // ...and that single gated master is the pause-mute Select, whose own
+    // InputB is the raw Volume pin: the scale still ultimately comes from the
+    // pin, one hop further back now.
+    let select = *pin_sources.iter().next().unwrap();
+    let sel_inputb = by_target
+        .get(&(select, "InputB".to_string()))
+        .expect("the pause-mute Select's InputB is unwired");
+    assert_eq!(sel_inputb.len(), 1, "the Select's InputB takes one wire");
+    assert_eq!(
+        comp.get(&sel_inputb[0].0).map(String::as_str),
+        Some(MICROCHIP_INPUT),
+        "the gated master's InputB must be driven by the Volume pin"
+    );
+    assert_eq!(sel_inputb[0].1, "RER_Output", "from the pin's RER_Output");
 }
 
 /// The baked values standing behind the pins, read back out of a real save.
@@ -1083,15 +1129,13 @@ fn the_baked_emitter_defaults_that_stand_behind_the_pins_reach_the_save() {
             );
             assert_eq!(
                 f32_prop(s, "InnerRadius"),
-                400.0,
-                "band {b}: InnerRadius must be baked to the bank's own no-attenuation \
-                 radius (40 bricks), not the game's 15-unit single-prop default"
+                15.0,
+                "band {b}: InnerRadius must be baked to the default near-field radius"
             );
             assert_eq!(
                 f32_prop(s, "MaxDistance"),
-                4000.0,
-                "band {b}: MaxDistance must be baked to the bank's own range \
-                 (400 bricks), not the game's 400-unit single-prop default"
+                400.0,
+                "band {b}: MaxDistance must be baked to the default audible range"
             );
             assert!(
                 f32_prop(s, "MaxDistance") > 0.0,
@@ -1174,9 +1218,12 @@ fn max_separation(ps: &[brdb::Position]) -> (f64, usize, usize) {
 /// 372 units, which still fails by a factor of nearly four.
 #[test]
 fn no_two_speakers_are_far_apart() {
-    /// Stated bound, in game units: a quarter of the no-attenuation radius.
-    /// 10 units is one brick, so this is 10 bricks.
-    const BOUND: f64 = DEFAULT_INNER_RADIUS as f64 / 4.0;
+    // A fixed geometric bound, NOT derived from the inner radius: the near-field
+    // default (inner radius 15) is deliberately smaller than the cluster, so the
+    // cluster's compactness and the no-attenuation radius are two independent
+    // properties now. 100 units clears the real ~44-unit cluster diagonal with
+    // room to spare while a column fails it by an order of magnitude.
+    const BOUND: f64 = 100.0;
 
     let opts = AudioOptions::default();
     let track = tone_track(1.0, &opts);
@@ -1188,17 +1235,7 @@ fn no_two_speakers_are_far_apart() {
     assert!(
         worst < BOUND,
         "speakers {i} and {j} are {worst:.1} units apart, over the {BOUND}-unit bound \
-         -- bSpatialization only disables PANNING, so a bank spread this far is \
-         attenuated unevenly and the listener hears a slice of the spectrum that \
-         changes as they walk"
-    );
-    // ...and the bound really is small against the range the speakers carry,
-    // for whatever `--inner-radius` this build was given.
-    assert!(
-        worst * 4.0 < opts.inner_radius as f64,
-        "the bank ({worst:.1} units across) must be small against its own \
-         no-attenuation radius ({} units), or the two knobs cannot both be right",
-        opts.inner_radius
+         -- the cluster must stay compact so the bank reads as one point source"
     );
     // The shipped bug was a COLUMN, one speaker stacked on the next. Naming
     // it keeps this test discriminating rather than merely satisfiable: a
@@ -1921,4 +1958,397 @@ fn loop_playback_reaches_the_timer_limit_in_an_audio_render() {
     let index = ((stopping * fps as f64).floor() as i64).rem_euclid(frames as i64);
     assert_eq!(index, frames as i64 - 1, "the track must stop on its last frame");
     assert_ne!(index, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Pause-mute: silence while the clock is frozen.
+//
+// The mechanism gates the master volume on whether `Timer.Time` is still
+// ADVANCING (`BufferTicks` one tick back, `CompareNotEqual` against it, a
+// `Select` on the result), so ANY stall -- the Pause exec, a stalled external
+// clock, a no-loop track that ended -- drops the bank to 0 without depending on
+// how the pause was wired. Three shared gates for the whole bank, +3 regardless
+// of speaker count. All of it is topology and baked literals: nothing here
+// shows up in a gate count alone.
+// ---------------------------------------------------------------------------
+
+/// The whole pause-mute chain, traced end to end from the Timer to every
+/// speaker's multiply. The three gates and five wires all have to point the
+/// right way; a single reversed or mis-named port dangles silently in game.
+///
+/// Run on the multi-bank fixture so there are also value-cascade `Select`s in
+/// the graph, which proves the "bSelectB from a CompareNotEqual" filter really
+/// isolates the ONE pause-mute Select rather than tripping over the others.
+#[test]
+fn the_pause_mute_gate_silences_every_speaker_when_the_clock_stops() {
+    let (_track, _opts, world, _n_banks) = multi_bank();
+    let comp = component_of(&world);
+    let by_target = sources_by_target(&world);
+    let by_source = targets_by_source(&world);
+
+    // The pause-mute Select is the one whose bSelectB comes from a
+    // CompareNotEqual; every value-cascade Select takes bSelectB from a
+    // CompareGreaterOrEqual instead.
+    let gated: Vec<usize> = inner_ids_of(&world, SELECT)
+        .into_iter()
+        .filter(|&s| {
+            by_target
+                .get(&(s, "bSelectB".to_string()))
+                .and_then(|srcs| srcs.first())
+                .map(|(id, _)| comp.get(id).map(String::as_str) == Some(COMPARE_NE))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(gated.len(), 1, "exactly one shared pause-mute Select");
+    let select = gated[0];
+
+    // bSelectB <- CompareNotEqual.bOutput ("playing")
+    let cond = &by_target[&(select, "bSelectB".to_string())];
+    assert_eq!(cond.len(), 1, "bSelectB takes one wire");
+    let cmp = cond[0].0;
+    assert_eq!(comp.get(&cmp).map(String::as_str), Some(COMPARE_NE));
+    assert_eq!(cond[0].1, "bOutput", "playing = the != comparator's bOutput");
+
+    // CompareNotEqual.InputA <- Timer.Time ; InputB <- BufferTicks.Output
+    let a = &by_target[&(cmp, "InputA".to_string())];
+    let b = &by_target[&(cmp, "InputB".to_string())];
+    assert_eq!(comp.get(&a[0].0).map(String::as_str), Some(TIMER));
+    assert_eq!(a[0].1, "Time", "InputA is the live clock time");
+    let buffer = b[0].0;
+    assert_eq!(comp.get(&buffer).map(String::as_str), Some(BUFFER_TICKS));
+    assert_eq!(b[0].1, "Output", "InputB is last tick's time");
+
+    // BufferTicks.Input <- the SAME Timer.Time (dataflow fan-out)
+    let bi = &by_target[&(buffer, "Input".to_string())];
+    assert_eq!(comp.get(&bi[0].0).map(String::as_str), Some(TIMER));
+    assert_eq!(bi[0].1, "Time");
+    assert_eq!(
+        bi[0].0, a[0].0,
+        "the buffer and the comparator must tap the same Timer.Time"
+    );
+
+    // Select.InputA is baked (unwired 0.0); Select.InputB is the Volume pin.
+    assert!(
+        by_target.get(&(select, "InputA".to_string())).is_none(),
+        "InputA is the baked 0.0 -- it must be UNWIRED, or a source overrides the mute"
+    );
+    let sel_b = &by_target[&(select, "InputB".to_string())];
+    assert_eq!(comp.get(&sel_b[0].0).map(String::as_str), Some(MICROCHIP_INPUT));
+    assert_eq!(sel_b[0].1, "RER_Output", "the Volume pin feeds the Select's InputB");
+
+    // Select.Output fans out to EVERY speaker's volume multiply, on InputB.
+    let out = by_source
+        .get(&(select, "Output".to_string()))
+        .expect("the gated master drives nothing");
+    let speakers = speaker_ids(&world);
+    assert_eq!(
+        out.len(),
+        speakers.len(),
+        "the gated master must reach every band's multiply"
+    );
+    for (mul, port) in out {
+        assert_eq!(comp.get(mul).map(String::as_str), Some(MULTIPLY));
+        assert_eq!(port, "InputB", "into each volume multiply's InputB");
+    }
+}
+
+/// The Select's baked literals, read back from a real save: InputA is 0.0 (what
+/// a FROZEN clock emits) and InputB is 1.0 (VOLUME_SCALE, what a PLAYING render
+/// with the Volume pin unwired emits). Together these are the promise that the
+/// feature is INAUDIBLE until the clock stops -- a no-pause render still
+/// multiplies every band by 1.0 while playing, exactly as before the feature.
+///
+/// A single-bank render, so the only `Select` in the whole graph is the
+/// pause-mute one and the read-back cannot pick the wrong gate.
+#[test]
+fn the_pause_mute_selects_baked_literals_keep_a_playing_render_unchanged() {
+    let opts = AudioOptions { bands: Some(6), ..Default::default() };
+    let track = tone_track(1.0, &opts);
+    let world = build_speaker_world(&track, &opts).expect("build");
+
+    with_decoded_components(&world, "pause_mute_select", |all, _| {
+        let selects: Vec<&BrdbStruct> = all
+            .iter()
+            .filter(|(_, _, s)| s.get_name() == "BrickComponentData_WireGraph_Expr_Select")
+            .map(|(_, _, s)| s)
+            .collect();
+        assert_eq!(
+            selects.len(),
+            1,
+            "a single-bank render's only Select is the pause-mute gate"
+        );
+        let s = selects[0];
+
+        let number = |prop: &str| -> f64 {
+            let v = s.prop(prop).unwrap_or_else(|e| panic!("{prop}: {e}"));
+            let WireVariant::Number(n) =
+                WireVariant::try_from(v).expect("a Select input is a wire variant")
+            else {
+                panic!("{prop} did not decode as a Number");
+            };
+            n
+        };
+        assert_eq!(number("InputA"), 0.0, "frozen clock -> silence");
+        assert_eq!(
+            number("InputB"),
+            1.0,
+            "playing with Volume unwired -> unity gain, unchanged from before the feature"
+        );
+    });
+}
+
+/// Every wire in a BANK render must resolve to a brick that actually carries
+/// the referenced component -- the three pause-mute gates included. A port-name
+/// typo on the new gates (`BufferTicks.Input`, `CompareNotEqual.bOutput`,
+/// `Select.bSelectB`/`InputB`) would encode fine, pass a range-only check, and
+/// dangle silently in game. This is the loader's own port resolution.
+#[test]
+fn a_bank_render_passes_wire_integrity() {
+    let opts = AudioOptions::default();
+    let track = tone_track(1.0, &opts);
+    let world = build_speaker_world(&track, &opts).expect("build");
+    let path =
+        std::env::temp_dir().join(format!("h2b_audio_wi_bank_{}.brz", std::process::id()));
+    std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
+    wire_integrity::assert_wires_valid(&path);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same, for a VOICE render: it shares `scaffold` with the bank, so the
+/// pause-mute gates are wired identically, but the surrounding graph differs
+/// (two streams per voice, a pitch wire straight into the emitter) and the
+/// harness must resolve every wire there too.
+#[test]
+fn a_voice_render_passes_wire_integrity() {
+    let o = voice_opts(4);
+    let streams = voice_streams(1.0, &o);
+    let world = build_voice_world(&streams, &o).expect("build");
+    let path =
+        std::env::temp_dir().join(format!("h2b_audio_wi_voice_{}.brz", std::process::id()));
+    std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
+    wire_integrity::assert_wires_valid(&path);
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// --speakers-in-chip: the whole device as one portable microchip.
+//
+// The one thing this option changes is WHICH GRID the speakers sit on: the
+// chip's own inner grid instead of the world's main grid beside it. Everything
+// else -- the emitter data, the gate graph, every wire endpoint -- is identical,
+// and brdb resolves each wire to a local or remote source at write time from
+// where the bricks land, so the cross-grid remote wires simply become same-grid
+// internal ones. The two facts these tests CANNOT establish, because they are
+// game-runtime behaviour, are that an in-chip speaker plays at all and that it
+// plays from the chip's origin; the owner must confirm both on a test render.
+// ---------------------------------------------------------------------------
+
+/// Inner-grid emitter ids, in band/voice order (the in-chip analogue of the
+/// main-grid `speaker_ids`).
+fn inner_speaker_ids(world: &brdb::World) -> Vec<usize> {
+    inner_ids_of(world, AUDIO_EMITTER)
+}
+
+/// ON: every speaker moves onto the chip's inner grid, none stay on the main
+/// grid, and each one's `VolumeMultiplier` is still driven through its own
+/// master-volume multiply. OFF: the default beside-the-chip cluster is
+/// unchanged -- every speaker on the main grid, at exactly its
+/// [`speaker_position`] slot, and nothing extra on the inner grid.
+#[test]
+fn speakers_in_chip_moves_the_cluster_onto_the_inner_grid_and_off_leaves_it() {
+    let base = AudioOptions { bands: Some(16), ..Default::default() };
+    let track = tone_track(1.0, &base);
+    let n = track.plan.len();
+
+    // OFF (default): speakers on the main grid at the beside-the-chip slots,
+    // nothing on the inner grid. This is the "existing render is unchanged"
+    // guard.
+    let off = build_speaker_world(&track, &base).expect("build off");
+    assert_eq!(speaker_ids(&off).len(), n, "OFF: every speaker on the main grid");
+    assert_eq!(
+        inner_speaker_ids(&off).len(),
+        0,
+        "OFF: no emitter on the inner grid"
+    );
+    let off_positions: Vec<(i32, i32, i32)> =
+        speaker_positions(&off).iter().map(|p| (p.x, p.y, p.z)).collect();
+    let want: Vec<(i32, i32, i32)> = (0..n)
+        .map(|k| {
+            let p = speaker_position(k, n);
+            (p.x, p.y, p.z)
+        })
+        .collect();
+    assert_eq!(
+        off_positions, want,
+        "OFF placement must be the beside-the-chip cluster, unchanged from before the flag"
+    );
+
+    // ON: every speaker on the inner grid, none on the main grid.
+    let on_opts = AudioOptions { speakers_in_chip: true, ..base };
+    let on = build_speaker_world(&track, &on_opts).expect("build on");
+    assert_eq!(
+        speaker_ids(&on).len(),
+        0,
+        "ON: no speaker may remain on the main grid"
+    );
+    let inner = inner_speaker_ids(&on);
+    assert_eq!(inner.len(), n, "ON: every speaker on the chip's inner grid");
+
+    // ...and their volume wires resolve, through the same per-band multiply as
+    // the beside-the-chip layout -- a same-grid internal wire now, not a
+    // cross-grid remote one, but the topology is identical.
+    let comp = component_of(&on);
+    let by_target = sources_by_target(&on);
+    for (b, &speaker) in inner.iter().enumerate() {
+        let feeding = by_target
+            .get(&(speaker, "VolumeMultiplier".to_string()))
+            .unwrap_or_else(|| panic!("band {b}: in-chip speaker VolumeMultiplier is unwired"));
+        assert_eq!(feeding.len(), 1, "band {b}: exactly one wire drives the volume");
+        assert_eq!(
+            comp.get(&feeding[0].0).map(String::as_str),
+            Some(MULTIPLY),
+            "band {b}: the volume must reach the in-chip speaker through its master-volume multiply"
+        );
+    }
+}
+
+/// The written `.brz` proves the move: with the option ON every emitter decodes
+/// on the chip's own grid ([`CHIP_GRID`]), never the main grid; with it OFF
+/// every emitter decodes on the main grid, exactly as before the flag. Reading
+/// the save back is the only thing that shows which grid a component landed in.
+#[test]
+fn the_saved_file_puts_in_chip_speakers_in_the_chip_grid_not_the_main_grid() {
+    let emitter_grids = |world: &brdb::World, tag: &str| -> HashSet<usize> {
+        with_decoded_components(world, tag, |all, _| {
+            all.iter()
+                .filter(|(_, _, s)| s.get_name() == "BrickComponentData_AudioEmitter")
+                .map(|(gid, _, _)| *gid)
+                .collect()
+        })
+    };
+
+    let on = AudioOptions { speakers_in_chip: true, bands: Some(16), ..Default::default() };
+    let track = tone_track(1.0, &on);
+    let world = build_speaker_world(&track, &on).expect("build on");
+    assert_eq!(
+        emitter_grids(&world, "in_chip_grid"),
+        HashSet::from([CHIP_GRID]),
+        "every in-chip emitter must decode on the chip's inner grid ({CHIP_GRID})"
+    );
+
+    let off = AudioOptions { bands: Some(16), ..Default::default() };
+    let track = tone_track(1.0, &off);
+    let world = build_speaker_world(&track, &off).expect("build off");
+    assert_eq!(
+        emitter_grids(&world, "beside_chip_grid"),
+        HashSet::from([1]),
+        "the default layout keeps every emitter on the main grid (1)"
+    );
+}
+
+/// The in-chip block must clear the gate lattice at every band count, and put
+/// nothing on the main grid. `build_speaker_world` runs `assert_no_overlap`
+/// over the whole inner grid through `chip::finish`, so a build that SUCCEEDS
+/// is the proof the speaker block never collides with a gate -- and, in a debug
+/// build, that no speaker went to a negative inner coordinate (the
+/// `recompute_plane_extent` debug_assert).
+#[test]
+fn in_chip_speakers_clear_the_gate_lattice_at_any_band_count() {
+    for bands in [3usize, 8, 32, 64, 79] {
+        let mut opts = AudioOptions { speakers_in_chip: true, ..Default::default() };
+        opts.bands = Some(bands);
+        opts.noise_bands = if bands >= 4 { 2 } else { 0 };
+        let track = tone_track(1.0, &opts);
+        let world = build_speaker_world(&track, &opts)
+            .unwrap_or_else(|e| panic!("--bands {bands} --speakers-in-chip must build: {e}"));
+        assert_eq!(
+            inner_speaker_ids(&world).len(),
+            track.plan.len(),
+            "--bands {bands}: every speaker must land on the inner grid"
+        );
+        assert_eq!(
+            speaker_ids(&world).len(),
+            0,
+            "--bands {bands}: nothing may sit on the main grid but the chip shell"
+        );
+    }
+}
+
+/// The layout function itself: every coordinate non-negative (negative
+/// inner-grid coordinates delete bricks in-game), and every speaker's low x
+/// face clear of the service rows, whose farthest gate reaches x-face 110.
+#[test]
+fn in_chip_speaker_positions_are_nonnegative_and_clear_of_the_service_rows() {
+    // The service lattice (rows 0..-10) tops out at this x-face; the speaker
+    // block starts past it. Stated as a literal oracle, not imported.
+    const GATE_ROWS_MAX_X_FACE: i32 = 110;
+    let hx = speaker_half().x;
+    for n in [1usize, 2, 8, 32, 79, 128] {
+        for k in 0..n {
+            let p = speaker_inner_position(k, n);
+            assert!(
+                p.x >= 0 && p.y >= 0 && p.z >= 0,
+                "n={n} speaker {k} at ({}, {}, {}) has a negative coordinate -- \
+                 negative inner-grid coordinates delete bricks in-game",
+                p.x, p.y, p.z
+            );
+            assert!(
+                p.x - hx > GATE_ROWS_MAX_X_FACE,
+                "n={n} speaker {k} low x-face {} does not clear the gate rows \
+                 (which reach {GATE_ROWS_MAX_X_FACE})",
+                p.x - hx
+            );
+        }
+    }
+}
+
+/// Wire integrity for an in-chip BANK render: every wire must still resolve to
+/// a brick that carries the referenced component. The speaker's volume wires
+/// are same-grid internal wires now rather than cross-grid remote ones, so this
+/// exercises exactly the resolution path the move changed.
+#[test]
+fn an_in_chip_bank_render_passes_wire_integrity() {
+    let opts = AudioOptions { speakers_in_chip: true, ..AudioOptions::default() };
+    let track = tone_track(1.0, &opts);
+    let world = build_speaker_world(&track, &opts).expect("build");
+    let path = std::env::temp_dir()
+        .join(format!("h2b_audio_wi_bank_inchip_{}.brz", std::process::id()));
+    std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
+    wire_integrity::assert_wires_valid(&path);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The voice path shares the emitter/scaffold code with the bank, so the option
+/// must reach it too: every speaker on the inner grid, its pitch still wired
+/// straight from an `ArrayVar_Get` (not through the volume multiply), and the
+/// whole graph passing wire integrity as a same-grid render.
+#[test]
+fn an_in_chip_voice_render_moves_speakers_keeps_the_pitch_wire_and_passes_wire_integrity() {
+    let o = AudioOptions { speakers_in_chip: true, ..voice_opts(4) };
+    let streams = voice_streams(1.0, &o);
+    let world = build_voice_world(&streams, &o).expect("build");
+
+    assert_eq!(speaker_ids(&world).len(), 0, "voice ON: nothing on the main grid");
+    let inner = inner_speaker_ids(&world);
+    assert_eq!(inner.len(), 4, "voice ON: every voice speaker on the inner grid");
+
+    let comp = component_of(&world);
+    let sources = sources_by_target(&world);
+    for (v, &speaker) in inner.iter().enumerate() {
+        let pitch = sources
+            .get(&(speaker, "PitchMultiplier".to_string()))
+            .unwrap_or_else(|| panic!("voice {v}: in-chip PitchMultiplier is unwired"));
+        assert_eq!(pitch.len(), 1, "voice {v}: one pitch source");
+        assert_eq!(
+            comp.get(&pitch[0].0).map(String::as_str),
+            Some(ARRAY_GET),
+            "voice {v}: pitch must still come straight from an ArrayVar_Get"
+        );
+    }
+
+    let path = std::env::temp_dir()
+        .join(format!("h2b_audio_wi_voice_inchip_{}.brz", std::process::id()));
+    std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
+    wire_integrity::assert_wires_valid(&path);
+    let _ = std::fs::remove_file(&path);
 }

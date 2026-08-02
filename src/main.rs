@@ -140,6 +140,7 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg audiopitchsnap: --("pitch-snap") +takes_value "Audio (Pitch Switching, --audio-mode voice): pull a continuing voice onto the nearest equal-tempered semitone when it is within this many cents (default 0 = off, max 50 = half a semitone, i.e. always). Trades vibrato and glissando for a rock-steady pitch; the frame-to-frame wobble is already smoothed without it")
         (@arg audioinner: --("inner-radius") +takes_value "Audio: speaker no-attenuation radius in units (default 15; 10 units = 1 brick). Raise it (e.g. 400) for one flat equal-level field across a large build")
         (@arg audiomaxdist: --("max-distance") +takes_value "Audio: speaker audible range in units (default 400; 10 units = 1 brick). Raise it (e.g. 4000) to be heard across a big build")
+        (@arg audiospeakersinchip: --("speakers-in-chip") "Audio: place the speaker cluster INSIDE the microchip's own inner grid instead of beside it on the main grid, so the whole audio device is one portable microchip. The speakers play from the chip's ORIGIN regardless of their inner-grid layout (an AudioEmitter on a microchip inner grid emits from the chip's world position), so the layout is physical placement only, not spatial audio. Default off (speakers beside the chip)")
         (@arg animmode: --("anim-mode") +takes_value "Animation output mode (brick, text). 'brick' builds one display brick per pixel, driven by the encoding --anim-encoding selects. 'text' builds one animated Component_TextDisplay per BAND of image rows instead -- roughly two orders of magnitude fewer gates (a 192x108 clip is 113 gates against 4613), at the cost of glyph-grid rendering rather than real bricks. Text mode reuses --font, --char-repeat, --fill-char, --empty-char, --alpha-threshold and --line-height-world, and adds --colors")
         (@arg animcolors: --("colors") +takes_value "Text mode: quantize to at most N colours with a median-cut palette (default 0, meaning full 24-bit colour). Text mode writes a 16-character <color=\"RRGGBB\"> tag at the start of every colour run, so its size is governed by run length; collapsing the palette lengthens runs. Measured on animated video at 192x108, 32 colours cuts characters per cell from 14.65 to 4.74 -- from 2.4x brick mode's data cost to 0.79x. Useful values are 16 to 64; the palette is built from up to 120 frames sampled evenly across the clip")
         (@arg animencoding: --("anim-encoding") +takes_value "Animation pixel encoding (hex, color-array; default hex). 'hex' packs every frame into one big RRGGBB string per 1666-pixel chunk, which each pixel slices with a Substring and parses with a MakeColorHex -- 2 gate evaluations per pixel per frame plus ~10 KB of string per chunk per frame. 'color-array' gives each pixel its own array of linear colors read straight into its brick: the same 2 components per pixel, but half the per-frame evaluations and no string work at all. color-array costs ~2.7x the host RAM to build (16 bytes per pixel per frame vs 6) and, past 65535 frames, one extra gate per PIXEL per bank boundary instead of per chunk")
@@ -1880,6 +1881,11 @@ fn audio_options(matches: &clap::ArgMatches) -> Result<AudioOptions, String> {
         // clock exactly as the video path does. Negated and defaulting to
         // looping, same as the video path's `AnimOptions`.
         loop_playback: !matches.is_present("noloop"),
+        // A plain boolean flag, off by default: the beside-the-chip placement
+        // is unchanged for every existing render. `build_speaker_world` /
+        // `build_voice_world` read this to put the speakers on the chip's inner
+        // grid instead.
+        speakers_in_chip: matches.is_present("audiospeakersinchip"),
         // Not `matches.is_present("externalclock")`: the audio branch has
         // already refused that flag outright, because nothing in
         // `build_speaker_world` reads this field.

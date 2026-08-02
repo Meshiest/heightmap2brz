@@ -17,6 +17,17 @@ pub const MODULO: &str = "BrickComponentType_WireGraph_Expr_MathModuloFloored";
 pub struct Clock {
     /// Source port carrying the wrapped integer frame index.
     pub frame_index: WirePort,
+    /// The timer's raw `Time` output: continuous seconds, advancing every tick
+    /// while the clock runs and frozen while it is paused.
+    ///
+    /// This is the SAME port the fps multiply already reads (`Timer.Time ->
+    /// Multiply.InputA`, wired in `build_clock`); it is surfaced here only so a
+    /// consumer can TAP it without disturbing that math. Reading it a second
+    /// time is dataflow fan-out, which the graph allows freely. The audio
+    /// scaffold uses it to tell a running clock from a frozen one -- see
+    /// `audio::speakers::scaffold` -- so a paused render can fall silent instead
+    /// of sustaining its last frame.
+    pub time: WirePort,
     pub pause_pin: usize,
     pub restart_pin: usize,
     pub resume_pin: usize,
@@ -305,6 +316,11 @@ pub fn build_clock(
 
     Clock {
         frame_index: WirePort::new(wrap, MODULO, "Output"),
+        // The timer's raw stopwatch, exposed for tapping. NOT a new wire: the
+        // `Timer.Time -> Multiply.InputA` connection above is the only wire off
+        // this port that `build_clock` itself emits; this merely names the
+        // source so a caller can fan a second wire out of it.
+        time: WirePort::new(timer, TIMER, "Time"),
         pause_pin,
         restart_pin,
         resume_pin,

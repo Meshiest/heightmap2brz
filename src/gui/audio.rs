@@ -895,15 +895,21 @@ impl AudioApp {
     }
 
     fn speaker_chips(&self) -> Vec<String> {
-        vec![
+        let mut chips = vec![
             format!("inner {:.0}", self.opts.inner_radius),
             format!("max {:.0} units", self.opts.max_distance),
-        ]
+        ];
+        if self.opts.speakers_in_chip {
+            chips.push("in chip".to_string());
+        }
+        chips
     }
 
     fn speakers_are_tuned(&self) -> bool {
         let d = AudioOptions::default();
-        self.opts.inner_radius != d.inner_radius || self.opts.max_distance != d.max_distance
+        self.opts.inner_radius != d.inner_radius
+            || self.opts.max_distance != d.max_distance
+            || self.opts.speakers_in_chip != d.speakers_in_chip
     }
 
     /// **The most valuable control on this pane.**
@@ -1236,6 +1242,17 @@ impl AudioApp {
     }
 
     fn draw_speaker_rows(&mut self, ui: &mut Ui) {
+        ui.label("Placement").on_hover_text(
+            "Where the speaker cluster goes. Beside the chip on the main grid (the \
+             default), or IN the microchip's own inner grid, which makes the whole audio \
+             device one portable microchip. The speakers play from the chip's ORIGIN \
+             either way -- an AudioEmitter on a microchip inner grid emits from the chip's \
+             world position -- so this only moves the bricks, it does not change the \
+             sound, and costs nothing (same speakers, gates and wires).",
+        );
+        ui.checkbox(&mut self.opts.speakers_in_chip, "In microchip");
+        ui.end_row();
+
         ui.label("Inner Radius").on_hover_text(
             "The radius inside which there is NO distance attenuation, in units (10 units = \
              1 brick). NOT COSMETIC: turning spatialization off kills PANNING, not distance \
