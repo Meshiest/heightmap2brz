@@ -1,13 +1,17 @@
 [package]
 name = "heightmap"
-version = "0.10.3"
+version = "0.11.0"
 authors = ["Isaac <gpg@reheatedcake.io>"]
 edition = "2024"
 rust-version = "1.88"
 
 
 [dependencies]
-image = { version = "0.25.8", features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = [
+  "png",
+  "gif",
+  "webp",
+] }
 log = "0.4.28"
 eframe = { version = "0.33.3", optional = true }
 egui = { version = "0.33.3", optional = true }
@@ -16,10 +20,36 @@ egui_extras = { version = "0.33.3", features = [
   "file",
   "image",
 ], optional = true }
+# Pure-Rust container demux (video::demux) -- MP4/MOV and MKV/WebM. Both are
+# pure Rust and must work on wasm, which is why they live here and not under
+# the native-only target block below where ffmpeg-sidecar sits.
+re_mp4 = "0.5"
+matroska-demuxer = "0.8"
+# Pure-Rust H.264 decode (video::rustvideo). Also pure Rust, also must work
+# on wasm -- see that module's doc for the CABAC-only restriction this
+# project places on it (Task 1's evaluation of this crate found it silently
+# decodes CAVLC streams to wrong pixels).
+rust_h264 = "0.4.0"
+# FFT for audio band analysis (audio::stft). Pure Rust, builds for wasm, so
+# it belongs here rather than in the native-only block below.
+rustfft = "6.2"
+# Pure-Rust audio decode (audio::symphonia_src). Also pure Rust and also
+# required on wasm, where ffmpeg cannot exist -- so it belongs here, not in
+# the native-only block below.
+symphonia = { version = "0.5", default-features = false, features = [
+  "mp3",
+  "aac",
+  "isomp4",
+  "mkv",
+  "flac",
+  "vorbis",
+  "wav",
+  "pcm",
+] }
 
 # native: full brdb (brz + sqlite-backed brdb), CLI deps, sync dialogs
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-brdb = "0.6.3"
+brdb = "0.9.1"
 rayon = "1.11.0"
 poll-promise = { version = "0.2.0", optional = true }
 clap = "2.33.0"
@@ -28,10 +58,12 @@ pollster = { version = "0.4", optional = true }
 clipboard-win = { version = "5.4.1", features = [
   "windows-win",
 ], optional = true }
+indicatif = "0.17"
+ffmpeg-sidecar = "2.5"
 
 # web: brz-only brdb with the wasm clock, async dialogs, browser downloads
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-brdb = { version = "0.6.3", default-features = false, features = [
+brdb = { version = "0.9.1", default-features = false, features = [
   "brz",
   "wasm",
 ] }
@@ -76,3 +108,11 @@ js-sys = ["dep:js-sys"]
 name = "heightmap_gui"
 path = "src/gui_main.rs"
 required-features = ["gui"]
+
+# The text-mode spike (examples/text_probe.rs) carries its own unit tests for
+# the fixed band layout. Examples are compiled but not test-harnessed by
+# default, so `test = true` is what actually runs them under `cargo test`.
+[[example]]
+name = "text_probe"
+path = "examples/text_probe.rs"
+test = true
