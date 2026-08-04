@@ -1,6 +1,7 @@
 use super::logger;
 use crate::gui::audio::AudioApp;
 use crate::gui::heightmap::HeightmapApp;
+use crate::gui::midi::MidiApp;
 use crate::gui::text::TextApp;
 use crate::gui::video::VideoApp;
 use eframe::App;
@@ -15,6 +16,7 @@ pub struct BrzApp {
     text: TextApp,
     video: VideoApp,
     audio: AudioApp,
+    midi: MidiApp,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +26,7 @@ enum Menu {
     Heightmap,
     Video,
     Audio,
+    Midi,
 }
 
 impl AsRef<str> for Menu {
@@ -34,6 +37,7 @@ impl AsRef<str> for Menu {
             Menu::Heightmap => "Heightmap",
             Menu::Video => "Video2Brick",
             Menu::Audio => "Audio2Brick",
+            Menu::Midi => "MIDI2Brick",
         }
     }
 }
@@ -50,6 +54,9 @@ impl Menu {
             Menu::Audio => {
                 "Turn a song into a cluster of wired, pitched speaker bricks that play it back"
             }
+            Menu::Midi => {
+                "Turn a MIDI file into wired, pitched speaker bricks, one synth tone per instrument"
+            }
         }
     }
 }
@@ -64,6 +71,7 @@ impl Default for BrzApp {
             text: TextApp::default(),
             video: VideoApp::default(),
             audio: AudioApp::default(),
+            midi: MidiApp::default(),
         }
     }
 }
@@ -136,6 +144,7 @@ impl App for BrzApp {
                 self.menu(ui, Menu::Text);
                 self.menu(ui, Menu::Video);
                 self.menu(ui, Menu::Audio);
+                self.menu(ui, Menu::Midi);
             });
             ui.separator();
             ScrollArea::vertical()
@@ -146,6 +155,7 @@ impl App for BrzApp {
                     Menu::Text => self.text.draw(ui, &mut self.shared),
                     Menu::Video => self.video.draw(ui, &mut self.shared),
                     Menu::Audio => self.audio.draw(ui, &mut self.shared),
+                    Menu::Midi => self.midi.draw(ui, &mut self.shared),
                 });
 
             TopBottomPanel::bottom(Id::new("logs"))

@@ -241,6 +241,25 @@ pub fn pick_audio_path() -> Promise<Option<std::path::PathBuf>> {
     Promise::spawn_thread("pick_audio_path", move || pollster::block_on(pick))
 }
 
+/// Pick a MIDI file, returning its path. Native only, mirroring
+/// [`pick_audio_path`] -- the MIDI pane reads the (small) file's bytes itself
+/// once the path resolves, so there is no re-openable source to keep. Defaults
+/// the dialog into the user's Music folder, where a `.mid` most often lives; if
+/// [`dirs::audio_dir`] cannot name one (a headless or unusual profile) the
+/// dialog opens wherever rfd defaults instead. `None` if the user cancels.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn pick_midi_path() -> Promise<Option<std::path::PathBuf>> {
+    let mut dialog = rfd::AsyncFileDialog::new().add_filter("MIDI Files", &["mid", "midi"]);
+    if let Some(dir) = dirs::audio_dir() {
+        dialog = dialog.set_directory(dir);
+    }
+    let pick = async move {
+        let handle = dialog.pick_file().await?;
+        Some(handle.path().to_path_buf())
+    };
+    Promise::spawn_thread("pick_midi_path", move || pollster::block_on(pick))
+}
+
 /// Small square thumbnail for a picked image, served via egui's bytes loader.
 pub fn thumb(ui: &mut egui::Ui, img: &PickedImage) {
     let uri = format!("bytes://thumb/{}", img.name);

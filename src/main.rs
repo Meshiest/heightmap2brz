@@ -39,10 +39,11 @@ use heightmap::{
         AudioMode,
         backend::{AudioBackend, open_audio_track},
         cost as audio_cost,
-        speakers::{build_speaker_world, build_voice_world},
+        speakers::{build_midi_event_world, build_speaker_world, build_voice_world},
         track::{AudioOptions, SynthWave, analyze},
         voices::{MAX_PITCH_SNAP_CENTS, analyze_voices},
     },
+    midi::{MidiOptions, ToneAssignment, analyze_midi, discover},
     subs::{self, Subtitles},
     text::*,
     video::{
@@ -130,6 +131,10 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg audiomaxdist: --("max-distance") +takes_value "Audio: speaker audible range in units (default 400; 10 units = 1 brick). Raise it (e.g. 4000) to be heard across a big build")
         (@arg audiospeakersinchip: --("speakers-in-chip") "Audio: place the speaker cluster INSIDE the microchip's own inner grid instead of beside it on the main grid, so the whole audio device is one portable microchip. The speakers play from the chip's ORIGIN regardless of their inner-grid layout (an AudioEmitter on a microchip inner grid emits from the chip's world position), so the layout is physical placement only, not spatial audio. Default off (speakers beside the chip)")
         (@arg audiosynth: --synth +takes_value "Audio: the synth waveform every TONAL band plays through -- sine (default), square, triangle or sawtooth. Applies to tonal bands in BOTH modes; white/pink --noise-bands keep their own noise assets and are unaffected. Default sine renders exactly as before this flag existed")
+        (@arg midi: --midi "MIDI (midi2brick): read the input as a Standard MIDI File and build an EVENT-BASED speaker world -- each track's notes are stored as spans and played by a runtime playhead. The input is the .mid; -o is the .brz. Lite: one --synth tone for the whole file (per-track tones are a GUI feature). Reuses --inner-radius, --max-distance, --gain, --no-loop, --no-control-buttons, --speakers-in-chip and --polyphony-cap")
+        (@arg midilist: --("midi-list") "MIDI: with --midi, print the discovered instruments (name, channel, note count, max polyphony) and the file's format/duration/tempo, then exit without building")
+        (@arg midipolyphony: --("polyphony-cap") +takes_value "MIDI: maximum speakers per instrument, however many notes it plays at once (default 8). A busier instrument steals its oldest sounding note")
+        (@arg midirate: --("playback-rate") +takes_value "MIDI: playback speed multiplier baked into the clock (default 1.0; 2.0 = double speed, 0.5 = half). The generated Rate pin still overrides it at runtime")
         (@arg animmode: --("anim-mode") +takes_value "Animation output mode (brick, text). 'brick' builds one display brick per pixel, driven by the encoding --anim-encoding selects. 'text' builds one animated Component_TextDisplay per BAND of image rows instead -- roughly two orders of magnitude fewer gates (a 192x108 clip is 113 gates against 4613), at the cost of glyph-grid rendering rather than real bricks. Text mode reuses --font, --char-repeat, --fill-char, --empty-char, --alpha-threshold and --line-height-world, and adds --colors")
         (@arg animcolors: --("colors") +takes_value "Text mode: quantize to at most N colours with a median-cut palette (default 0 = full 24-bit colour). Fewer colours means longer same-colour runs and a smaller save; useful values are 16 to 64")
         (@arg animencoding: --("anim-encoding") +takes_value "Animation pixel encoding (hex, color-array; default hex). 'hex' packs each frame into a shared RRGGBB string per chunk; 'color-array' gives each pixel its own colour array -- fewer gate evaluations and no string work, at the cost of more host RAM to build")
@@ -306,6 +311,11 @@ fn main() {
             "--anim-mode takes precedence over --text; this render is the ANIMATED wired \
              build, not the static text export. Pass one output mode"
         );
+    }
+
+    if matches.is_present("midi") {
+        run_midi(&matches, &heightmap_files, &out_file);
+        return;
     }
 
     if matches.is_present("audiomode") {
@@ -640,6 +650,118 @@ fn run_audio(
         fail!("{e}");
     }
     return info!("Done!");
+}
+
+/// The `--midi` (midi2brick) branch: read a Standard MIDI File and either list
+/// its instruments (`--midi-list`) or build an event-based speaker world from
+/// it. Lite CLI: one `--synth` tone for the whole file; per-track tones are a
+/// GUI feature.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_midi(matches: &clap::ArgMatches, heightmap_files: &[PathBuf], out_file: &str) {
+    let input = &heightmap_files[0];
+    if heightmap_files.len() > 1 {
+        warn!("--midi reads a single MIDI file; ignoring the extra inputs");
+    }
+    let bytes = match std::fs::read(input) {
+        Ok(b) => b,
+        Err(e) => fail!("could not read {}: {e}", input.display()),
+    };
+
+    if matches.is_present("midilist") {
+        match discover(&bytes) {
+            Ok((instruments, summary)) => print_midi_info(&instruments, &summary),
+            Err(e) => fail!("{e}"),
+        }
+        return;
+    }
+
+    let opts = match midi_options(matches) {
+        Ok(o) => o,
+        Err(e) => fail!("{e}"),
+    };
+    let score = match analyze_midi(&bytes, &opts) {
+        Ok(s) => s,
+        Err(e) => fail!("{e}"),
+    };
+    info!(
+        "midi2brick: {} speaker(s), {:.1}s{}",
+        score.voices.len(),
+        score.duration_s,
+        if opts.loop_playback { ", looping" } else { "" }
+    );
+    let world = match build_midi_event_world(&score, &opts) {
+        Ok(w) => w,
+        Err(e) => fail!("{e}"),
+    };
+    if let Err(e) = write_world(&world, out_file) {
+        fail!("{e}");
+    }
+    info!("Done!");
+}
+
+/// Build [`MidiOptions`] from the CLI flags. The tone is a single `--synth`
+/// applied to every instrument (a `ToneAssignment::Uniform`); per-track tones
+/// are a GUI feature. Spatialization/playback flags are shared with the audio
+/// path by name.
+#[cfg(not(target_arch = "wasm32"))]
+fn midi_options(matches: &clap::ArgMatches) -> Result<MidiOptions, String> {
+    let d = MidiOptions::default();
+    let tone = match matches.value_of("audiosynth") {
+        Some(s) => SynthWave::parse(s)?,
+        None => SynthWave::Sine,
+    };
+    Ok(MidiOptions {
+        inner_radius: parse_arg(matches, "audioinner", "--inner-radius", "a number", d.inner_radius)?,
+        max_distance: parse_arg(matches, "audiomaxdist", "--max-distance", "a number", d.max_distance)?,
+        gain: parse_arg(matches, "audiogain", "--gain", "a number", d.gain)?,
+        polyphony_cap: parse_arg(
+            matches,
+            "midipolyphony",
+            "--polyphony-cap",
+            "an integer",
+            d.polyphony_cap,
+        )?,
+        loop_playback: !matches.is_present("noloop"),
+        control_buttons: !matches.is_present("nocontrolbuttons"),
+        speakers_in_chip: matches.is_present("audiospeakersinchip"),
+        // Lite CLI path: uniform tone, and no per-instrument volume (that is a
+        // GUI feature) -- an empty list plays every instrument at 1.0.
+        instrument_volumes: Vec::new(),
+        playback_rate: parse_arg(matches, "midirate", "--playback-rate", "a number", d.playback_rate)?,
+        preview_seconds: d.preview_seconds,
+        tones: ToneAssignment::Uniform(tone),
+    })
+}
+
+/// Print the `--midi-list` report: the file summary and one line per discovered
+/// instrument.
+#[cfg(not(target_arch = "wasm32"))]
+fn print_midi_info(instruments: &[heightmap::midi::Instrument], summary: &heightmap::midi::MidiSummary) {
+    info!(
+        "MIDI format {}, {} track(s), {:.1}s, {:.0} BPM, {} note(s){}",
+        summary.format,
+        summary.track_count,
+        summary.duration_s,
+        summary.initial_bpm,
+        summary.total_notes,
+        if summary.has_percussion { " (has percussion, not built)" } else { "" }
+    );
+    info!("{} instrument(s):", instruments.len());
+    for (i, inst) in instruments.iter().enumerate() {
+        let dropped = if inst.dropped_notes > 0 {
+            format!(", {} out of range", inst.dropped_notes)
+        } else {
+            String::new()
+        };
+        info!(
+            "  [{i}] {} (ch {}): {} note(s), max polyphony {}{}",
+            inst.label,
+            inst.channel + 1,
+            inst.note_count,
+            inst.max_polyphony,
+            dropped
+        );
+    }
 }
 
 /// The `--anim-mode` render branch: resolves the mode/encoding pair, the

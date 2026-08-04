@@ -10,7 +10,7 @@
 //! scales every band through a per-band multiply. Each keeps a baked value
 //! underneath for when its pin is unwired.
 use super::bands::{BandKind, PITCH_MAX, PITCH_MIN};
-use super::track::{AudioOptions, VoiceTrack};
+use super::track::{AudioOptions, SynthWave, VoiceTrack};
 use super::voices::VoiceStreams;
 use crate::anim::bricks::{
     ARRAY_GET, ARRAY_VAR, BRANCH, CHANGE_DETECTOR, COMPARE_GE, SELECT, SUBTRACT,
@@ -275,6 +275,10 @@ struct Scaffold {
     control_pins: (usize, usize, usize),
     /// Source port carrying the wrapped integer frame index.
     frame_index: WirePort,
+    /// The timer's raw `Time` (continuous seconds), for a consumer that reads
+    /// the runtime directly rather than the wrapped frame index -- the MIDI
+    /// event playhead compares it against note start/end times.
+    time: WirePort,
     /// The gated master-volume source every per-speaker multiply reads: the
     /// pause-mute `Select`'s output, not the raw `Volume` pin. Passes the
     /// master volume through while the clock advances, emits 0 while frozen
@@ -426,6 +430,7 @@ fn scaffold(
         chip,
         control_pins,
         frame_index,
+        time: clock.time.clone(),
         master_volume: WirePort::new(gated, SELECT, "Output"),
     }
 }
@@ -443,12 +448,13 @@ fn volume_multiply(
     slot: usize,
     speaker: usize,
     master_volume: &WirePort,
+    row: i32,
 ) -> WirePort {
     let gate_id = gate(
         chip,
         "B_1x1_Gate_Expr_MathMultiply",
         MULTIPLY,
-        service(slot as i32, -10),
+        service(slot as i32, row),
         vec![(
             "InputB",
             Box::new(WireVariant::Number(VOLUME_SCALE)) as Box<dyn AsBrdbValue>,
@@ -709,7 +715,8 @@ pub fn build_speaker_world(track: &VoiceTrack, opts: &AudioOptions) -> Result<Wo
         .iter()
         .enumerate()
         .map(|(b, &speaker)| {
-            volume_multiply(&mut world, &mut sc.chip, b, speaker, &sc.master_volume)
+            // Below the audio select cascade (rows -4..-9), per the service doc.
+            volume_multiply(&mut world, &mut sc.chip, b, speaker, &sc.master_volume, -10)
         })
         .collect();
 
@@ -761,41 +768,556 @@ pub fn build_speaker_world(track: &VoiceTrack, opts: &AudioOptions) -> Result<Wo
 /// settles it). The baked value is frame 0's, so a paused chip holds the
 /// first note rather than an arbitrary one.
 pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<World, String> {
-    if streams.frame_count == 0 {
-        return Err("audio track has 0 frames -- nothing to render".to_string());
-    }
-    let n_voices = streams.voice_count();
-    if n_voices == 0 {
+    if streams.voice_count() == 0 {
         return Err("a voice-mode track needs at least one voice".to_string());
     }
-    if streams.volumes.len() != n_voices {
+    // Voice mode is every-speaker tonal (peak-tracking, no noise bands), so the
+    // whole cluster plays one selected waveform -- a uniform synth. The MIDI
+    // path passes a different synth per speaker through this same builder.
+    let synths = vec![opts.tonal_synth; streams.voice_count()];
+    let pitches: Vec<&[f64]> = streams.pitches.iter().map(Vec::as_slice).collect();
+    let volumes: Vec<&[f64]> = streams.volumes.iter().map(Vec::as_slice).collect();
+    build_pitch_volume_world(
+        &pitches,
+        &volumes,
+        &synths,
+        streams.fps,
+        streams.frame_count,
+        opts,
+        "Audio peak-tracking playback generated from an audio file",
+    )
+}
+
+/// Build a world that plays a MIDI file with an EVENT-BASED playback circuit.
+///
+/// Each speaker stores its notes as ONE quat array -- each element
+/// `(start, end, pitch, vol)` -- and a persistent `Var` register indexes into
+/// it. Every tick, `ArrayGet(events, idx)` + `SplitQuaternion` reads the current
+/// event; the speaker plays `pitch` while `start <= t <= end`; when `t > end`
+/// (and the get is in bounds) `Var_Increment` bumps the index; and when the
+/// playback time jumps backward (a restart or a loop wrap) `Var_Set` resets it
+/// to 0. This is the stateful-`Var` playhead verified in game via the probe:
+/// O(1) gates per speaker (no per-note compare chain) and only the events stored.
+///
+/// Reuses the audio [`scaffold`] for the chip, clock, spatialization pins,
+/// pause-mute master volume (a frozen clock is silent) and control buttons; the
+/// per-speaker playhead is new and sits on service rows below the scaffold's.
+/// Looping feeds the playhead `Time mod duration`; playing once feeds raw `Time`
+/// and the index caps at the last event.
+pub fn build_midi_event_world(
+    score: &crate::midi::MidiScore,
+    opts: &crate::midi::MidiOptions,
+) -> Result<World, String> {
+    const VAR: &str = "BrickComponentType_WireGraphPseudo_Var";
+    const VAR_INCREMENT: &str = "BrickComponentType_WireGraph_Exec_Var_Increment";
+    const VAR_SET: &str = "BrickComponentType_WireGraph_Exec_Var_Set";
+    const SPLIT_QUAT: &str = "BrickComponentType_WireGraph_Expr_SplitQuaternion";
+    const COMPARE_GREATER: &str = "BrickComponentType_WireGraph_Expr_CompareGreater";
+    const COMPARE_LE: &str = "BrickComponentType_WireGraph_Expr_CompareLessOrEqual";
+    const COMPARE_LESS: &str = "BrickComponentType_WireGraph_Expr_CompareLess";
+    use crate::anim::clock::MODULO;
+
+    if score.voices.is_empty() {
+        return Err(
+            "this MIDI produced no speakers -- every note was outside the playable range"
+                .to_string(),
+        );
+    }
+    for (v, voice) in score.voices.iter().enumerate() {
+        if voice.notes.is_empty() {
+            return Err(format!("speaker {v} has no notes"));
+        }
+        for (i, note) in voice.notes.iter().enumerate() {
+            if !note.pitch.is_finite() || note.pitch < PITCH_MIN as f64 || note.pitch > PITCH_MAX as f64 {
+                return Err(format!(
+                    "speaker {v} note {i} has PitchMultiplier {}, outside the emitter's legal \
+                     {PITCH_MIN}..{PITCH_MAX} range",
+                    note.pitch
+                ));
+            }
+        }
+    }
+    if !score.duration_s.is_finite() || score.duration_s <= 0.0 {
+        return Err(format!("MIDI duration must be positive, got {}", score.duration_s));
+    }
+
+    let audio_opts = AudioOptions {
+        inner_radius: opts.inner_radius,
+        max_distance: opts.max_distance,
+        ..AudioOptions::default()
+    };
+    check_attenuation(&audio_opts)?;
+
+    let n_speakers = score.voices.len();
+    let mut world = World::new();
+    world.meta.bundle.description = "MIDI event playback generated from a MIDI file".to_string();
+
+    // --- 1. The speaker cluster (main grid, or the chip's inner grid) --------
+    let in_chip = opts.speakers_in_chip;
+    let mut speaker_ids = Vec::with_capacity(n_speakers);
+    let mut in_chip_speakers: Vec<Brick> = Vec::new();
+    for (v, voice) in score.voices.iter().enumerate() {
+        let position = if in_chip {
+            speaker_inner_position(v, n_speakers)
+        } else {
+            speaker_position(v, n_speakers)
+        };
+        speaker_ids.push(add_emitter(
+            &mut world,
+            voice.synth.asset().as_ref(),
+            voice.notes[0].pitch as f32,
+            position,
+            &audio_opts,
+            in_chip.then_some(&mut in_chip_speakers),
+        )?);
+    }
+
+    // --- 2. Chip, clock, pins, pause-mute (shared scaffold) ------------------
+    // Feed the clock a real frame count at 60 fps times the playback rate, so
+    // its `Progress` (0..1) and `Length` (seconds) status output pins track this
+    // piece at the chosen speed -- the frame-index chain is otherwise unused
+    // here (the playhead reads `Time` directly below). A looping render frees
+    // the timer (Time counts up, the frame index wraps); a play-once render
+    // stops it at the end.
+    let rate = (opts.playback_rate as f64).max(0.01);
+    let clock_fps = 60.0f32 * rate as f32;
+    let frame_count = (score.duration_s * 60.0).round().max(1.0) as usize;
+    let mut sc = scaffold(&mut world, &speaker_ids, clock_fps, frame_count, opts.loop_playback);
+    for brick in in_chip_speakers {
+        sc.chip.add_brick(brick, speaker_half());
+    }
+
+    // Playhead gates pack onto a dense grid on the rows just below the
+    // scaffold's own (clock 0, pins -2, pause-mute -3) and the per-speaker
+    // master-volume multiplies, which this build places at -4 (there is no audio
+    // select cascade to clear). Starting the playhead at -5 keeps the whole
+    // thing one compact block instead of the tall empty bands a far-below start
+    // left between sections.
+    let mut slot = 0i32;
+    let mut next_pos = || {
+        let p = service(slot % 48, -5 - slot / 48);
+        slot += 1;
+        p
+    };
+
+    // Playback time in seconds: scale the clock's `Time` by the baked rate
+    // (identity at 1.0), then -- for a looping render -- wrap it at the
+    // duration. The clock's fps carries the same rate, so its Progress/Length
+    // stay in step with these note comparisons.
+    let scaled_time = if (rate - 1.0).abs() < 1e-9 {
+        sc.time.clone()
+    } else {
+        let m = gate(&mut sc.chip, "B_1x1_Gate_Expr_MathMultiply", MULTIPLY, next_pos(), vec![(
+            "InputB",
+            Box::new(WireVariant::Number(rate)) as Box<dyn AsBrdbValue>,
+        )]);
+        world.add_wire_connection(sc.time.clone(), WirePort::new(m, MULTIPLY, "InputA"));
+        WirePort::new(m, MULTIPLY, "Output")
+    };
+    let play_time = if opts.loop_playback {
+        let m = gate(&mut sc.chip, "B_1x1_Gate_Expr_MathModuloFloored", MODULO, next_pos(), vec![(
+            "InputB",
+            Box::new(WireVariant::Number(score.duration_s)) as Box<dyn AsBrdbValue>,
+        )]);
+        world.add_wire_connection(scaled_time.clone(), WirePort::new(m, MODULO, "InputA"));
+        WirePort::new(m, MODULO, "Output")
+    } else {
+        scaled_time
+    };
+
+    // Shared reset signal: last tick's playback time, and whether it jumped
+    // backward (a restart or a loop wrap). Fanned out to every speaker's reset.
+    let prev = gate(&mut sc.chip, "B_1x1_Gate_Pseudo_BufferTicks", BUFFER_TICKS, next_pos(), vec![(
+        "TicksToWait",
+        Box::new(1i32) as Box<dyn AsBrdbValue>,
+    )]);
+    world.add_wire_connection(play_time.clone(), WirePort::new(prev, BUFFER_TICKS, "Input"));
+    let decreased = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareLess", COMPARE_LESS, next_pos(), vec![]);
+    world.add_wire_connection(play_time.clone(), WirePort::new(decreased, COMPARE_LESS, "InputA"));
+    world.add_wire_connection(WirePort::new(prev, BUFFER_TICKS, "Output"), WirePort::new(decreased, COMPARE_LESS, "InputB"));
+
+    // --- 3. Per-speaker playhead ---------------------------------------------
+    for (v, voice) in score.voices.iter().enumerate() {
+        // The events, packed one quat each: (start, end, pitch, vol) = (X,Y,Z,W).
+        let events: Vec<(f64, f64, f64, f64)> = voice
+            .notes
+            .iter()
+            .map(|n| (n.start_s, n.end_s, n.pitch, n.volume))
+            .collect();
+        let events_arr = gate(&mut sc.chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, next_pos(), vec![(
+            "Value",
+            Box::new(WireArrayVariant::QuatArray(events)) as Box<dyn AsBrdbValue>,
+        )]);
+        // The playhead index register (starts 0).
+        let idx_var = gate(&mut sc.chip, "B_1x1_Gate_Variable", VAR, next_pos(), vec![(
+            "Value",
+            Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
+        )]);
+        // This speaker's per-tick exec pulse (own detector, no cross-speaker
+        // chaining -- the reset/advance branches would break a shared chain).
+        let detector = gate(&mut sc.chip, "B_1x1_Gate_Expr_ChangeDetectorExec", CHANGE_DETECTOR, next_pos(), vec![]);
+        world.add_wire_connection(play_time.clone(), WirePort::new(detector, CHANGE_DETECTOR, "Input"));
+
+        // Read the current event and break it into its four floats.
+        let get = gate(&mut sc.chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, next_pos(), vec![]);
+        world.add_wire_connection(WirePort::new(events_arr, ARRAY_VAR, "ArrayVarRef"), WirePort::new(get, ARRAY_GET, "ArrayVarRef"));
+        world.add_wire_connection(WirePort::new(idx_var, VAR, "Value"), WirePort::new(get, ARRAY_GET, "Index"));
+        world.add_wire_connection(WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"), WirePort::new(get, ARRAY_GET, "Exec"));
+        let split = gate(&mut sc.chip, "B_1x1_Gate_Expr_SplitQuaternion", SPLIT_QUAT, next_pos(), vec![]);
+        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "Value"), WirePort::new(split, SPLIT_QUAT, "Input"));
+        let start = WirePort::new(split, SPLIT_QUAT, "X");
+        let end = WirePort::new(split, SPLIT_QUAT, "Y");
+        let pitch = WirePort::new(split, SPLIT_QUAT, "Z");
+        let vol = WirePort::new(split, SPLIT_QUAT, "W");
+
+        // Reset first: if playback time jumped backward, set the index to 0.
+        let br_reset = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, next_pos(), vec![]);
+        world.add_wire_connection(WirePort::new(decreased, COMPARE_LESS, "bOutput"), WirePort::new(br_reset, BRANCH, "bCond"));
+        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "ExecOut"), WirePort::new(br_reset, BRANCH, "Exec"));
+        let var_set = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, next_pos(), vec![(
+            "Value",
+            Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
+        )]);
+        world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(var_set, VAR_SET, "VarRef"));
+        world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutA"), WirePort::new(var_set, VAR_SET, "Exec"));
+
+        // Advance: on the no-reset exec, if Time > end and in bounds, idx += 1.
+        let gt_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreater", COMPARE_GREATER, next_pos(), vec![]);
+        world.add_wire_connection(play_time.clone(), WirePort::new(gt_end, COMPARE_GREATER, "InputA"));
+        world.add_wire_connection(end.clone(), WirePort::new(gt_end, COMPARE_GREATER, "InputB"));
+        let br_time = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, next_pos(), vec![]);
+        world.add_wire_connection(WirePort::new(gt_end, COMPARE_GREATER, "bOutput"), WirePort::new(br_time, BRANCH, "bCond"));
+        world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutB"), WirePort::new(br_time, BRANCH, "Exec"));
+        let br_oob = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, next_pos(), vec![]);
+        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "bOutOfBounds"), WirePort::new(br_oob, BRANCH, "bCond"));
+        world.add_wire_connection(WirePort::new(br_time, BRANCH, "ExecOutA"), WirePort::new(br_oob, BRANCH, "Exec"));
+        let inc = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, next_pos(), vec![(
+            "Value",
+            Box::new(WireVariant::Int(1)) as Box<dyn AsBrdbValue>,
+        )]);
+        world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(inc, VAR_INCREMENT, "VarRef"));
+        world.add_wire_connection(WirePort::new(br_oob, BRANCH, "ExecOutB"), WirePort::new(inc, VAR_INCREMENT, "Exec"));
+
+        // volume = (t >= start) ? ((t <= end) ? vol : 0) : 0
+        let ge_start = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE, next_pos(), vec![]);
+        world.add_wire_connection(play_time.clone(), WirePort::new(ge_start, COMPARE_GE, "InputA"));
+        world.add_wire_connection(start, WirePort::new(ge_start, COMPARE_GE, "InputB"));
+        let le_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareLessOrEqual", COMPARE_LE, next_pos(), vec![]);
+        world.add_wire_connection(play_time.clone(), WirePort::new(le_end, COMPARE_LE, "InputA"));
+        world.add_wire_connection(end, WirePort::new(le_end, COMPARE_LE, "InputB"));
+
+        let vol_inner = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, next_pos(), vec![(
+            "InputA",
+            Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
+        )]);
+        world.add_wire_connection(WirePort::new(le_end, COMPARE_LE, "bOutput"), WirePort::new(vol_inner, SELECT, "bSelectB"));
+        world.add_wire_connection(vol, WirePort::new(vol_inner, SELECT, "InputB"));
+        let vol_gated = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, next_pos(), vec![(
+            "InputA",
+            Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
+        )]);
+        world.add_wire_connection(WirePort::new(ge_start, COMPARE_GE, "bOutput"), WirePort::new(vol_gated, SELECT, "bSelectB"));
+        world.add_wire_connection(WirePort::new(vol_inner, SELECT, "Output"), WirePort::new(vol_gated, SELECT, "InputB"));
+
+        // Pitch straight into the emitter; volume through the master-volume
+        // multiply (pause-mute) so a frozen clock silences it.
+        world.add_wire_connection(pitch, WirePort::new(speaker_ids[v], AUDIO_EMITTER, "PitchMultiplier"));
+        let vol_target = volume_multiply(&mut world, &mut sc.chip, v, speaker_ids[v], &sc.master_volume, -4);
+        world.add_wire_connection(WirePort::new(vol_gated, SELECT, "Output"), vol_target);
+    }
+
+    // --- 4. Control buttons --------------------------------------------------
+    if opts.control_buttons {
+        let (pause, restart, resume) = sc.control_pins;
+        let anchor = crate::anim::controls::control_anchor(&world);
+        crate::anim::controls::add_control_buttons(&mut world, pause, restart, resume, anchor);
+    }
+
+    finish(&mut world, sc.chip)?;
+    world.register_used_components();
+    Ok(world)
+}
+
+/// A minimal one-speaker EVENT-BASED playback circuit, for in-game
+/// verification of the STATEFUL playhead before committing midi2brick to it.
+///
+/// Events are stored as ONE quat array -- each element `(start, end, pitch,
+/// vol)` -- and a persistent `Var` register indexes into it. Each tick:
+/// `ArrayGet(events, idx)` reads the current event and `SplitQuaternion` breaks
+/// it into its four floats; the speaker plays `pitch` while `start <= Time <=
+/// end`; and when `Time > end` (and the get is not out of bounds) a
+/// `Var_Increment` bumps the index by one -- an imperative `idx++` on the tick
+/// exec, NOT the combinational `BufferTicks` feedback that failed to advance in
+/// an earlier probe. Out of bounds is checked so the index stops at the end and
+/// the get holds its last value (the game does not update it while OOB).
+///
+/// This is O(1) gates per speaker (no per-note compare/select chain) AND stores
+/// only the events (one quat each) -- the "arrays not gates" encoding. The clock
+/// is the shared render clock with Pause/Restart/Resume buttons: press Resume or
+/// Restart to start. The output is an ascending 8-note C-major scale, one note
+/// per second, then silence. If the scale advances, the stateful `Var` playhead
+/// works and the real builder can be rebuilt on it. Writes a `.brz` via
+/// `examples/midi_playhead_probe.rs`.
+pub fn build_playhead_probe_world() -> Result<World, String> {
+    const VAR: &str = "BrickComponentType_WireGraphPseudo_Var";
+    const VAR_INCREMENT: &str = "BrickComponentType_WireGraph_Exec_Var_Increment";
+    const VAR_SET: &str = "BrickComponentType_WireGraph_Exec_Var_Set";
+    const SPLIT_QUAT: &str = "BrickComponentType_WireGraph_Expr_SplitQuaternion";
+    const COMPARE_GREATER: &str = "BrickComponentType_WireGraph_Expr_CompareGreater";
+    const COMPARE_LE: &str = "BrickComponentType_WireGraph_Expr_CompareLessOrEqual";
+    const COMPARE_LESS: &str = "BrickComponentType_WireGraph_Expr_CompareLess";
+
+    // The score: eight one-second events (0.9 s sounding, 0.1 s gap), C-major.
+    // Packed as quats (start, end, pitch, vol) = (X, Y, Z, W).
+    let notes: [u8; 8] = [60, 62, 64, 65, 67, 69, 71, 72];
+    let events: Vec<(f64, f64, f64, f64)> = notes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (i as f64, i as f64 + 0.9, 2.0f64.powf((n as f64 - 69.0) / 12.0), 1.0))
+        .collect();
+    let first_pitch = events[0].2 as f32;
+
+    let mut world = World::new();
+    world.meta.bundle.description =
+        "MIDI event-playback playhead probe: a Var-indexed quat-event circuit playing a scale"
+            .to_string();
+
+    let mut chip = new_chip(
+        &mut world,
+        Position { x: 0, y: 0, z: 2 },
+        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
+        IntVector { x: 5, y: 5, z: 5 },
+    );
+
+    // Gate positions: a tight grid, 8 per row, gates touching, on the plane.
+    let pos = |slot: i32| Position {
+        x: GATE_HALF.x + (slot % 8) * (2 * GATE_HALF.x),
+        y: GATE_HALF.y + (slot / 8) * (2 * GATE_HALF.y),
+        z: GATE_HALF.z,
+    };
+    let mut n = 0i32;
+
+    // The shared render clock (Time + control pins), placed clear of the grid.
+    let clock = build_clock(
+        &mut world,
+        &mut chip,
+        1.0,
+        notes.len().max(1),
+        true,
+        Position { x: GATE_HALF.x, y: 200, z: GATE_HALF.z },
+    );
+    let time = || clock.time.clone();
+
+    // The event array (one quat per event) and the index register (starts 0).
+    let events_arr = gate(&mut chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, pos(n), vec![(
+        "Value",
+        Box::new(WireArrayVariant::QuatArray(events)) as Box<dyn AsBrdbValue>,
+    )]);
+    n += 1;
+    let idx_var = gate(&mut chip, "B_1x1_Gate_Variable", VAR, pos(n), vec![(
+        "Value",
+        Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
+    )]);
+    n += 1;
+
+    // Per-tick exec pulse.
+    let detector = gate(&mut chip, "B_1x1_Gate_Expr_ChangeDetectorExec", CHANGE_DETECTOR, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(time(), WirePort::new(detector, CHANGE_DETECTOR, "Input"));
+
+    // Last tick's Time, for the restart/loop reset and the pause-mute.
+    let prev = gate(&mut chip, "B_1x1_Gate_Pseudo_BufferTicks", BUFFER_TICKS, pos(n), vec![(
+        "TicksToWait",
+        Box::new(1i32) as Box<dyn AsBrdbValue>,
+    )]);
+    n += 1;
+    world.add_wire_connection(time(), WirePort::new(prev, BUFFER_TICKS, "Input"));
+    let prev_time = || WirePort::new(prev, BUFFER_TICKS, "Output");
+    // Time jumped backward: a restart or a loop wrap.
+    let decreased = gate(&mut chip, "B_1x1_Gate_Expr_CompareLess", COMPARE_LESS, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(time(), WirePort::new(decreased, COMPARE_LESS, "InputA"));
+    world.add_wire_connection(prev_time(), WirePort::new(decreased, COMPARE_LESS, "InputB"));
+    // Time changed at all: the clock is advancing (not paused).
+    let moving = gate(&mut chip, "B_1x1_Gate_Expr_CompareNotEqual", COMPARE_NE, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(time(), WirePort::new(moving, COMPARE_NE, "InputA"));
+    world.add_wire_connection(prev_time(), WirePort::new(moving, COMPARE_NE, "InputB"));
+
+    // Read the current event: ArrayGet(events, idx) on the pulse.
+    let get = gate(&mut chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(
+        WirePort::new(events_arr, ARRAY_VAR, "ArrayVarRef"),
+        WirePort::new(get, ARRAY_GET, "ArrayVarRef"),
+    );
+    world.add_wire_connection(WirePort::new(idx_var, VAR, "Value"), WirePort::new(get, ARRAY_GET, "Index"));
+    world.add_wire_connection(
+        WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"),
+        WirePort::new(get, ARRAY_GET, "Exec"),
+    );
+
+    // Break the quat into (start, end, pitch, vol) = (X, Y, Z, W).
+    let split = gate(&mut chip, "B_1x1_Gate_Expr_SplitQuaternion", SPLIT_QUAT, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(WirePort::new(get, ARRAY_GET, "Value"), WirePort::new(split, SPLIT_QUAT, "Input"));
+    let start = || WirePort::new(split, SPLIT_QUAT, "X");
+    let end = || WirePort::new(split, SPLIT_QUAT, "Y");
+    let pitch = WirePort::new(split, SPLIT_QUAT, "Z");
+    let vol = WirePort::new(split, SPLIT_QUAT, "W");
+
+    // --- Reset: when Time jumped backward, set the index to 0 ----------------
+    // Runs first on the tick's exec; its no-reset branch continues to advance.
+    let br_reset = gate(&mut chip, "B_1x1_Gate_Exec_Branch", BRANCH, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(WirePort::new(decreased, COMPARE_LESS, "bOutput"), WirePort::new(br_reset, BRANCH, "bCond"));
+    world.add_wire_connection(WirePort::new(get, ARRAY_GET, "ExecOut"), WirePort::new(br_reset, BRANCH, "Exec"));
+    let var_set = gate(&mut chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, pos(n), vec![(
+        "Value",
+        Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
+    )]);
+    n += 1;
+    world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(var_set, VAR_SET, "VarRef"));
+    world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutA"), WirePort::new(var_set, VAR_SET, "Exec"));
+
+    // --- Advance: when Time > end AND the get is in bounds, idx += 1 ----------
+    let gt_end = gate(&mut chip, "B_1x1_Gate_Expr_CompareGreater", COMPARE_GREATER, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(time(), WirePort::new(gt_end, COMPARE_GREATER, "InputA"));
+    world.add_wire_connection(end(), WirePort::new(gt_end, COMPARE_GREATER, "InputB"));
+    // Branch on Time>end: the true exec continues to the OOB check.
+    let br_time = gate(&mut chip, "B_1x1_Gate_Exec_Branch", BRANCH, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(WirePort::new(gt_end, COMPARE_GREATER, "bOutput"), WirePort::new(br_time, BRANCH, "bCond"));
+    world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutB"), WirePort::new(br_time, BRANCH, "Exec"));
+    // Branch on bOutOfBounds: the FALSE exec (in bounds) does the increment, so
+    // the index never runs past the last event.
+    let br_oob = gate(&mut chip, "B_1x1_Gate_Exec_Branch", BRANCH, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(WirePort::new(get, ARRAY_GET, "bOutOfBounds"), WirePort::new(br_oob, BRANCH, "bCond"));
+    world.add_wire_connection(WirePort::new(br_time, BRANCH, "ExecOutA"), WirePort::new(br_oob, BRANCH, "Exec"));
+    let inc = gate(&mut chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, pos(n), vec![(
+        "Value",
+        Box::new(WireVariant::Int(1)) as Box<dyn AsBrdbValue>,
+    )]);
+    n += 1;
+    world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(inc, VAR_INCREMENT, "VarRef"));
+    world.add_wire_connection(WirePort::new(br_oob, BRANCH, "ExecOutB"), WirePort::new(inc, VAR_INCREMENT, "Exec"));
+
+    // --- Play: volume = (Time >= start) ? ((Time <= end) ? vol : 0) : 0 ------
+    let ge_start = gate(&mut chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(time(), WirePort::new(ge_start, COMPARE_GE, "InputA"));
+    world.add_wire_connection(start(), WirePort::new(ge_start, COMPARE_GE, "InputB"));
+    let le_end = gate(&mut chip, "B_1x1_Gate_Expr_CompareLessOrEqual", COMPARE_LE, pos(n), vec![]);
+    n += 1;
+    world.add_wire_connection(time(), WirePort::new(le_end, COMPARE_LE, "InputA"));
+    world.add_wire_connection(end(), WirePort::new(le_end, COMPARE_LE, "InputB"));
+
+    let vol_inner = gate(&mut chip, "B_1x1_Gate_Expr_Select", SELECT, pos(n), vec![(
+        "InputA",
+        Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
+    )]);
+    n += 1;
+    world.add_wire_connection(WirePort::new(le_end, COMPARE_LE, "bOutput"), WirePort::new(vol_inner, SELECT, "bSelectB"));
+    world.add_wire_connection(vol, WirePort::new(vol_inner, SELECT, "InputB"));
+    let vol_out = gate(&mut chip, "B_1x1_Gate_Expr_Select", SELECT, pos(n), vec![(
+        "InputA",
+        Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
+    )]);
+    world.add_wire_connection(WirePort::new(ge_start, COMPARE_GE, "bOutput"), WirePort::new(vol_out, SELECT, "bSelectB"));
+    world.add_wire_connection(WirePort::new(vol_inner, SELECT, "Output"), WirePort::new(vol_out, SELECT, "InputB"));
+
+    // --- The single speaker, driven by the circuit --------------------------
+    let opts = AudioOptions::default();
+    let emitter = add_emitter(
+        &mut world,
+        SynthWave::Sine.asset().as_ref(),
+        first_pitch,
+        Position { x: 200, y: 0, z: GATE_HALF.z },
+        &opts,
+        None,
+    )?;
+    // Pause-mute: silence unless the clock advanced this tick.
+    n += 1;
+    let pause_mute = gate(&mut chip, "B_1x1_Gate_Expr_Select", SELECT, pos(n), vec![(
+        "InputA",
+        Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
+    )]);
+    world.add_wire_connection(WirePort::new(moving, COMPARE_NE, "bOutput"), WirePort::new(pause_mute, SELECT, "bSelectB"));
+    world.add_wire_connection(WirePort::new(vol_out, SELECT, "Output"), WirePort::new(pause_mute, SELECT, "InputB"));
+
+    world.add_wire_connection(pitch, WirePort::new(emitter, AUDIO_EMITTER, "PitchMultiplier"));
+    world.add_wire_connection(
+        WirePort::new(pause_mute, SELECT, "Output"),
+        WirePort::new(emitter, AUDIO_EMITTER, "VolumeMultiplier"),
+    );
+
+    // Physical Pause/Restart/Resume buttons.
+    let anchor = crate::anim::controls::control_anchor(&world);
+    crate::anim::controls::add_control_buttons(
+        &mut world,
+        clock.pause_pin,
+        clock.restart_pin,
+        clock.resume_pin,
+        anchor,
+    );
+
+    finish(&mut world, chip)?;
+    world.register_used_components();
+    Ok(world)
+}
+
+/// The shared per-speaker pitch+volume builder behind both [`build_voice_world`]
+/// and [`build_midi_world`]. Every speaker gets its own `synths[i]` (voice mode
+/// passes the same one for all; MIDI passes one per instrument), its pitch wired
+/// straight into `PitchMultiplier` and its volume through a master-volume
+/// multiply, all banked by the shared frame cascade. `opts` supplies only the
+/// spatialization/playback fields (inner/max radius, speakers-in-chip, loop,
+/// control buttons, bank size); `fps` and `frame_count` come from the streams.
+fn build_pitch_volume_world(
+    pitches: &[&[f64]],
+    volumes: &[&[f64]],
+    synths: &[SynthWave],
+    fps: f32,
+    frame_count: usize,
+    opts: &AudioOptions,
+    description: &str,
+) -> Result<World, String> {
+    if frame_count == 0 {
+        return Err("audio track has 0 frames -- nothing to render".to_string());
+    }
+    let n = pitches.len();
+    if n == 0 {
+        return Err("a track needs at least one speaker".to_string());
+    }
+    if volumes.len() != n || synths.len() != n {
         return Err(format!(
-            "track has {} pitch arrays but {} volume arrays",
-            n_voices,
-            streams.volumes.len()
+            "track has {n} pitch arrays but {} volume arrays and {} synths",
+            volumes.len(),
+            synths.len()
         ));
     }
-    // Both arrays of every voice are read at the same frame index, so a short
-    // one would leave that voice reading a stale value (or nothing) from the
+    // Both arrays of every speaker are read at the same frame index, so a short
+    // one would leave that speaker reading a stale value (or nothing) from the
     // point it ran out -- silently, and only for part of the track.
-    for (v, (p, vol)) in streams.pitches.iter().zip(&streams.volumes).enumerate() {
-        if p.len() != streams.frame_count || vol.len() != streams.frame_count {
+    for (v, (p, vol)) in pitches.iter().zip(volumes).enumerate() {
+        if p.len() != frame_count || vol.len() != frame_count {
             return Err(format!(
-                "voice {v} has {} pitch and {} volume values, expected {} of each",
+                "speaker {v} has {} pitch and {} volume values, expected {frame_count} of each",
                 p.len(),
                 vol.len(),
-                streams.frame_count
             ));
         }
     }
     // A pitch outside the emitter's legal range is clamped in game, turning a
-    // wrong number into a wrong note rather than silence. analyze_voices
-    // already clamps; this guards any other caller.
-    for (v, row) in streams.pitches.iter().enumerate() {
+    // wrong number into a wrong note rather than silence. The analyzers already
+    // clamp/drop; this guards any other caller.
+    for (v, row) in pitches.iter().enumerate() {
         for (f, &p) in row.iter().enumerate() {
             if !p.is_finite() || p < PITCH_MIN as f64 || p > PITCH_MAX as f64 {
                 return Err(format!(
-                    "voice {v} frame {f} has PitchMultiplier {p}, outside the emitter's \
+                    "speaker {v} frame {f} has PitchMultiplier {p}, outside the emitter's \
                      legal {PITCH_MIN}..{PITCH_MAX} range -- the game would clamp it \
                      and play a wrong note"
                 ));
@@ -805,27 +1327,24 @@ pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<
     check_attenuation(opts)?;
 
     let mut world = World::new();
-    world.meta.bundle.description =
-        "Audio peak-tracking playback generated from an audio file".to_string();
+    world.meta.bundle.description = description.to_string();
 
     // --- 1. The speaker cluster (main grid, or the chip's inner grid) -------
     let in_chip = opts.speakers_in_chip;
-    let mut speaker_ids = Vec::with_capacity(n_voices);
+    let mut speaker_ids = Vec::with_capacity(n);
     // Deferred until the chip exists; empty (loop a no-op) unless
     // `--speakers-in-chip`. Same mechanism as the bank builder.
     let mut in_chip_speakers: Vec<Brick> = Vec::new();
-    for v in 0..n_voices {
+    for v in 0..n {
         let position = if in_chip {
-            speaker_inner_position(v, n_voices)
+            speaker_inner_position(v, n)
         } else {
-            speaker_position(v, n_voices)
+            speaker_position(v, n)
         };
         speaker_ids.push(add_emitter(
             &mut world,
-            // Voice mode is every-speaker tonal (peak-tracking, no noise
-            // bands), so the whole cluster plays the selected waveform.
-            opts.tonal_synth.asset().as_ref(),
-            streams.pitches[v][0] as f32,
+            synths[v].asset().as_ref(),
+            pitches[v][0] as f32,
             position,
             opts,
             in_chip.then_some(&mut in_chip_speakers),
@@ -833,13 +1352,7 @@ pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<
     }
 
     // --- 2. Chip, clock and the four input pins -----------------------------
-    let mut sc = scaffold(
-        &mut world,
-        &speaker_ids,
-        streams.fps,
-        streams.frame_count,
-        opts.loop_playback,
-    );
+    let mut sc = scaffold(&mut world, &speaker_ids, fps, frame_count, opts.loop_playback);
 
     // Place the deferred in-chip speakers now the chip exists (a no-op for the
     // default beside-the-chip layout). See `build_speaker_world`.
@@ -847,27 +1360,27 @@ pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<
         sc.chip.add_brick(brick, speaker_half());
     }
 
-    // --- 3. One master-volume multiply per voice ----------------------------
+    // --- 3. One master-volume multiply per speaker --------------------------
     let volume_targets: Vec<WirePort> = speaker_ids
         .iter()
         .enumerate()
         .map(|(v, &speaker)| {
-            volume_multiply(&mut world, &mut sc.chip, v, speaker, &sc.master_volume)
+            volume_multiply(&mut world, &mut sc.chip, v, speaker, &sc.master_volume, -10)
         })
         .collect();
 
-    // --- 4. Two streams per voice: its pitch and its volume -----------------
-    // Interleaved per voice so the two arrays sit next to each other in the
+    // --- 4. Two streams per speaker: its pitch and its volume ---------------
+    // Interleaved per speaker so the two arrays sit next to each other in the
     // chip. Pitch goes straight into the emitter with no multiply in between:
     // scaling it by Volume would transpose the render whenever volume changed.
-    let mut frame_streams: Vec<FrameStream<'_>> = Vec::with_capacity(n_voices * 2);
-    for v in 0..n_voices {
+    let mut frame_streams: Vec<FrameStream<'_>> = Vec::with_capacity(n * 2);
+    for v in 0..n {
         frame_streams.push(FrameStream {
-            values: &streams.pitches[v],
+            values: pitches[v],
             target: WirePort::new(speaker_ids[v], AUDIO_EMITTER, "PitchMultiplier"),
         });
         frame_streams.push(FrameStream {
-            values: &streams.volumes[v],
+            values: volumes[v],
             target: volume_targets[v].clone(),
         });
     }
@@ -875,7 +1388,7 @@ pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<
         &mut world,
         &mut sc.chip,
         &sc.frame_index,
-        streams.frame_count,
+        frame_count,
         opts.bank_size,
         &frame_streams,
     );

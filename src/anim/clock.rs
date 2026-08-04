@@ -39,12 +39,12 @@ pub struct Clock {
     /// that never reaches a limit never expires. On a non-looping clock it
     /// fires once, at [`stop_limit`] -- see `build_clock`.
     pub done_pin: usize,
-    /// Output pin carrying playback progress in percent (0..100), a float.
+    /// Output pin carrying playback progress as a fraction (0..1), a float.
     ///
     /// The wrapped frame index scaled so frame 0 reads 0 and the last frame
-    /// reads 100; a looping clock sweeps 0..100 and wraps with the index.
-    /// Quantized to whole frames (the render's own granularity) and
-    /// rate-independent. Always wired, inert until a builder taps it.
+    /// reads 1; a looping clock sweeps 0..1 and wraps with the index. Quantized
+    /// to whole frames (the render's own granularity) and rate-independent.
+    /// Always wired, inert until a builder taps it.
     pub progress_pin: usize,
     /// Output pin carrying the clip's intrinsic length in seconds, a float
     /// constant (`frame_count / fps`).
@@ -298,13 +298,13 @@ pub fn build_clock(
         pin_target(length_pin, false),
     );
 
-    // Progress is the wrapped frame index scaled to percent: `frame_index *
-    // 100 / (frame_count - 1)`, so frame 0 reads 0 and the last frame reads
-    // 100. Reading `wrap.Output` again is dataflow fan-out (the caller also
-    // reads it as the frame index), which the graph allows freely.
+    // Progress is the wrapped frame index scaled to a fraction: `frame_index /
+    // (frame_count - 1)`, so frame 0 reads 0 and the last frame reads 1.
+    // Reading `wrap.Output` again is dataflow fan-out (the caller also reads it
+    // as the frame index), which the graph allows freely.
     // `(frame_count - 1).max(1)` guards a single-frame clip, which then reads
     // a constant 0.
-    let progress_scale = 100.0 / frame_count.saturating_sub(1).max(1) as f64;
+    let progress_scale = 1.0 / frame_count.saturating_sub(1).max(1) as f64;
     let progress_gate = gate(chip, "B_1x1_Gate_Expr_MathMultiply", MULTIPLY, at(5), vec![(
         "InputB",
         Box::new(WireVariant::Number(progress_scale)) as Box<dyn AsBrdbValue>,

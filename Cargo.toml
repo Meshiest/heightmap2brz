@@ -13,6 +13,12 @@ image = { version = "0.25.10", default-features = false, features = [
   "webp",
 ] }
 log = "0.4.28"
+# Standard MIDI File parser (midi::parse). Pure Rust, no_std-capable, wasm-safe,
+# so it belongs here rather than in a native-only block.
+midly = { version = "0.5", default-features = false, features = ["std"] }
+# Platform user directories (the MIDI file dialog opens into the Music folder).
+# GUI-only, so it is optional and pulled by the `gui` feature.
+dirs = { version = "5", optional = true }
 eframe = { version = "0.33.3", optional = true }
 egui = { version = "0.33.3", optional = true }
 rfd = { version = "0.15", optional = true }
@@ -60,6 +66,10 @@ clipboard-win = { version = "5.4.1", features = [
 ], optional = true }
 indicatif = "0.17"
 ffmpeg-sidecar = "2.5"
+# Desktop audio output for the MIDI preview. Optional and native-only (pulls
+# cpal), pulled by the `gui` feature; the wasm build uses Web Audio instead.
+# default-features off: only raw-PCM playback is needed, not the decoders.
+rodio = { version = "0.20", optional = true, default-features = false }
 
 # web: brz-only brdb with the wasm clock, async dialogs, browser downloads
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -79,6 +89,14 @@ web-sys = { version = "0.3", features = [
   "HtmlAnchorElement",
   "Document",
   "Window",
+  # Web Audio, for the MIDI preview in the browser build.
+  "AudioContext",
+  "AudioBuffer",
+  "AudioBufferSourceNode",
+  "AudioDestinationNode",
+  "AudioContextState",
+  "GainNode",
+  "AudioParam",
 ], optional = true }
 
 [features]
@@ -95,8 +113,12 @@ gui = [
   "wasm-bindgen-futures",
   "web-sys",
   "js-sys",
+  "dirs",
+  "rodio",
 ]
 egui = ["dep:egui"]
+dirs = ["dep:dirs"]
+rodio = ["dep:rodio"]
 clipboard-win = ["dep:clipboard-win"]
 pollster = ["dep:pollster"]
 wasm-bindgen = ["dep:wasm-bindgen"]

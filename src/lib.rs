@@ -1,6 +1,7 @@
 pub mod anim;
 pub mod audio;
 pub mod map;
+pub mod midi;
 pub mod opt;
 pub mod progress;
 pub mod subs;
