@@ -15,39 +15,16 @@ pub fn parse(input: &str) -> Result<Subtitles, String> {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
 
-    // Cues are grouped on any line that is blank AFTER trimming, rather than
-    // split on a literal "\n\n".
-    //
-    // Real files routinely separate cues with a line holding a space or a tab.
-    // That is invisible in an editor but it is not an empty string, so
-    // `split("\n\n")` does not break there -- and filtering blank lines out
-    // afterwards then deletes the separator, collapsing two cues into one
-    // block. `position(.. "-->")` finds only the FIRST timing line, so
-    // everything after it becomes cue text: cue 1 displays the next cue's
-    // index, timing line and body as its own text, and cue 2 is lost. No
-    // error, just a corrupted subtitle track.
-    //
-    // A blank line inside a cue's body therefore also ends that cue, which is
-    // how SubRip is normally read.
+    // Cues are separated by a blank-AFTER-trim line -- see `super::blocks`'s
+    // doc for why that trim matters.
     let mut cues = Vec::new();
-    let mut block: Vec<&str> = Vec::new();
-
-    // The appended "" flushes the last cue in files that do not end blank.
-    for line in normalized.lines().chain(std::iter::once("")) {
-        if !line.trim().is_empty() {
-            block.push(line);
-            continue;
-        }
-        if block.is_empty() {
-            continue;
-        }
+    for block in super::blocks(&normalized) {
         let timing_idx = block.iter().position(|l| l.contains("-->")).ok_or_else(|| {
             format!("SubRip cue is missing a timing line (\"-->\"): {:?}", block.join("\n"))
         })?;
         let (start_s, end_s) = parse_timing_line(block[timing_idx])?;
         let text = block[timing_idx + 1..].join("\n");
         cues.push(Cue { start_s, end_s, text });
-        block.clear();
     }
 
     Ok(Subtitles::new(cues))
@@ -67,45 +44,17 @@ fn parse_timing_line(line: &str) -> Result<(f64, f64), String> {
         .ok_or_else(|| format!("invalid SubRip timestamp in timing line {line:?}"))?;
     let end_s = parse_timestamp(right)
         .ok_or_else(|| format!("invalid SubRip timestamp in timing line {line:?}"))?;
-    if end_s < start_s {
-        return Err(format!(
-            "SubRip cue ends before it starts ({start_s}s --> {end_s}s): {line:?}"
-        ));
-    }
+    super::reject_reversed("SubRip", start_s, end_s, &format!("{line:?}"))?;
     Ok((start_s, end_s))
 }
 
-/// Parses a single `HH:MM:SS,mmm` timestamp into seconds.
-///
-/// Components are read as unsigned integers rather than through
-/// `f64::from_str`, which also accepts `inf`, `NaN`, `-1` and `1e3`. Each of
-/// those yields a cue that no frame time can ever fall inside, i.e. one
-/// silently dropped from the render. The signed case is worse still:
-/// `"-00".parse::<f64>()` is `-0.0`, and `-0.0 * 3600.0 + 0.0 * 60.0 + 1.0`
-/// is `+1.0`, so `-00:00:01,000` became a POSITIVE one-second timestamp with
-/// the sign quietly gone.
+/// Parses a single `HH:MM:SS,mmm` timestamp into seconds: comma-separated
+/// milliseconds, hours mandatory. See [`super::parse_timestamp`] for the
+/// shared digit handling -- a leading `-` is rejected rather than parsed: as
+/// a float, `"-00".parse::<f64>()` is `-0.0`, and `-0.0 * 3600.0 + 1.0` is
+/// `+1.0` -- the sign would be lost, not the value rejected.
 fn parse_timestamp(s: &str) -> Option<f64> {
-    let s = s.trim();
-    let (hms, ms) = s.split_once(',')?;
-    let mut parts = hms.split(':');
-    let hours = digits(parts.next()?)?;
-    let minutes = digits(parts.next()?)?;
-    let seconds = digits(parts.next()?)?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let millis = digits(ms)?;
-    Some(hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds as f64 + millis as f64 / 1000.0)
-}
-
-/// An unsigned integer written in ASCII digits and nothing else -- no sign,
-/// no exponent, no `inf`. See [`parse_timestamp`]'s doc for why.
-fn digits(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
+    super::parse_timestamp(s, ',', 1000.0, false)
 }
 
 #[cfg(test)]

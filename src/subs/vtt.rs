@@ -1,25 +1,19 @@
 //! WebVTT (`.vtt` / `.webvtt`) parser.
 //!
-//! Close enough to SubRip that routing `.vtt` at [`super::srt`] looks
-//! plausible, and different enough that doing so cannot parse a single real
-//! file. The three differences that matter:
+//! Different enough from SubRip that routing `.vtt` through [`super::srt`]
+//! cannot parse a real file: the signature block (`WEBVTT`, no `-->`) reads
+//! as a cue missing its timing line, the fraction separator is `.` not `,`,
+//! and the hours field is optional (`MM:SS.mmm` is legal).
 //!
-//! - the file opens with a `WEBVTT` signature block that carries no `-->`,
-//!   which SubRip's block loop reads as a cue missing its timing line;
-//! - the fraction separator is `.`, not `,`;
-//! - the hours field is optional, so `MM:SS.mmm` is a legal timestamp.
+//! A timing line may also carry cue settings after the end timestamp
+//! (`... --> ... align:start position:10%`), a cue may be preceded by an
+//! identifier line, `NOTE`/`STYLE`/`REGION` blocks may appear between cues,
+//! and the payload may carry inline markup (`<v Roger>`, `<c.loud>`, `<i>`,
+//! `<00:00:01.500>`) plus HTML entities.
 //!
-//! On top of that, a timing line may carry cue settings after the end
-//! timestamp (`00:00:01.000 --> 00:00:02.000 align:start position:10%`), a
-//! cue may be preceded by an identifier line, `NOTE`/`STYLE`/`REGION` blocks
-//! may appear between cues, and the payload may carry inline markup
-//! (`<v Roger>`, `<c.loud>`, `<i>`, `<00:00:01.500>`) plus HTML entities.
-//!
-//! Deliberately out of scope, exactly as in [`super::ass`]: positioning,
-//! styling and regions. Cue settings are parsed only far enough to be
-//! ignored; `STYLE` and `REGION` blocks are skipped whole. What this module
-//! promises is the text and its timing, nothing about where on screen the
-//! source wanted it.
+//! Deliberately out of scope: positioning, styling and regions. Cue
+//! settings are parsed only far enough to be ignored; `STYLE`/`REGION`
+//! blocks are skipped whole.
 
 use super::{Cue, Subtitles};
 
@@ -41,17 +35,12 @@ pub fn is_webvtt(input: &str) -> bool {
 
 /// Parses WebVTT text into a [`Subtitles`] track.
 ///
-/// The `WEBVTT` signature is REQUIRED rather than optional-and-guessed. A
-/// file without it is not WebVTT, and the most likely thing it actually is --
-/// SubRip under a `.vtt` name -- parses to entirely different timestamps if
-/// read as WebVTT (`00:00:01,500` read with a `.` separator would lose its
-/// fraction), so guessing here would trade a clear error for a silently
-/// mistimed track.
+/// The `WEBVTT` signature is required, not guessed: a file without it is
+/// most likely SubRip under a `.vtt` name, and reading that as WebVTT would
+/// silently misparse its `,`-separated timestamps rather than erroring.
 ///
 /// An empty cue list is valid, matching [`super::srt::parse`]: a `.vtt`
-/// holding only a header and a `NOTE` is a real, if useless, file. The
-/// signature check is what stops a mis-routed file from arriving here and
-/// succeeding emptily.
+/// holding only a header and a `NOTE` is a real, if useless, file.
 pub fn parse(input: &str) -> Result<Subtitles, String> {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
@@ -65,35 +54,19 @@ pub fn parse(input: &str) -> Result<Subtitles, String> {
         ));
     }
 
-    // Blocks are separated by a blank line, and "blank" is tested AFTER
-    // trimming for exactly the reason `srt::parse` gives: a separator holding
-    // a space or a tab is invisible in an editor but is not an empty string,
-    // and splitting on a literal "\n\n" merges the cues either side of it
-    // into one -- losing the second silently.
+    // Blocks are separated by a blank line, tested AFTER trimming -- see
+    // `super::blocks`'s doc for why that trim matters.
     let mut cues = Vec::new();
-    let mut block: Vec<&str> = Vec::new();
-    let mut seen_header = false;
-
-    // The appended "" flushes the last block in files that do not end blank.
-    for line in normalized.lines().chain(std::iter::once("")) {
-        if !line.trim().is_empty() {
-            block.push(line);
-            continue;
-        }
-        if block.is_empty() {
-            continue;
-        }
-        // The signature block is everything up to the first blank line; it
-        // carries no cue, only the `WEBVTT` line and any header metadata.
-        if !seen_header {
-            seen_header = true;
-            block.clear();
-            continue;
-        }
+    let mut blocks = super::blocks(&normalized).into_iter();
+    // The signature block is everything up to the first blank line; it
+    // carries no cue, only the `WEBVTT` line and any header metadata.
+    // `is_webvtt` above guarantees the input starts with that line, so there
+    // is always at least one block to discard here.
+    blocks.next();
+    for block in blocks {
         if let Some(cue) = parse_block(&block)? {
             cues.push(cue);
         }
-        block.clear();
     }
 
     Ok(Subtitles::new(cues))
@@ -102,10 +75,9 @@ pub fn parse(input: &str) -> Result<Subtitles, String> {
 /// Parses one non-header block into a cue, or `None` for a block that
 /// carries no cue (a comment, a style sheet, a region definition).
 ///
-/// A block that is none of those and still has no `-->` is an `Err`, matching
-/// [`super::srt::parse`]: silently skipping it would turn a malformed file
-/// into a short track, and a short track renders as a video where somebody
-/// stops speaking for no reason.
+/// A block that is none of those and still has no `-->` is an `Err`,
+/// matching [`super::srt::parse`]: silently skipping it would shorten the
+/// track with no diagnostic.
 fn parse_block(block: &[&str]) -> Result<Option<Cue>, String> {
     let first = block[0].trim();
     if is_keyword_block(first, "NOTE") || is_keyword_block(first, "STYLE")
@@ -161,56 +133,25 @@ fn parse_timing_line(line: &str) -> Result<(f64, f64), String> {
     let end_token = right.split_whitespace().next().unwrap_or("");
     let end_s = parse_timestamp(end_token)
         .ok_or_else(|| format!("invalid WebVTT timestamp in timing line {line:?}"))?;
-    if end_s < start_s {
-        return Err(format!(
-            "WebVTT cue ends before it starts ({start_s}s --> {end_s}s): {line:?}"
-        ));
-    }
+    super::reject_reversed("WebVTT", start_s, end_s, &format!("{line:?}"))?;
     Ok((start_s, end_s))
 }
 
-/// Parses a `HH:MM:SS.mmm` or `MM:SS.mmm` timestamp into seconds.
-///
-/// Components are read as unsigned integers rather than through
-/// `f64::from_str`, which would also accept `inf`, `NaN`, `-1` and `1e3`.
-/// Each of those parses to a cue that can never satisfy
-/// `start_s <= t < end_s`, i.e. one silently dropped from the render -- and a
-/// leading `-` is worse than that, since `-0` times 3600 is `-0.0` and the
-/// sign is lost entirely rather than the value being rejected.
+/// Parses a `HH:MM:SS.mmm` or `MM:SS.mmm` timestamp into seconds:
+/// dot-separated milliseconds, hours optional. See [`super::parse_timestamp`]
+/// for the shared digit handling (rejects `inf`/`NaN`/signs/exponents rather
+/// than parsing them into a cue no frame time can ever fall inside).
 fn parse_timestamp(s: &str) -> Option<f64> {
-    let s = s.trim();
-    let (hms, ms) = s.split_once('.')?;
-    let parts: Vec<&str> = hms.split(':').collect();
-    let (hours, minutes, seconds) = match parts.as_slice() {
-        [m, sec] => (0u64, digits(m)?, digits(sec)?),
-        [h, m, sec] => (digits(h)?, digits(m)?, digits(sec)?),
-        _ => return None,
-    };
-    let millis = digits(ms)?;
-    Some(hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds as f64 + millis as f64 / 1000.0)
-}
-
-/// An unsigned integer written in ASCII digits and nothing else -- no sign,
-/// no exponent, no `inf`. See [`parse_timestamp`]'s doc for why.
-fn digits(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
+    super::parse_timestamp(s, '.', 1000.0, true)
 }
 
 /// Strips WebVTT inline markup and resolves the entities the format defines.
 ///
 /// Markup is every `<...>` span: voice spans (`<v Roger>`), class spans
 /// (`<c.loud>`), the plain `<i>`/`<b>`/`<u>`/`<ruby>` tags, and karaoke
-/// timestamps (`<00:00:01.500>`). All carry no text of their own.
+/// timestamps (`<00:00:01.500>`) -- all carry no text of their own.
 ///
-/// An unterminated `<` is kept LITERALLY rather than swallowing the rest of
-/// the line. `src/subs/ass.rs`'s brace skip made the other choice and turned
-/// `{\i1 Hello there` into an empty cue -- text vanishing with no error is
-/// the failure this module exists to avoid, and a stray `<` in dialogue
-/// ("5 < 6") is far more likely than a truncated tag.
+/// An unterminated `<` is kept literally, not swallowed.
 fn clean_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
@@ -232,9 +173,8 @@ fn clean_text(raw: &str) -> String {
 
 /// Resolves the five character references WebVTT names, plus `&nbsp;`.
 ///
-/// `&amp;` is resolved LAST in the sense that matters: each reference is
-/// consumed whole in one left-to-right pass, so `&amp;lt;` yields `&lt;` as
-/// text rather than being re-scanned into `<`.
+/// Each reference is consumed whole in one left-to-right pass, so
+/// `&amp;lt;` yields `&lt;` as text rather than being re-scanned into `<`.
 fn decode_entities(raw: &str) -> String {
     const ENTITIES: &[(&str, &str)] = &[
         ("&amp;", "&"),

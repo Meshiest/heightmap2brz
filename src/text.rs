@@ -562,12 +562,10 @@ fn row_too_wide(y: u32, chars: usize) -> String {
 
 /// The two halves of a `<color="RRGGBB">` tag, and its character cost.
 ///
-/// Spelled out as literals, and the cost DERIVED from them, so the count and
-/// the text it counts cannot drift apart. All three parts are ASCII, so `len()`
-/// (bytes) and the char count are the same number -- which is what makes
-/// `COLOR_TAG_CHARS` a constant rather than a `chars().count()` per tag.
-/// `the_colour_tag_is_exactly_what_the_format_string_produced` pins both the
-/// text and the count against the `format!` they replaced.
+/// Spelled out as literals, with the cost derived from them, so the count
+/// and the text it counts cannot drift apart. All three parts are ASCII, so
+/// `len()` (bytes) equals the char count, which is what makes
+/// `COLOR_TAG_CHARS` a constant instead of a `chars().count()` per tag.
 const COLOR_TAG_OPEN: &str = "<color=\"";
 const COLOR_TAG_CLOSE: &str = "\">";
 const COLOR_TAG_CHARS: usize = COLOR_TAG_OPEN.len() + 6 + COLOR_TAG_CLOSE.len();
@@ -656,52 +654,37 @@ impl AsBrdbValue for Vector2f {
     }
 }
 
-/// `Component_TextDisplay`'s `Anchor`: which point OF THE TEXT BLOCK the
-/// anchor cube's position names, in normalized block coordinates. `(0, 0)` is
-/// the block's top-left, so the glyphs draw down and to the right of the cube --
-/// what every pixel-art placement in this crate wants, since each tile's cube
-/// sits at its patch's top-left image position.
+/// `Component_TextDisplay`'s `Anchor`, in normalized block coordinates:
+/// `(0, 0)` is the block's top-left, so glyphs draw down and right of the
+/// cube -- what pixel-art tiling wants, since each tile's cube sits at its
+/// patch's top-left image position.
 pub const ANCHOR_TOP_LEFT: Vector2f = Vector2f { x: 0.0, y: 0.0 };
 
-/// Anchor for a line meant to sit ON something rather than hang off it:
-/// horizontally CENTRED (X 0.5) and anchored at the block's BOTTOM edge
-/// (Y 1.0), so the text spreads either side of the cube and grows UPWARD from
-/// it. [`crate::anim::subtitle_display`] uses this to lay a subtitle across the
-/// bottom of the picture; see its `SUBTITLE_ANCHOR`.
+/// Anchor for a line meant to sit on something rather than hang off it:
+/// centred (X 0.5) at the block's bottom edge (Y 1.0), so text spreads
+/// either side of the cube and grows upward from it.
 pub const ANCHOR_BOTTOM_CENTRE: Vector2f = Vector2f { x: 0.5, y: 1.0 };
 
-/// `EBRTextOutline::None` -- no outline at all.
-///
-/// The `Outline` property of `Component_TextDisplay` is typed as the game's
-/// `EBRTextOutline` in the save schema, which
-/// `brdb/crates/brdb/schemas/BRSavedComponentChunkSoA_max.schema` declares as
-/// `None = 0, Inlined = 1, Outlined = 2, HollowInlined = 3, HollowOutlined = 4`.
-/// These constants are read off that file rather than guessed, the same way
-/// [`FACE_X_POSITIVE`] is read off `EBrickDirection`.
+/// Anchor for a line centred on the block in both axes (X 0.5, Y 0.5), so the
+/// text sits in the middle of the face it draws on -- what a label riding on
+/// the middle of a button's top face wants.
+pub const ANCHOR_CENTRE: Vector2f = Vector2f { x: 0.5, y: 0.5 };
+
+/// `EBRTextOutline` values (from the save schema): `None`.
 pub const OUTLINE_NONE: u8 = 0;
-/// `EBRTextOutline::Outlined` -- a solid outline drawn AROUND the glyph, using
-/// the component's `OutlineColor`/`OutlineWidth`. (`Inlined`, 1, eats into the
-/// glyph instead, which thins small text.) See [`OUTLINE_NONE`] for the source
-/// of these values.
+/// `EBRTextOutline::Outlined` -- a solid outline drawn around the glyph
+/// (`OutlineColor`/`OutlineWidth`). `Inlined` (1) eats into the glyph
+/// instead, thinning small text.
 pub const OUTLINE_OUTLINED: u8 = 2;
-/// The `OutlineWidth` every text block in this crate draws with.
-///
-/// 4.0, chosen by the repository owner from a real render after seeing it on a
-/// subtitle. It was 2.0 until then, and briefly 4.0 for subtitles only -- but
-/// that was a distinction with no reason behind it, so there is one value.
-///
-/// Only affects blocks whose `Outline` is not [`OUTLINE_NONE`]; text mode's
+/// The `OutlineWidth` every text block in this crate draws with. Only
+/// affects blocks whose `Outline` is not [`OUTLINE_NONE`]; text mode's
 /// glyph bands draw the picture itself and carry no outline at all.
 pub const DEFAULT_OUTLINE_WIDTH: f32 = 4.0;
 
-/// Half-extent of the anchor cube every text block rides on, in world units.
-///
-/// The cube is a 1x1x1 micro brick, which is 2 world units on a side -- so its
-/// drawing face lies this far from its centre. Renderers that must put a text
-/// block *in front of* a surface rest the cube flush on that surface, i.e. put
-/// its centre one half-extent proud, which leaves the glyphs a full cube clear
-/// of it. Exported so those renderers can do that arithmetic against the real
-/// cube instead of a repeated literal.
+/// Half-extent of the anchor cube every text block rides on, in world
+/// units: a 1x1x1 micro brick is 2 units on a side, so its drawing face
+/// lies this far from its centre. A renderer placing text flush in front of
+/// a surface rests the cube's centre one half-extent proud of it.
 pub const ANCHOR_CUBE_HALF: i32 = 1;
 
 /// The invisible, collision-less anchor cube all text rides on.
@@ -725,39 +708,25 @@ fn anchor_cube(position: Position, visible: bool) -> Brick {
     }
 }
 
-/// Which face of the anchor cube a [`add_text_block`] block draws on. These
-/// are the game's `EBrickDirection` values, which is what the component's
-/// `Face` property is typed as in the save schema -- not an invented encoding.
+/// `EBrickDirection` values for which face of the anchor cube a text block
+/// draws on -- a `TextDisplay` draws in the plane of the face it is given,
+/// so this decides whether the block stands up or lies flat.
 ///
-/// A `TextDisplay` draws in the PLANE of the face it is given, so this is what
-/// decides whether a block stands up or lies flat. [`FACE_X_POSITIVE`] is the
-/// value every text render in this crate has always used (the glyph wall faces
-/// world +X, see [`add_text_tiles`]); [`FACE_Z_POSITIVE`] is the one a
-/// ground-flat screen needs, since such a screen presents its top to the
-/// viewer and a +X block over it would stand edge-on and be unreadable.
-///
-/// `Offset` stays in the component's own frame either way -- X/Y in the plane
-/// of the face, Z out of it (see [`TextOptions::offset_z`]) -- so changing the
-/// face does not change what any of the geometry options mean.
+/// `FACE_X_POSITIVE` is what every text render in this crate has used (the
+/// glyph wall faces world +X); `FACE_Z_POSITIVE` is the upward face, for
+/// text meant to lie flat in the ground plane.
 pub const FACE_X_POSITIVE: u8 = 0;
-/// See [`FACE_X_POSITIVE`]. `EBrickDirection::Z_Positive`: the upward face,
-/// for text meant to lie flat in the ground plane.
 pub const FACE_Z_POSITIVE: u8 = 4;
 
 /// Add a TextDisplay block with explicit geometry (LineHeight/Kerning/Offset)
-/// on an anchor cube. `visible_anchor` shows the cube itself, useful when the
-/// block is meant to be compared against the cube's edges.
+/// on an anchor cube, drawn on [`FACE_X_POSITIVE`]. `visible_anchor` shows
+/// the cube itself, useful when the block is meant to be compared against
+/// the cube's edges.
 ///
-/// `face` is one of [`FACE_X_POSITIVE`] / [`FACE_Z_POSITIVE`] and decides
-/// which plane the glyphs are drawn in -- a caller placing text over a
-/// ground-flat build wants the latter.
-///
-/// Returns the anchor cube's brick id, which is the id a wire endpoint names --
-/// [`crate::anim::subtitle_display`] drives this component's `Text` port from
-/// a microchip, and there is no other way to reach the brick afterwards
-/// (`World::add_brick` consumes it). Callers that only want a static label can
-/// ignore the id; the brick carries one either way, exactly as every brick
-/// [`add_text_tiles`] places already does.
+/// Returns the anchor cube's brick id, which is the id a wire endpoint
+/// names -- `World::add_brick` consumes the brick, so there is no other way
+/// to reach it afterwards. Callers that only want a static label can ignore
+/// the id; the brick carries one either way.
 pub fn add_text_block(
     world: &mut World,
     text: String,
@@ -766,7 +735,6 @@ pub fn add_text_block(
     kerning: f32,
     offset: Vector3f,
     visible_anchor: bool,
-    face: u8,
     opts: &TextOptions,
 ) -> usize {
     add_text_block_styled(
@@ -777,7 +745,7 @@ pub fn add_text_block(
         kerning,
         offset,
         visible_anchor,
-        face,
+        FACE_X_POSITIVE,
         ANCHOR_TOP_LEFT,
         OUTLINE_NONE,
         DEFAULT_OUTLINE_WIDTH,
@@ -785,22 +753,10 @@ pub fn add_text_block(
     )
 }
 
-/// [`add_text_block`] with the two style properties a pixel-art block never
-/// varies made explicit: where in the text block the anchor cube sits
-/// ([`ANCHOR_TOP_LEFT`] / [`ANCHOR_BOTTOM_CENTRE`]) and whether the glyphs carry
-/// an outline ([`OUTLINE_NONE`] / [`OUTLINE_OUTLINED`]).
-///
-/// Everything else is identical, and [`add_text_block`] is exactly this call
-/// with the pixel-art values -- so a glyph band and an annotation keep the
-/// geometry they have always had, and only a caller that asks for a different
-/// anchor or outline gets one. The subtitle
-/// ([`crate::anim::subtitle_display`]) is the one caller that does: it is a
-/// LINE OF TEXT laid over the picture rather than a patch of pixels, so it
-/// centres itself on its cube, grows upward from it, and needs an outline to
-/// stay legible over arbitrary frame content.
-///
-/// `outline` is an `EBRTextOutline` value; `anchor` is the component's own
-/// normalized `Anchor`. Both are documented on their constants.
+/// [`add_text_block`] with the anchor point ([`ANCHOR_TOP_LEFT`] /
+/// [`ANCHOR_BOTTOM_CENTRE`]) and outline ([`OUTLINE_NONE`] /
+/// [`OUTLINE_OUTLINED`]) made explicit, for a caller that draws on a
+/// different face too (`face` is [`FACE_X_POSITIVE`] / [`FACE_Z_POSITIVE`]).
 #[allow(clippy::too_many_arguments)]
 pub fn add_text_block_styled(
     world: &mut World,
@@ -848,12 +804,59 @@ pub fn add_text_block_styled(
     id
 }
 
+/// Build a plain-text `Component_TextDisplay` to ride on another brick (for
+/// example a button), instead of its own anchor cube.
+///
+/// Registers `opts.font` in `world`'s external asset table -- the same step
+/// [`add_text_block_styled`] does -- and returns the component for the caller
+/// to attach with [`Brick::with_component`]. The text draws on `face` at
+/// `anchor`, `line_height` (LineHeight) sized for a label rather than pixel
+/// art, in white with the given outline.
+#[allow(clippy::too_many_arguments)]
+pub fn text_label_component(
+    world: &mut World,
+    text: String,
+    line_height: f32,
+    face: u8,
+    anchor: Vector2f,
+    outline: u8,
+    outline_width: f32,
+    opts: &TextOptions,
+) -> LiteralComponent {
+    let (font_idx, _) = world
+        .global_data
+        .external_asset_references
+        .insert_full(("BrickFontDescriptor".to_string(), opts.font.to_string()));
+    let block_opts = TextOptions {
+        line_height,
+        kerning: 0.0,
+        ..opts.clone()
+    };
+    text_display_component(
+        text,
+        font_idx,
+        Vector3f {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        &block_opts,
+        face,
+        SavedBrickColor {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        },
+        anchor,
+        0,
+        outline,
+        outline_width,
+    )
+}
+
 /// Add a readable TextDisplay label brick (for annotating generated saves) --
 /// plain text at the given LineHeight, not pixel art.
-///
-/// Drawn on [`FACE_X_POSITIVE`], the same upright face every other text
-/// placement in this crate uses, so annotations read the same way they always
-/// have.
 ///
 /// Returns the anchor's brick id, same as [`add_text_block`].
 pub fn add_annotation(
@@ -875,7 +878,6 @@ pub fn add_annotation(
             z: 0.0,
         },
         false,
-        FACE_X_POSITIVE,
         opts,
     )
 }

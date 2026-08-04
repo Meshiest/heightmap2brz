@@ -1,5 +1,5 @@
 //! Colour-array mode: the same screen of display bricks [`super::bricks`]
-//! builds, driven by PIXEL-major linear colour arrays instead of frame-major
+//! builds, driven by pixel-major linear colour arrays instead of frame-major
 //! hex strings.
 //!
 //! This is a sibling of [`super::bricks::build_brick_world`], not a
@@ -27,34 +27,30 @@
 //!
 //! # Exec wiring: fan-out, not a chain
 //!
-//! The `ChangeDetectorExec`'s `OnChanged` output feeds EVERY pixel's
-//! `Get.Exec` directly. It is deliberately not chained
-//! `Get.ExecOut -> Get.Exec` the way [`super::bricks`] chains its handful of
-//! per-chunk gets: at one Get per pixel that chain would be thousands of gates
-//! deep. The repository owner has confirmed exec **fan-out** (one output
-//! driving many exec inputs) is supported and costs the same as a chain.
-//!
-//! Exec **fan-in** (two sources into one exec input) is the thing that is NOT
-//! verified, so this design never requires it -- every `Get.Exec` in the graph
-//! has exactly one source, which
-//! `tests/anim_color.rs::no_exec_input_ever_has_two_sources` pins.
+//! The `ChangeDetectorExec`'s `OnChanged` output feeds every pixel's
+//! `Get.Exec` directly, rather than chaining `Get.ExecOut -> Get.Exec` the
+//! way [`super::bricks`] chains its handful of per-chunk gets (at one Get per
+//! pixel that chain would be thousands of gates deep). Exec fan-out (one
+//! output driving many exec inputs) is supported; exec fan-in (two sources
+//! into one exec input) is not verified, so this design never requires it --
+//! every `Get.Exec` has exactly one source, pinned by
+//! `tests/anim_color.rs::no_exec_input_ever_has_two_sources`.
+use super::cascade;
 use super::chip;
 use super::clock::{self, gate};
 use super::color_pack::{ColorPacker, LinearColor};
+use super::controls;
 use super::layout::{GATE_HALF, STAGE_PITCH, lattice_pos_staged};
 use super::pack;
 use super::subtitle_display;
 // Gate/component names are shared with the hex renderer -- reused, never
 // redefined, so a rename can only ever happen in one place.
-use super::bricks::{
-    ARRAY_GET, ARRAY_VAR, AnimOptions, BRANCH, CHANGE_DETECTOR, COMPARE_GE, PROP_CHANGER, SELECT,
-    SUBTRACT,
-};
+use super::bricks::{ARRAY_GET, ARRAY_VAR, AnimOptions, CHANGE_DETECTOR, PROP_CHANGER, SELECT};
 use crate::progress::{FrameTotal, Progress};
 use crate::video::stream::FrameSource;
 use brdb::{
     AsBrdbValue, WirePort, World,
-    schema::{WireArrayVariant, WireVariant},
+    schema::WireArrayVariant,
 };
 
 /// Lattice stages a single pixel occupies, per bank: its `ArrayVar` and its
@@ -66,9 +62,9 @@ const STAGES_PER_BANK: i32 = 2;
 ///
 /// Signature, streaming contract and cancellation semantics are identical to
 /// [`super::bricks::build_brick_world`] -- including that a cancelled render
-/// returns an EMPTY `Ok(World)` rather than a partial one, that it returns as
+/// returns an empty `Ok(World)` rather than a partial one, that it returns as
 /// soon as it notices (after the decode loop, or at the next pixel once the
-/// build is under way), and that it is still on the CALLER to re-check
+/// build is under way), and that it is still on the caller to re-check
 /// `progress.is_cancelled()` and write nothing when it is true.
 pub fn build_color_array_world(
     source: &dyn FrameSource,
@@ -87,7 +83,7 @@ pub fn build_color_array_world(
     // `build_brick_world`'s call and `FrameTotal`'s doc.
     FrameTotal::new(info.frame_count_hint, source.frame_count_estimate())
         .begin(progress, "packing frames");
-    // The hint is passed through so every pixel's array is reserved EXACTLY
+    // The hint is passed through so every pixel's array is reserved exactly
     // once rather than doubled into place -- which is what makes
     // `accumulator_bytes` (and the memory figure the CLI prints from it) the
     // real peak instead of up to half of it. See `color_pack`'s Memory note.
@@ -114,7 +110,7 @@ pub fn build_color_array_world(
     progress.finish();
     let seen = seen?;
 
-    // CANCELLED: return before anything is built, and ahead of the zero-frame
+    // Cancelled: return before anything is built, and ahead of the zero-frame
     // guard so a cancel is never reported as that error. Same reasoning, in
     // full, on `build_brick_world`.
     if progress.is_cancelled() {
@@ -153,7 +149,7 @@ pub fn build_color_array_world(
     let bank_size = opts.bank_size.max(1);
     let n_banks = frame_count.div_ceil(bank_size).max(1);
 
-    // Service gates sit BEHIND every pixel stage, so the service stage depends
+    // Service gates sit behind every pixel stage, so the service stage depends
     // on how many stages a pixel uses -- unlike the hex path, where the pixel
     // stages are always 0 and 1 and the service stage is always 2.
     //
@@ -166,19 +162,22 @@ pub fn build_color_array_world(
         |col: i32, row: i32| lattice_pos_staged(col, row, service_stage, h, GATE_HALF, STAGE_PITCH);
 
     // --- 3. Frame index source ---------------------------------------------
-    let frame_index = if opts.external_clock {
+    // `control_pins` carries the clock's Pause/Restart/Resume pin ids for the
+    // control buttons below; `None` under `--external-clock` (no timer, no pins).
+    let (frame_index, control_pins) = if opts.external_clock {
         let pin = chip::add_input_pin(&mut chip, "Frame", service(0, -1));
-        chip::pin_source(pin, true)
+        (chip::pin_source(pin, true), None)
     } else {
-        clock::build_clock(
+        let clock = clock::build_clock(
             &mut world,
             &mut chip,
             info.fps,
             frame_count,
             opts.loop_playback,
             service(0, -2),
-        )
-        .frame_index
+        );
+        let pins = (clock.pause_pin, clock.restart_pin, clock.resume_pin);
+        (clock.frame_index, Some(pins))
     };
 
     // --- 4. Exec source -----------------------------------------------------
@@ -194,84 +193,47 @@ pub fn build_color_array_world(
         WirePort::new(detector, CHANGE_DETECTOR, "Input"),
     );
 
-    // --- 5. Per-bank index and boundary comparators -------------------------
-    // Byte-for-byte the same construction as the hex path's: bank 0 reads the
-    // frame index directly, bank k subtracts `k * bank_size`, and `ge[k-1]` is
-    // true once the frame index reaches bank k (which is `Select`'s `bSelectB`
-    // sense -- true picks InputB, the later bank).
-    let mut index_of_bank = Vec::with_capacity(n_banks);
-    index_of_bank.push(frame_index.clone());
-    for k in 1..n_banks {
-        let sub = gate(&mut chip, "B_1x1_Gate_Expr_MathSubtract", SUBTRACT,
-            service(k as i32, -6), vec![(
-                "InputB",
-                Box::new(WireVariant::Number((k * bank_size) as f64)) as Box<dyn AsBrdbValue>,
-            )]);
-        world.add_wire_connection(frame_index.clone(), WirePort::new(sub, SUBTRACT, "InputA"));
-        index_of_bank.push(WirePort::new(sub, SUBTRACT, "Output"));
-    }
-
-    let mut ge = Vec::with_capacity(n_banks.saturating_sub(1));
-    for k in 1..n_banks {
-        let cmp = gate(&mut chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE,
-            service(k as i32, -7), vec![(
-                "InputB",
-                Box::new(WireVariant::Int((k * bank_size) as i64)) as Box<dyn AsBrdbValue>,
-            )]);
-        world.add_wire_connection(frame_index.clone(), WirePort::new(cmp, COMPARE_GE, "InputA"));
-        ge.push(WirePort::new(cmp, COMPARE_GE, "bOutput"));
-    }
-
-    // --- 6. Exec entry per bank ---------------------------------------------
-    // Branches cascade at the FRONT so exactly one bank's gets run and no exec
-    // input ever takes two sources -- the same reasoning (and the same
-    // ExecOutA = keep descending / ExecOutB = this bank polarity) as the hex
-    // path. What differs is what happens at the entry: hex threads it through
-    // a per-chunk chain, this fans it straight out to every pixel's Get.
+    // --- 5. Per-bank index, boundary comparators and exec entry -------------
+    // The shared per-bank spine (see `cascade`): bank 0 reads the frame index
+    // directly, bank k subtracts `k * bank_size`, `ge[k-1]` is true once the
+    // frame index reaches bank k (`Select`'s `bSelectB` sense), and the branch
+    // cascade at the front keeps exactly one bank's gets running. What differs
+    // is what happens at the entry: hex threads it through a per-chunk chain,
+    // this fans it straight out to every pixel's Get.
     //
-    // With n_banks == 1 this emits no branch at all and `entry_of_bank[0]` is
+    // With n_banks == 1 this emits no gate at all and `entry_of_bank[0]` is
     // simply the detector's `OnChanged`.
-    let mut entry_of_bank = Vec::with_capacity(n_banks);
-    let mut exec_src = WirePort::new(detector, CHANGE_DETECTOR, "OnChanged");
-    for bi in 0..n_banks {
-        if bi + 1 < n_banks {
-            let br = gate(&mut chip, "B_1x1_Gate_Exec_Branch", BRANCH,
-                service(bi as i32, -8), vec![]);
-            world.add_wire_connection(ge[bi].clone(), WirePort::new(br, BRANCH, "bCond"));
-            world.add_wire_connection(exec_src, WirePort::new(br, BRANCH, "Exec"));
-            // true -> keep descending; false -> this bank
-            exec_src = WirePort::new(br, BRANCH, "ExecOutA");
-            entry_of_bank.push(WirePort::new(br, BRANCH, "ExecOutB"));
-        } else {
-            entry_of_bank.push(exec_src.clone());
-        }
-    }
+    let cascade::BankCascade { index_of_bank, ge, entry_of_bank } = cascade::bank_cascade(
+        &mut world,
+        &mut chip,
+        &frame_index,
+        WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"),
+        n_banks,
+        bank_size,
+        &service,
+    );
 
     // --- 7. Two gates per surviving pixel, per bank -------------------------
     //
-    // COST NOTE, deliberately recorded here: a bank boundary is far more
-    // expensive in this mode than in hex mode. Hex mode pays one extra
-    // ArrayVar + Get + Select per CHUNK per boundary (a 64x36 screen is 2
-    // chunks); this pays one extra ArrayVar + Get + Select per PIXEL per
-    // boundary (2304 of them for that same screen) -- roughly a thousandfold
-    // more gates at every seam, because the arrays are pixel-major and each
-    // one has to be split independently.
+    // Cost note: a bank boundary is far more expensive in this mode than in
+    // hex mode. Hex mode pays one extra ArrayVar + Get + Select per chunk per
+    // boundary (a 64x36 screen is 2 chunks); this pays one extra ArrayVar +
+    // Get + Select per pixel per boundary (2304 of them for that same
+    // screen), since the arrays are pixel-major and each has to be split
+    // independently. It only bites past `BANK_FRAMES` (65 535) frames
+    // (about 90 minutes at 12 fps); below that there is one bank and the two
+    // modes cost the same 2 components per pixel.
     //
-    // It only bites past `BANK_FRAMES` (65 535) frames, which is about 90
-    // minutes at 12 fps, so no ordinary render ever reaches it. Below that
-    // there is exactly one bank, no comparators, no branches and no selects at
-    // all, and the two modes cost the same 2 components per pixel.
-    //
-    // Walked in row-major pixel order, NOT by iterating `brick_of` -- a
+    // Walked in row-major pixel order, not by iterating `brick_of` -- a
     // `HashMap`'s iteration order is unspecified and would mint gate brick
     // ids in a different order on every run, making two renders of the same
     // clip differ byte for byte for no reason.
     for idx in 0..(w * h) as usize {
         // Polled per pixel, for the reason spelled out on `build_brick_world`'s
         // matching loop -- and this mode needs it more, not less: every pixel
-        // here owns an `ArrayVar` holding its colour for the WHOLE clip, so a
-        // pixel costs a `frames.to_vec()` of the entire track on top of its two
-        // gates.
+        // here owns an `ArrayVar` holding its colour for the whole clip, so a
+        // pixel costs a `frames.to_vec()` of the entire track on top of its
+        // two gates.
         if progress.is_cancelled() {
             return Ok(World::new());
         }
@@ -316,7 +278,7 @@ pub fn build_color_array_world(
                 index_of_bank[bi].clone(),
                 WirePort::new(get, ARRAY_GET, "Index"),
             );
-            // THE FAN-OUT. One exec source drives every pixel's Get for this
+            // The fan-out: one exec source drives every pixel's Get for this
             // bank; no chaining, and no exec input ever gains a second source.
             world.add_wire_connection(
                 entry_of_bank[bi].clone(),
@@ -354,7 +316,7 @@ pub fn build_color_array_world(
         }
 
         // Straight into the display brick's colour. No Substring, no
-        // MakeColorHex: the array element already IS a linear colour.
+        // MakeColorHex: the array element already is a linear colour.
         world.add_wire_connection(value, WirePort::new(brick_id, PROP_CHANGER, "Color"));
     }
 
@@ -364,7 +326,7 @@ pub fn build_color_array_world(
     // for why the ordering matters -- and gated on `opts.subtitles`, so a
     // render without a track is exactly the graph it is today.
     if let Some(subs) = &opts.subtitles {
-        // `opts.source_start_s`, NOT 0.0: a subtitle file is in SOURCE time,
+        // `opts.source_start_s`, not 0.0: a subtitle file is in source time,
         // and frame 0 of what this renderer receives is at source time
         // `--start` (see `AnimOptions::source_start_s`). Timing the cues from
         // zero puts the whole track `--start` seconds early.
@@ -382,6 +344,16 @@ pub fn build_color_array_world(
             opts,
             super::bricks::subtitle_extent(&geometry, w, h, opts.subtitle_lift)?,
         )?;
+    }
+
+    // --- 7c. Control buttons ------------------------------------------------
+    //
+    // Same as the hex renderer's step 6c: default-on physical buttons wired into
+    // the clock's control pins, skipped under `--external-clock` and when off.
+    // Before `chip::finish` (its overlap check must see them) and register.
+    if let (true, Some((pause, restart, resume))) = (opts.control_buttons, control_pins) {
+        let anchor = controls::control_anchor(&world);
+        controls::add_control_buttons(&mut world, pause, restart, resume, anchor);
     }
 
     // --- 8. Publish ---------------------------------------------------------
@@ -410,17 +382,11 @@ pub fn array_elements(pixels: usize, frames: usize) -> usize {
 }
 
 /// Host bytes the accumulator retains at peak: 16 per element (four `f32`).
-/// See [`super::color_pack`]'s memory note -- this is ~2.7x hex mode's 6 bytes
-/// per pixel per frame, and it is the figure that decides whether a long
-/// render is feasible on a given machine.
-///
-/// **Exact, not a bound -- but only because [`ColorPacker::new`] reserves each
-/// pixel's array exactly.** This same expression used to be printed by the CLI
-/// against an accumulator built from unreserved `Vec`s, where Rust's growth
-/// doubling meant the process actually held
-/// [`unreserved_accumulator_bytes`] -- up to 2x more than the number the user
-/// was shown before committing to the render. The reservation is what closed
-/// that gap; if it is ever removed, this function is wrong again.
+/// See [`super::color_pack`]'s memory note for the full accounting -- this is
+/// the figure that decides whether a long render is feasible on a given
+/// machine, exact rather than a bound only because [`ColorPacker::new`]
+/// reserves each pixel's array exactly. If that reservation is ever removed,
+/// this function is wrong again (see [`unreserved_accumulator_bytes`]).
 pub fn accumulator_bytes(pixels: usize, frames: usize) -> usize {
     array_elements(pixels, frames) * std::mem::size_of::<LinearColor>()
 }
@@ -484,11 +450,9 @@ mod tests {
 
     /// The same regression this mode's sibling carries (see
     /// `bricks::tests::a_cancel_while_packing_builds_no_graph_at_all`): a
-    /// cancel that only stopped the decode left the ENTIRE build to run over
-    /// the frames already packed. It costs more here than anywhere -- this
-    /// mode gives every pixel its own whole-clip colour array -- so the
-    /// no-build guarantee is pinned in this module too, not inherited by
-    /// assumption from a shared comment.
+    /// cancel that only stopped the decode would leave the whole build to run
+    /// over the frames already packed. Costs more here, since this mode gives
+    /// every pixel its own whole-clip colour array.
     #[test]
     fn a_cancel_while_packing_builds_no_graph_at_all() {
         const TOTAL_FRAMES: usize = 120;
@@ -503,7 +467,7 @@ mod tests {
             build_color_array_world(&clip, &AnimOptions::default(), &mut ran).expect("build");
         assert!(
             !full.bricks.is_empty() && !full.wires.is_empty() && !full.grids.is_empty(),
-            "the uncancelled control must actually build a graph, or this test proves nothing"
+            "the uncancelled control must actually build a graph"
         );
 
         assert!(cancelled.is_cancelled(), "the reporter must really have flagged cancellation");
@@ -529,21 +493,11 @@ mod tests {
         );
     }
 
-    /// **The figure the CLI prints must be the memory the process actually
-    /// holds.**
-    ///
-    /// `accumulator_bytes` says `pixels * frames * 16`, and it was printed for
-    /// a long time against an accumulator built from unreserved `Vec`s, where
-    /// Rust's growth doubling means what is really retained is
-    /// `pixels * next_power_of_two(frames) * 16`. At 128x72 over 40,000 frames
-    /// that gap is 5.90 GB reported against 9.66 GB held -- the difference,
-    /// on a 16 GB machine, between a render that fits and one that gets
-    /// OOM-killed an hour in, after the user was shown a number saying it
-    /// would fit.
-    ///
-    /// So this measures the real capacity of a packed pixel's array. It is the
-    /// reservation in `ColorPacker::new` that closes the gap; without it this
-    /// reads `next_power_of_two`.
+    /// `accumulator_bytes` (`pixels * frames * 16`) must equal the memory the
+    /// process actually holds, not what an unreserved `Vec` would grow to
+    /// (`next_power_of_two(frames)`). This measures the real capacity of a
+    /// packed pixel's array; it is the reservation in `ColorPacker::new` that
+    /// closes the gap.
     #[test]
     fn the_reservation_is_what_makes_the_memory_figure_true() {
         // A frame count deliberately just past a power of two -- the worst
@@ -565,7 +519,7 @@ mod tests {
                 assert_eq!(
                     p.capacity(),
                     frames,
-                    "pixel {i}: {frames} frames must occupy EXACTLY {frames} slots -- \
+                    "pixel {i}: {frames} frames must occupy exactly {frames} slots -- \
                      a capacity of {} is the growth-doubling slack accumulator_bytes \
                      does not report",
                     p.capacity()
@@ -600,8 +554,7 @@ mod tests {
         );
         assert!(
             held > accumulator_bytes(4, FRAMES),
-            "17 frames doubling to 32 must cost strictly more than 17 frames reserved -- \
-             otherwise this test is not measuring the doubling at all"
+            "17 frames doubling to 32 must cost strictly more than 17 frames reserved"
         );
         // The exact worst case the doc quotes: one past a power of two.
         assert_eq!(unreserved_accumulator_bytes(1, 32_769), 65_536 * 16);
@@ -618,7 +571,7 @@ mod tests {
         assert_eq!(STAGES_PER_BANK * n_banks as i32 + boundaries, 2);
     }
 
-    /// Service gates must sit strictly BEHIND every pixel stage, or they can
+    /// Service gates must sit strictly behind every pixel stage, or they can
     /// collide with the deepest pixel gates. The deepest pixel stage is the
     /// last Select's.
     #[test]

@@ -155,14 +155,10 @@ impl FrameStream for ResizeStream<'_> {
 
 /// The error [`FpsStream`] produces when a render would exceed `max_frames`.
 ///
-/// Shared rather than inlined so a caller that must decide *before* opening
-/// the stream whether the budget will blow -- the CLI, which cannot print a
-/// cost line for a render it is about to refuse -- reports the identical
-/// wording. Two hand-written copies would drift, and the tests asserting on
-/// this text would then only pin one of them.
-///
-/// Phrased as "more than N" on purpose: the true total is never counted
-/// (both the stream and the CLI's pre-check stop as soon as the budget is
+/// Shared rather than inlined so the CLI's pre-flight budget check (which
+/// must refuse before opening the stream) reports identical wording rather
+/// than a second hand-written copy that could drift. Phrased as "more than
+/// N": the true total is never counted (both stop as soon as the budget is
 /// known to be blown), so the message must not claim a number it never
 /// measured.
 pub fn max_frames_error(max_frames: usize) -> String {
@@ -172,47 +168,21 @@ pub fn max_frames_error(max_frames: usize) -> String {
     )
 }
 
-/// How many frames an [`FpsStream`] over a `source_frames`-long source would
-/// emit, without decoding or holding any of them.
+/// Frame count an [`FpsStream`] would emit over a `source_frames`-long
+/// source, computed by running the SAME per-iteration `t` recurrence
+/// `FpsStream::next` does (a closed-form `ceil()` drifts +/-1 from it in
+/// `f32` on a measurable fraction of inputs -- equal over the reals, not
+/// once rounded). Bounded by `max_frames`, matching where `FpsStream` itself
+/// would error rather than finish counting; returns 0 for a degenerate rate
+/// rather than erroring (`FpsStream::new` rejects those; this is only ever a
+/// sizing hint ahead of that).
 ///
-/// `AdaptedSource::info`'s `frame_count_hint` is deliberately `None` once the
-/// rate changes, because a *stream* cannot know its own length. A caller that
-/// already holds the whole source, though, knows the source length, and every
-/// other input is a scalar -- so the count is computable up front, and the CLI
-/// needs it to size a cost estimate and to refuse an over-budget render before
-/// printing anything about it.
-///
-/// This must agree with `FpsStream` exactly, not approximately: it decides
-/// whether the CLI errors, so a count one too high would refuse a render the
-/// stream would have completed, and a count one too low would print a cost
-/// line the render then contradicts. A PREVIOUS version computed this in
-/// closed form (`ceil((end_time - start_s) * target_fps)`). That drifted by
-/// exactly +/-1 from `FpsStream`'s real output on a measurable fraction of
-/// inputs: the closed form and `FpsStream`'s own per-iteration accumulation
-/// (`t = start_s + i / target_fps`, one `i` at a time) are equal over the
-/// reals but round differently in `f32`, so a single `ceil()` cannot be
-/// trusted to reproduce a loop. The fix is to stop approximating and instead
-/// run the SAME recurrence `FpsStream::next` does -- just the `t`/"is this
-/// still due" half of it, since the other half (`want`/`held`, which source
-/// frame gets repeated) affects frame *content*, never the *count*.
+/// Must agree with `FpsStream` exactly, not approximately: the CLI uses it
+/// to refuse an over-budget render before printing anything, so a count one
+/// too high refuses a render that would have worked, and one too low prints
+/// a cost line the render then contradicts.
 /// `estimated_frame_count_matches_fps_stream_over_thousands_of_configs` pins
-/// the two together over a broad sweep, generated rather than hand-picked so
-/// it cannot share a blind spot with the implementation.
-///
-/// `max_frames` bounds the loop the same way it bounds `FpsStream`: a
-/// pathological `target_fps` (say, 1e9) paired with a long window must not
-/// spin for as many iterations as `FpsStream` would need before erroring.
-/// Once the running count is already over `max_frames`, `FpsStream` itself
-/// never learns the true eventual total either -- it errors right there
-/// instead of finishing the count -- so this stops at the same point and
-/// returns whatever count it has, which is already `> max_frames`. Every
-/// caller only ever asks "is the estimate over budget?" (`est > max_frames`),
-/// and that comparison comes out identical whether the returned number is the
-/// exact total (when under budget) or merely SOME number past the cap (when
-/// over it).
-///
-/// Returns 0 for a degenerate rate rather than erroring; `FpsStream::new`
-/// rejects those, and this is only ever a sizing hint ahead of that.
+/// the two together over a generated sweep.
 pub fn estimated_frame_count(
     source_frames: usize,
     source_fps: f32,
@@ -330,23 +300,15 @@ impl<'a> FpsStream<'a> {
 
     /// Pull source frames until `want` has been read, holding the last.
     ///
-    /// Returns false only when the source yielded NOTHING AT ALL -- a genuine
-    /// end of stream. Running past the last index is not that: `resample_fps`
-    /// clamps its index with `.clamp(0, n - 1)`, so an upsample whose output
-    /// time still falls inside the source repeats the final frame. Collapsing
-    /// the two cases into one "false" silently truncated every upsample whose
-    /// target rate did not evenly divide the clip.
+    /// Returns false only when the source yielded nothing at all -- a
+    /// genuine end of stream. Running past the last index is not that:
+    /// `resample_fps` clamps its index, so an upsample whose output time
+    /// still falls inside the source repeats the final frame instead.
     ///
-    /// Expressed as ONE [`FrameStream::advance`] call rather than a `next()`
-    /// loop, because the frames strictly between `pulled` and `want` are
-    /// passed over: nothing ever looks at them. `advance`'s default body is
-    /// that same `next()` loop, so this is unchanged for any stream that
-    /// does not override it; the streams that do (`ResizeStream` above, the
-    /// builtin decoder's own) skip the per-frame work for the ones being
-    /// passed over. The bookkeeping below reproduces the old loop exactly:
-    /// `held` becomes the last frame actually pulled (unchanged when none
-    /// were), `pulled` advances by however many were read, and a short read
-    /// is the drain that fixes `source_end`.
+    /// One [`FrameStream::advance`] call, not a `next()` loop, so a stream
+    /// that overrides `advance` (`ResizeStream` above, the builtin decoder's
+    /// own) skips per-frame work for the frames strictly between `pulled`
+    /// and `want`, which nothing ever looks at.
     fn advance_to(&mut self, want: usize) -> Result<bool, String> {
         if self.pulled > want {
             // The old `while` loop's condition, false on entry: already past
@@ -385,23 +347,16 @@ impl FrameStream for FpsStream<'_> {
             self.done = true;
             return Ok(None);
         }
-        // `advance_to` may have just learned the source's length. Re-test:
-        // `resample_fps` compares against an `end_time` already capped at
-        // the source duration, and this is the first moment that number
-        // exists. Skipping this would emit one frame past the source's end.
+        // `advance_to` may have just learned the source's length; re-test so
+        // this doesn't emit one frame past the source's end.
         if self.past_end(t) {
             self.done = true;
             return Ok(None);
         }
-        // A frame is genuinely due -- inside the window, inside the source --
-        // and the budget is already full, so the true total is *more than*
-        // max_frames. `resample_fps` breaks out of its index loop at exactly
-        // this point, without measuring how much more, and the message says
-        // so rather than claiming a number it never counted. The check sits
-        // after the two bounds above for the same reason it sits after
-        // `t >= end_time` there: a frame that was never due must not be
-        // charged against the budget, or a request that exactly fills it
-        // would error where `resample_fps` succeeds.
+        // A frame is genuinely due and the budget is already full, so the
+        // true total is more than max_frames. Checked after the two bounds
+        // above so a frame that was never due isn't charged against the
+        // budget -- a request that exactly fills it must not error.
         if self.emitted >= self.max_frames {
             self.done = true;
             return Err(max_frames_error(self.max_frames));
@@ -927,25 +882,14 @@ mod tests {
         assert!(drain(Box::new(s)).is_err(), "one over the budget must error");
     }
 
-    /// `estimated_frame_count` decides whether the CLI refuses a render
-    /// before printing anything about it, so it has to equal what the stream
-    /// actually emits -- not approximate it. One too high refuses a render
-    /// that would have worked; one too low prints a cost line the render then
-    /// contradicts.
-    ///
-    /// A hand-picked set of ~20 configurations used to stand here. It missed
-    /// an entire class of defect: a closed-form `ceil()` implementation
-    /// disagreed with `FpsStream`'s real, per-iteration output by +/-1 on
-    /// thousands of inputs out of a measured 247,520-configuration sweep
-    /// (4,669 over-estimates, 50 under-estimates), and every one of the 20
-    /// hand-picked cases happened to land on a value where the two agreed.
-    /// This sweep is generated instead of hand-picked -- every combination of
-    /// frame count, source rate, target rate, start offset and duration
-    /// below, several thousand in total -- specifically so it cannot share a
-    /// blind spot with whatever the implementation happens to get right by
-    /// hand. It reproduces (and would have caught) the closed-form bug: with
-    /// the previous implementation this test fails; against the per-iteration
-    /// implementation it passes.
+    /// `estimated_frame_count` must equal what the stream actually emits,
+    /// not approximate it -- it decides whether the CLI refuses a render
+    /// before printing anything about it. Every combination of frame count,
+    /// source rate, target rate, start offset and duration below is swept
+    /// (generated, not hand-picked, so it cannot share a blind spot with the
+    /// implementation) rather than a small hand-picked set, which is what
+    /// missed the closed-form `ceil()` implementation's +/-1 drift this test
+    /// now pins against.
     #[test]
     fn estimated_frame_count_matches_fps_stream_over_thousands_of_configs() {
         let frame_counts = [0usize, 1, 2, 3, 5, 8, 13, 21];

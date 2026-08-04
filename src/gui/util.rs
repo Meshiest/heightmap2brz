@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     map::{Colormap, ColormapPNG, Heightmap, HeightmapFlat, HeightmapPNG},
@@ -11,34 +12,14 @@ use poll_promise::Promise;
 
 type MapPair = (Box<dyn Heightmap>, Box<dyn Colormap>);
 
-/// A two-column settings grid whose cells WRAP instead of widening the pane.
-///
-/// `Grid::max_col_width` is doing two separate jobs here, and the second one is
-/// the reason this helper exists at all:
-///
-/// 1. It caps how far one cell can push the pane out.
-/// 2. It is the ONLY switch that turns text wrapping on inside grid cells.
-///    `GridLayout::wrap_text()` is literally `max_cell_size.x.is_finite()`, and
-///    `Ui::wrap_mode` consults it for every cell -- so a grid *without* a max
-///    column width puts every label in `TextWrapMode::Extend`, and one long
-///    annotation ("(Pitch-Per-Speaker only -- ...)") drags a horizontal
-///    scrollbar across the entire window.
-///
-/// `num_columns(2)` is what keeps the cap from wasting space: it marks column 1
-/// as the last one, which egui then sizes to the width actually left over
-/// rather than to the same bound as column 0.
-///
-/// **Do not reach for `horizontal_wrapped` inside one of these cells.** A
-/// wrapping horizontal layout reports a height short of what it drew, and the
-/// grid then places the next row on top of it -- measured at every window
-/// width, in both panes, on every row that tried it. Long text inside a cell
-/// goes through [`note`], which wraps at the widget rather than at the layout
-/// and so allocates the rect it actually used; text too long for what is left
-/// beside a control gets a row of its own instead.
+/// Two-column settings grid. `max_col_width` is load-bearing: it is the only
+/// switch that turns on text wrapping inside grid cells, so without it a long
+/// label forces a horizontal scrollbar. Don't use `horizontal_wrapped` in a
+/// cell -- it under-reports its height and the next row draws on top; long
+/// text should go through [`note`] instead.
 pub fn settings_grid(ui: &egui::Ui, id: &str) -> egui::Grid {
-    // Generous, because the *label* column is always short: the cap exists to
-    // stop the long annotations in column 1 from running off the edge, and
-    // column 1 is sized from the real remaining width anyway (see above).
+    // Label column is short; the cap only stops column 1's long annotations
+    // from pushing the pane wide.
     let max_col_width = (ui.available_width() - 60.0).max(160.0);
     egui::Grid::new(id)
         .striped(true)
@@ -48,68 +29,31 @@ pub fn settings_grid(ui: &egui::Ui, id: &str) -> egui::Grid {
         .max_col_width(max_col_width)
 }
 
-/// Width reserved for the label column of every [`settings_grid`].
-///
-/// **This is what makes separate sections line up with each other.** Each
-/// accordion section owns its own `egui::Grid` (it has to -- a grid cannot span
-/// a collapsing body), and a grid sizes column 1 to ITS OWN widest label. Left
-/// alone, "Analysis" and "Levels" put their controls at two different x
-/// positions and the pane reads as several unrelated tables stacked up. Pinning
-/// a floor that no single label reaches makes column 1 the same width in every
-/// section of both panes, so column 2 starts at one x throughout.
-///
-/// Chosen to clear the longest label in either pane ("Save Destination" at
-/// about 97 points, "Alpha Threshold") while still leaving the widest ROW --
-/// the video pane's two size sliders -- room inside a 520 point window. Both
-/// ends of that are tested: `tests/gui_accordion.rs` asserts no label outgrows
-/// this, and separately that nothing overflows the pane at 520. It is in
-/// POINTS, so it scales with the user's zoom exactly as the text does.
-///
-/// A label longer than this is not a disaster -- that one grid's column simply
-/// grows, and only that section falls out of line -- but it will be a test
-/// failure naming the label rather than something discovered by eye.
+/// Floor so every section's own Grid sizes column 1 identically (a grid can't
+/// span a collapsing body). `tests/gui_accordion.rs` asserts no label outgrows
+/// it.
 pub const LABEL_COLUMN_WIDTH: f32 = 112.0;
 
-/// Pin a pane to the width it was handed, and make text wrap to it by default.
-///
-/// Called once at the top of a pane's `draw`. Two guarantees, both of which the
-/// panes depend on and neither of which a pane can establish row by row:
-///
-/// - `set_max_width` fixes the pane's `max_rect` to the width actually
-///   available, so nothing downstream can lay out against an unbounded region
-///   and get clipped at the window edge instead of wrapping.
-/// - `style.wrap_mode` is the FIRST thing `Ui::wrap_mode` consults, ahead of
-///   the grid and layout fallbacks that otherwise resolve to
-///   `TextWrapMode::Extend` inside a `horizontal` or an unbounded grid cell.
-///   Setting it here means a label wraps unless a widget deliberately opts out.
+/// Pin a pane to the width it was handed and make text wrap by default.
+/// Called once at the top of a pane's `draw`: `style.wrap_mode` is the first
+/// thing `Ui::wrap_mode` consults, ahead of the fallbacks that otherwise
+/// resolve to `TextWrapMode::Extend` in a `horizontal` or unbounded grid cell.
 pub fn bound_pane_width(ui: &mut egui::Ui) {
     ui.set_max_width(ui.available_width());
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
 }
 
-/// Wrap a long label so it folds inside its parent instead of running past the
-/// edge and being clipped.
-///
-/// `Ui::wrap_mode` resolves to `Extend` in a plain `ui.horizontal(..)`, which is
-/// what every "(Pitch-Per-Speaker only -- ...)" annotation sits in. Asking for
-/// wrapping on the widget itself is independent of the parent's layout, and --
-/// unlike `horizontal_wrapped` -- a `Label` allocates its own exact (already
-/// wrapped) rect, so an `egui::Grid` measures the row height correctly.
+/// Wrap a long label so it folds instead of getting clipped. Unlike
+/// `horizontal_wrapped`, a `Label` allocates its own already-wrapped rect, so
+/// a `Grid` measures the row height correctly.
 pub fn note(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
     ui.add(egui::Label::new(text.into()).wrap())
 }
 
-/// A small rounded badge for ONE value in an accordion header.
-///
-/// Every colour comes out of the current visuals rather than being hard-coded,
-/// so a chip follows a light/dark theme switch like the rest of the widgets.
-/// The foreground is `strong_text_color` rather than the weak/label colour: a
-/// chip is read AT A GLANCE against a filled background, and the muted colour
-/// that suits body text washes out on top of one.
-///
-/// The vertical inner margin is deliberately 0 -- with `RichText::small` the
-/// glyphs are already shorter than a normal row, so any vertical padding at all
-/// makes the header taller than a plain text header would be.
+/// A small rounded badge for one value in an accordion header. Uses
+/// `strong_text_color` (not the muted label colour) since it's read against a
+/// filled background; zero vertical margin since `RichText::small` is already
+/// shorter than a normal row.
 pub fn chip(ui: &mut egui::Ui, text: &str) -> egui::Response {
     let (fill, stroke, text_color) = {
         let w = ui.visuals().widgets.inactive;
@@ -134,25 +78,11 @@ pub fn chip(ui: &mut egui::Ui, text: &str) -> egui::Response {
         .response
 }
 
-/// One collapsible block of advanced settings, headed by a name and a row of
-/// value [`chip`]s.
-///
-/// **Built on `CollapsingState` rather than `CollapsingHeader` for two
-/// reasons.** A `CollapsingHeader` takes only text, and it lays that text out
-/// with `TextWrapMode::Extend` hard-coded -- so a summary long enough to be
-/// worth reading pushes the pane wider than the window. A custom header can
-/// hold real widgets and put them in a `horizontal_wrapped`, which folds the
-/// chips onto a second line instead.
-///
-/// `id_salt` is NOT optional. The chips change as the user drags a slider, and
-/// a header that derived its id from its own contents would mint a new id on
-/// every change and forget whether it was open.
-///
-/// `open_by_default` only decides the FIRST frame the section is ever drawn;
-/// after that egui remembers what the user did with it. It is set from "does
-/// this section hold a non-default value", so a pane that starts on tuned
-/// settings does not hide them. The chips are what carry that information
-/// afterwards, which is why they are values and not a bare noun.
+/// One collapsible block of settings: a name plus a row of value [`chip`]s.
+/// Custom header (not `CollapsingHeader`) so long chips wrap to a second line
+/// instead of widening the pane. `id_salt` must be stable across chip
+/// changes, or the header forgets whether it was open. `open_by_default`
+/// only applies the first frame; egui remembers user toggles after that.
 pub fn section(
     ui: &mut egui::Ui,
     id_salt: &str,
@@ -162,26 +92,10 @@ pub fn section(
     body: impl FnOnce(&mut egui::Ui),
 ) {
     let id = ui.make_persistent_id(id_salt);
-    // The WHOLE header row toggles, not just the little triangle. Three things
-    // have to be true at once for that, and each was verified by driving real
-    // pointer events at the title, at a chip, at the empty space to their
-    // right, and at the arrow -- opening AND closing on every one:
-    //
-    // 1. `toggle()`, not `set_open(true)`. Anything that only ever opens gives
-    //    a header that will not collapse again.
-    // 2. **The title and the chips must not sense clicks.** `egui`'s
-    //    `Interaction::selectable_labels` defaults to ON, so a plain
-    //    `ui.label` is a click-sensing widget (for text selection), and it wins
-    //    the hit-test over the row underneath it -- the row reported
-    //    `contains_pointer: true` with `hovered: false` and never fired. They
-    //    are drawn with `.selectable(false)` so clicks fall through to the row,
-    //    which is also why the click sense lives on the ROW and not on the
-    //    title: one clickable widget, not two firing on the same press.
-    // 3. The row has to REACH the empty space. A row is only as wide as its
-    //    content (a stock `CollapsingHeader` has the same limitation), so a
-    //    click to the right of the last chip would otherwise hit nothing. The
-    //    fix widens the INTERACTION rect only -- see below for why it must not
-    //    be an allocation.
+    // Whole row toggles. selectable_labels defaults ON, so a plain label
+    // wins the hit-test over the row; title+chips use .selectable(false).
+    // The interaction rect is widened, never allocated: a zero-height
+    // wrapped item still costs one item_spacing.y.
     let mut row_clicked = false;
     let mut header = egui::collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
@@ -195,13 +109,6 @@ pub fn section(
                 chip(ui, c);
             }
         });
-        // Point 3. **Interaction only: do NOT allocate space to widen this.**
-        // A zero-height `allocate_exact_size(available_width)` looks free and
-        // is not -- this is a `main_wrap` layout, an exact fit is allowed to
-        // spill onto the next line, and a wrapped zero-height item still costs
-        // a full `item_spacing.y`. That put a blank line under every collapsed
-        // header. Overriding the hit rect instead leaves the layout untouched
-        // by construction: no widget is added, so there is no spacing to pay.
         let mut hit = row.response.rect;
         hit.max.x = hit.max.x.max(ui.max_rect().right());
         row_clicked = ui
@@ -260,15 +167,9 @@ pub fn pick_images(multiple: bool) -> Promise<Vec<PickedImage>> {
     }
 }
 
-/// Pick a single file's raw bytes, without any image decode.
-///
-/// `pick_images` decodes eagerly via `image::load_from_memory(...).to_rgba8()`,
-/// which keeps only the first frame of a GIF/APNG/animated-WebP and throws the
-/// original bytes away. `video::source::decode_animated` needs every byte to
-/// recover every frame, so this hands them over untouched instead.
-///
-/// `None` if the user cancels the dialog. Poll the returned promise each
-/// frame, same as [`pick_images`].
+/// Pick a single file's raw bytes, without any image decode -- unlike
+/// `pick_images`, which decodes eagerly and keeps only the first frame of an
+/// animated image. `None` if the user cancels.
 pub fn pick_animated_bytes() -> Promise<Option<(String, Vec<u8>)>> {
     let dialog = rfd::AsyncFileDialog::new()
         .add_filter("Animated Images", &["gif", "png", "webp", "jpg", "jpeg"]);
@@ -288,15 +189,9 @@ pub fn pick_animated_bytes() -> Promise<Option<(String, Vec<u8>)>> {
     }
 }
 
-/// Pick a subtitle file's raw bytes and name.
-///
-/// BYTES, not a path, and so available on the web too: a subtitle file is
-/// kilobytes and is parsed in one pass, with nothing to stream -- the opposite
-/// of [`pick_video_path`]'s case. The NAME comes back alongside them because
-/// its extension is what picks the parser (`subs::parse_auto`), and a browser
-/// file handle has no path to recover it from afterwards.
-///
-/// `None` if the user cancels the dialog.
+/// Pick a subtitle file's raw bytes and name -- bytes rather than a path so it
+/// works on the web too; the name comes along since its extension picks the
+/// parser (`subs::parse_auto`). `None` if the user cancels.
 pub fn pick_subtitle_bytes() -> Promise<Option<(String, Vec<u8>)>> {
     let dialog =
         rfd::AsyncFileDialog::new().add_filter("Subtitle Files", &["srt", "ass", "ssa", "vtt"]);
@@ -316,15 +211,9 @@ pub fn pick_subtitle_bytes() -> Promise<Option<(String, Vec<u8>)>> {
     }
 }
 
-/// Pick a video file, returning its PATH rather than its bytes.
-///
-/// Deliberately not `pick_animated_bytes`'s shape: that reads the whole file
-/// into memory, and reading a 650 MB mp4 up front is exactly what the decode
-/// backends exist to avoid. The backends open the path and stream from it.
-///
-/// The filter is only offered on targets where a backend can actually decode
-/// these formats. A picker that accepts a file the tool then refuses is worse
-/// than one that never offered it.
+/// Pick a video file, returning its path rather than its bytes: the decode
+/// backends stream from a path instead of reading a multi-hundred-MB file
+/// into memory up front. Native only, since a browser file handle has no path.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn pick_video_path() -> Promise<Option<std::path::PathBuf>> {
     let dialog = rfd::AsyncFileDialog::new()
@@ -336,20 +225,10 @@ pub fn pick_video_path() -> Promise<Option<std::path::PathBuf>> {
     Promise::spawn_thread("pick_video_path", move || pollster::block_on(pick))
 }
 
-/// Pick an audio file -- or a video container to pull an audio track out of --
-/// returning its PATH.
-///
-/// A path, not bytes, for [`pick_video_path`]'s reason and one more of its
-/// own: `audio::symphonia_src::SymphoniaSource::open_path` and the ffmpeg
-/// audio source both take a path and stream from it, and a song is decoded
-/// twice (once to find the normalisation peak, once to emit), which is
-/// exactly what the re-openable `AudioSource` handle exists for. Reading a
-/// whole album track into a `Vec<u8>` first would defeat both.
-///
-/// Both filters are offered because the audio pipeline genuinely accepts
-/// both: a video container carries audio tracks, and `--audio-track` selects
-/// which one. Native only, same as [`pick_video_path`] -- a browser file
-/// handle has no filesystem path for a decoder to open.
+/// Pick an audio file -- or a video container to pull an audio track out of
+/// (`--audio-track` selects which one) -- returning its path. Path, not
+/// bytes, so the re-openable `AudioSource` can decode a song twice (once for
+/// the normalisation peak, once to emit) without holding it all in memory.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn pick_audio_path() -> Promise<Option<std::path::PathBuf>> {
     let dialog = rfd::AsyncFileDialog::new()
@@ -422,14 +301,8 @@ pub fn deliver_save(data: Vec<u8>, out_file: &str, clipboard: bool) -> Result<()
 }
 
 /// Why the current Save Destination cannot be written, or `None` if it can.
-///
-/// **One rule, one wording, one place -- and it is the same rule
-/// [`deliver_world`] enforces.** Each of the five panes drew its own red label
-/// from its own copy of the condition, and none of them stopped Generate, so the
-/// surface that *showed* the warning was also the surface that wrote to the bad
-/// name anyway (the CLI, which refuses it, was the strict one). Panes call this
-/// for the label AND gate their Generate button on it, so the two cannot
-/// disagree.
+/// Panes use this both for the warning label and to gate the Generate button,
+/// so the two can't disagree.
 pub fn out_file_problem(out_file: &str) -> Option<String> {
     let lower = out_file.trim().to_lowercase();
     if lower.is_empty() {
@@ -441,14 +314,8 @@ pub fn out_file_problem(out_file: &str) -> Option<String> {
     None
 }
 
-/// Whether a save already exists at the destination, i.e. whether Generate will
-/// OVERWRITE something.
-///
-/// Neither surface said so before: every pane defaults to the same `out.brz`, so
-/// a second render silently replaces the first, and nothing in the UI hints that
-/// the file being replaced was a different build. A note rather than a
-/// confirmation -- overwriting is usually what is wanted, and a modal on every
-/// second render would be worse than the surprise.
+/// Whether a save already exists at the destination, i.e. whether Generate
+/// will overwrite something.
 pub fn out_file_exists(out_file: &str) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -464,10 +331,6 @@ pub fn out_file_exists(out_file: &str) -> bool {
 }
 
 /// Draw the Save Destination's warnings as the last rows of a settings grid.
-///
-/// Shared so the wording, the colours and the ORDER are identical on every pane;
-/// each used to inline its own copy of the extension warning and none mentioned
-/// an existing file at all.
 pub fn draw_out_file_warnings(ui: &mut egui::Ui, out_file: &str) {
     if let Some(problem) = out_file_problem(out_file) {
         ui.label("Warning:");
@@ -484,12 +347,8 @@ pub fn draw_out_file_warnings(ui: &mut egui::Ui, out_file: &str) {
 }
 
 /// The Generate gate for a bad destination: `true` when the pane has drawn a
-/// refusal instead and must not offer the button.
-///
-/// Called FIRST in every pane's `draw_submit`, before "pick a file to
-/// continue...": a destination that cannot be written is wrong whether or not an
-/// input has been picked yet, and this is the only thing that makes the red
-/// label above binding rather than advisory.
+/// refusal instead and must not offer the button. Call before any other
+/// draw_submit gate so a bad destination wins regardless of input state.
 pub fn refuse_bad_out_file(ui: &mut egui::Ui, out_file: &str) -> bool {
     match out_file_problem(out_file) {
         Some(problem) => {
@@ -500,23 +359,10 @@ pub fn refuse_bad_out_file(ui: &mut egui::Ui, out_file: &str) -> bool {
     }
 }
 
-/// Write a finished `World` to `out_file` **in the container its extension
-/// names**, and copy the path to the clipboard if asked.
-///
-/// **The one place any pane decides the output FORMAT**, and it exists because
-/// the three newer panes did not decide it at all: `deliver_world_unless_
-/// cancelled` and `TextApp::generate` called `world.to_brz_vec()`
-/// unconditionally and then wrote the bytes to whatever name was in the box. All
-/// five panes share one `SharedOptions::out_file`, and each of them draws its
-/// "must end with .brz or .brdb" warning only when the name ends in NEITHER --
-/// so `out.brdb` was explicitly endorsed by the UI and then handed BRZ content.
-/// The two are genuinely different containers (`42 52 5a 00` against `53 51 4c
-/// 69`, "SQLite format 3"), so the file was simply mislabelled.
-///
-/// On native this is [`crate::util::write_world`] -- the CLI's own writer, not a
-/// second implementation of the same rule -- plus the clipboard step the GUI
-/// adds. On the web there is no filesystem to write a `.brdb` into, so that name
-/// is refused by name rather than silently downloaded as BRZ.
+/// Write a finished `World` to `out_file` in the container its extension
+/// names, and copy the path to the clipboard if asked. The one place any pane
+/// picks the output format; on the web, `.brdb` is refused rather than
+/// silently downloaded as BRZ (no filesystem to write it into).
 pub fn deliver_world(world: &World, out_file: &str, clipboard: bool) -> Result<(), String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -543,27 +389,10 @@ pub fn deliver_world(world: &World, out_file: &str, clipboard: bool) -> Result<(
     }
 }
 
-/// Delivers a finished `World` as a save file, UNLESS `progress` reports the
-/// render that produced it was cancelled -- in which case nothing is written
-/// and this still returns `Ok(())`, the same as a normal completion.
-///
-/// This is the one place that decides whether a cancelled render's
-/// real-but-partial `World` ever reaches disk, and it must never turn a
-/// cancellation into a logged error: a render worker only calls
-/// `log::error!` on an `Err`, so returning `Ok(())` here is what keeps a
-/// cancelled render from looking like a crash.
-///
-/// Shared by every pane that renders off-thread (Video, Audio) rather than
-/// copied into each: this is a *policy* decision about what a cancel means,
-/// and two copies of it is how one pane ends up writing a half-finished save
-/// while the other does not. Split out from any one pane's `generate` closure
-/// specifically so it is unit-testable on its own -- exercising the real
-/// thing would mean driving an actual egui frame loop and a background
-/// thread, neither of which a plain `#[test]` can do.
-///
-/// It decides ONLY that. The output format is [`deliver_world`]'s decision --
-/// this used to hard-code BRZ, which is how a `.brdb` destination received BRZ
-/// bytes.
+/// Delivers a finished `World` as a save file unless `progress` reports the
+/// render that produced it was cancelled, in which case nothing is written
+/// and this still returns `Ok(())` -- a cancelled render must never surface
+/// as a logged error.
 pub fn deliver_world_unless_cancelled(
     world: World,
     progress: &dyn Progress,
@@ -638,4 +467,652 @@ pub fn copy_path_to_clipboard(out_file: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared render-progress channel plumbing.
+//
+// The Audio and Video panes both spawn a background render worker (a
+// synchronous call on wasm, a real thread on native) and need to show its
+// progress in the UI: a labelled bar (or an indeterminate one while the total
+// is unknown), a Cancel button backed by a shared `Arc<AtomicBool>`, and a
+// channel carrying `Progress` events from the worker back to the UI thread
+// that owns egui. That was ~150 lines of near-identical code in each pane;
+// the shared core -- the message shape, the `Progress` impl that forwards it
+// over the channel, and the two draw calls -- lives here once instead.
+// `Extra` is room for whatever a pane needs on top of that core (the video
+// pane's throttled frame preview); a pane with nothing to add (the audio
+// pane, which has no picture to show) uses `std::convert::Infallible`, so its
+// own match on the result never needs an arm for it. Works on every target,
+// including wasm -- unlike the ffmpeg-download plumbing below, both panes'
+// render worker (and so this reporting) runs there too.
+// ---------------------------------------------------------------------------
+
+/// What a render worker reports to the UI over its progress channel: a named
+/// phase with an optional total (`Begin`), cumulative position within it
+/// (`Tick`), and a terminal `Finish` -- the shared core every pane's
+/// [`ChannelProgress`] sends. `Extra` carries whatever a specific pane needs
+/// on top of that; see [`ChannelProgress::send_extra`].
+#[derive(Clone, Debug)]
+pub enum RenderMsg<Extra> {
+    Begin { label: String, total: Option<u64> },
+    Tick(u64),
+    Finish,
+    Extra(Extra),
+}
+
+impl<Extra> RenderMsg<Extra> {
+    /// Apply a `Begin`/`Tick`/`Finish` event to a pane's progress-bar state,
+    /// growing an under-estimated total to meet an overrun tick rather than
+    /// letting the bar draw past 100% (see
+    /// [`crate::progress::reconcile_total`]). Returns the payload back out on
+    /// `Extra` rather than handling it here -- what a pane's `Extra` means
+    /// (the video pane's frame preview) is pane-specific, so the caller's
+    /// `poll_generate` handles it after this returns.
+    pub fn apply_core(
+        self,
+        label: &mut String,
+        pos: &mut u64,
+        total: &mut Option<u64>,
+    ) -> Option<Extra> {
+        match self {
+            RenderMsg::Begin { label: l, total: t } => {
+                *label = l;
+                *total = t;
+                *pos = 0;
+                None
+            }
+            RenderMsg::Tick(n) => {
+                let (p, t) = crate::progress::reconcile_total(*total, n);
+                *pos = p;
+                *total = t;
+                None
+            }
+            RenderMsg::Finish => None,
+            RenderMsg::Extra(e) => Some(e),
+        }
+    }
+}
+
+/// Reports progress from a render worker thread to the UI over a channel --
+/// the shared core of the audio and video panes' [`Progress`] implementations.
+/// Send failures are ignored on purpose: a closed channel means the UI went
+/// away, which must never abort a render that is otherwise fine. A pane
+/// needing more than this core (the video pane's throttled frame preview)
+/// wraps this rather than reimplementing `begin`/`tick`/`finish`/
+/// `is_cancelled` itself.
+pub struct ChannelProgress<Extra> {
+    tx: std::sync::mpsc::Sender<RenderMsg<Extra>>,
+    /// Set by the UI thread's Cancel button, read once per frame by
+    /// `is_cancelled`.
+    cancel: Arc<AtomicBool>,
+}
+
+impl<Extra> ChannelProgress<Extra> {
+    pub fn new(tx: std::sync::mpsc::Sender<RenderMsg<Extra>>, cancel: Arc<AtomicBool>) -> Self {
+        Self { tx, cancel }
+    }
+
+    /// Send a pane-specific payload -- the video pane's throttled frame
+    /// preview. Ignored on a closed channel, same as every other send here.
+    pub fn send_extra(&self, extra: Extra) {
+        let _ = self.tx.send(RenderMsg::Extra(extra));
+    }
+}
+
+impl<Extra> Progress for ChannelProgress<Extra> {
+    fn begin(&mut self, label: &str, total: Option<u64>) {
+        let _ = self
+            .tx
+            .send(RenderMsg::Begin { label: label.to_string(), total });
+    }
+    fn tick(&mut self, n: u64) {
+        let _ = self.tx.send(RenderMsg::Tick(n));
+    }
+    fn finish(&mut self) {
+        let _ = self.tx.send(RenderMsg::Finish);
+    }
+
+    /// Backed by the same `Arc<AtomicBool>` the UI thread's Cancel button
+    /// sets. `Relaxed` is enough: a single flag with no other state it must
+    /// stay ordered with.
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// Draw an in-flight render's progress bar: a real bar once a total is
+/// known, else an animated indeterminate one -- never a fabricated fraction
+/// that would reach 100% and keep going. Requests a repaint every call,
+/// since egui only repaints on input by default and a worker thread
+/// advancing `pos`/`total` on its own has nothing else to wake the event
+/// loop.
+pub fn draw_progress_bar(ui: &mut egui::Ui, label: &str, pos: u64, total: Option<u64>) {
+    ui.ctx().request_repaint();
+    match total {
+        Some(total) if total > 0 => {
+            let frac = pos as f32 / total as f32;
+            ui.add(egui::ProgressBar::new(frac).text(format!("{label} {pos}/{total}")));
+        }
+        // Unknown total (or a degenerate `Some(0)`): an animated
+        // indeterminate bar, never a fabricated fraction.
+        _ => {
+            ui.add(egui::ProgressBar::new(0.0).animate(true).text(label.to_string()));
+        }
+    }
+}
+
+/// Draw the Cancel button for an in-flight render's cancel flag: disabled
+/// and relabelled "Cancelling..." once the flag is set, so a second click
+/// can't re-fire it. Native only -- on wasm a render runs synchronously to
+/// completion before this could ever be drawn, so both panes' cancel flag
+/// field is `#[cfg]`'d out there entirely.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn draw_cancel_button(ui: &mut egui::Ui, flag: &Arc<AtomicBool>) {
+    ui.add_space(4.0);
+    let cancelling = flag.load(Ordering::Relaxed);
+    ui.add_enabled_ui(!cancelling, |ui| {
+        if ui
+            .add(egui::Button::new(if cancelling { "Cancelling..." } else { "Cancel" }))
+            .clicked()
+        {
+            flag.store(true, Ordering::Relaxed);
+        }
+    });
+}
+
+#[cfg(test)]
+mod render_progress_tests {
+    use super::*;
+
+    #[test]
+    fn begin_resets_position_and_records_label_and_total() {
+        let mut label = "stale".to_string();
+        let mut pos = 41;
+        let mut total = Some(9);
+        let msg: RenderMsg<std::convert::Infallible> =
+            RenderMsg::Begin { label: "analyzing".to_string(), total: Some(100) };
+        let extra = msg.apply_core(&mut label, &mut pos, &mut total);
+        assert!(extra.is_none());
+        assert_eq!(label, "analyzing");
+        assert_eq!(pos, 0);
+        assert_eq!(total, Some(100));
+    }
+
+    #[test]
+    fn tick_past_an_estimated_total_grows_it_rather_than_overflowing() {
+        let mut label = String::new();
+        let mut pos = 0;
+        let mut total = Some(100);
+        let msg: RenderMsg<std::convert::Infallible> = RenderMsg::Tick(137);
+        msg.apply_core(&mut label, &mut pos, &mut total);
+        assert_eq!(pos, 137);
+        assert_eq!(total, Some(137), "an under-estimate must grow to meet the tick");
+    }
+
+    #[test]
+    fn extra_passes_through_untouched_and_does_not_move_the_bar() {
+        let mut label = "phase".to_string();
+        let mut pos = 3;
+        let mut total = Some(10);
+        let msg: RenderMsg<u32> = RenderMsg::Extra(7);
+        let extra = msg.apply_core(&mut label, &mut pos, &mut total);
+        assert_eq!(extra, Some(7));
+        assert_eq!(label, "phase");
+        assert_eq!(pos, 3);
+        assert_eq!(total, Some(10));
+    }
+
+    #[test]
+    fn channel_progress_is_cancelled_reflects_the_shared_flag() {
+        let (tx, _rx) = std::sync::mpsc::channel::<RenderMsg<std::convert::Infallible>>();
+        let flag = Arc::new(AtomicBool::new(false));
+        let progress = ChannelProgress::new(tx, Arc::clone(&flag));
+
+        assert!(!progress.is_cancelled(), "a fresh flag must not read as cancelled");
+        flag.store(true, Ordering::Relaxed);
+        assert!(
+            progress.is_cancelled(),
+            "setting the shared flag (as the Cancel button does) must be visible immediately"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared ffmpeg-download modal + progress plumbing.
+//
+// The Video and Audio panes both need to fetch ffmpeg on demand, show a real
+// progress bar while it downloads (the gyan.dev Windows mirror is slow enough
+// that a spinner reads as a hang), let the user abandon the wait, and surface
+// the OUTCOME in the modal rather than only in the log. That was ~150 lines of
+// near-identical code in each pane; it lives here once instead, so a fix to one
+// cannot drift from the other. Native only: `video::ffmpeg` (and so the whole
+// download path) does not exist on wasm.
+// ---------------------------------------------------------------------------
+
+/// Which stage an in-flight ffmpeg download has reached.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DownloadPhase {
+    /// Connecting -- the fetch has begun but no bytes have arrived.
+    Connecting,
+    /// Bytes are arriving.
+    Downloading,
+    /// The archive is downloaded and being unpacked.
+    Unpacking,
+    /// ffmpeg is installed.
+    Done,
+}
+
+/// A `Copy` snapshot of the download's progress for one render frame -- what
+/// the modal body reads, taken under the state's lock so the UI thread never
+/// holds it while drawing.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+struct DownloadView {
+    phase: DownloadPhase,
+    done: u64,
+    total: u64,
+    /// How long since the most recent byte arrived, or `None` before the first
+    /// one. Drives the stall message and nothing else -- see
+    /// [`crate::video::ffmpeg::download_is_stalled`].
+    stalled_for: Option<std::time::Duration>,
+}
+
+/// Progress state shared between the background download thread (which writes
+/// via [`FfmpegDownloadState::record`]) and the UI thread (which reads via
+/// [`FfmpegDownloadState::view`] each frame and writes the terminal result via
+/// [`FfmpegDownloadState::set_outcome`]).
+///
+/// All state is behind one `Mutex`: the writes are tiny and infrequent (once
+/// per socket read at most), so lock contention is a non-issue and one mutex is
+/// simpler to reason about than a fan of atomics. The download thread holds one
+/// `Arc` and the UI another; when the UI abandons the wait it drops its `Arc`,
+/// and the orphaned thread's clone keeps the state alive until that thread ends
+/// -- nothing reads it by then, so its writes are harmless.
+#[cfg(not(target_arch = "wasm32"))]
+struct FfmpegDownloadState {
+    inner: std::sync::Mutex<DownloadSnapshot>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct DownloadSnapshot {
+    phase: DownloadPhase,
+    done: u64,
+    total: u64,
+    last_byte: Option<std::time::Instant>,
+    /// The terminal result, once the worker has finished. Written on the UI
+    /// thread from the resolved `Promise`, never by the download thread.
+    outcome: Option<Result<(), String>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FfmpegDownloadState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(DownloadSnapshot {
+                phase: DownloadPhase::Connecting,
+                done: 0,
+                total: 0,
+                last_byte: None,
+                outcome: None,
+            }),
+        })
+    }
+
+    /// The download thread's sink. Records one progress event; on a
+    /// `Downloading` event it also stamps the wall-clock time, which is what
+    /// the stall check reads back.
+    fn record(&self, p: crate::video::ffmpeg::FfmpegDownloadProgress) {
+        use crate::video::ffmpeg::FfmpegDownloadProgress as P;
+        let mut s = self.inner.lock().unwrap();
+        match p {
+            P::Starting => s.phase = DownloadPhase::Connecting,
+            P::Downloading { done, total } => {
+                s.phase = DownloadPhase::Downloading;
+                s.done = done;
+                s.total = total;
+                s.last_byte = Some(std::time::Instant::now());
+            }
+            P::Unpacking => s.phase = DownloadPhase::Unpacking,
+            P::Done => s.phase = DownloadPhase::Done,
+        }
+    }
+
+    fn view(&self) -> DownloadView {
+        let s = self.inner.lock().unwrap();
+        DownloadView {
+            phase: s.phase,
+            done: s.done,
+            total: s.total,
+            stalled_for: s.last_byte.map(|t| t.elapsed()),
+        }
+    }
+
+    fn set_outcome(&self, result: Result<(), String>) {
+        self.inner.lock().unwrap().outcome = Some(result);
+    }
+
+    fn outcome(&self) -> Option<Result<(), String>> {
+        self.inner.lock().unwrap().outcome.clone()
+    }
+}
+
+/// Draw the body of the download modal for one frame from a progress snapshot:
+/// a real progress bar with "X.X / Y.Y MB" and a percent, plus the stall notice
+/// when the connection has gone quiet.
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_ffmpeg_download_body(ui: &mut egui::Ui, view: DownloadView) {
+    use crate::video::ffmpeg::{download_fraction, download_is_stalled};
+    match view.phase {
+        DownloadPhase::Connecting => {
+            ui.add(egui::ProgressBar::new(0.0).animate(true).text("connecting..."));
+        }
+        DownloadPhase::Downloading => {
+            let done_mb = view.done as f64 / 1_000_000.0;
+            match download_fraction(view.done, view.total) {
+                Some(frac) => {
+                    let total_mb = view.total as f64 / 1_000_000.0;
+                    ui.add(egui::ProgressBar::new(frac).text(format!(
+                        "{done_mb:.1} / {total_mb:.1} MB ({:.0}%)",
+                        frac * 100.0
+                    )));
+                }
+                // No Content-Length: an honest indeterminate bar with the bytes
+                // so far, never a fabricated percentage.
+                None => {
+                    ui.add(
+                        egui::ProgressBar::new(0.0)
+                            .animate(true)
+                            .text(format!("{done_mb:.1} MB downloaded")),
+                    );
+                }
+            }
+        }
+        DownloadPhase::Unpacking => {
+            ui.add(egui::ProgressBar::new(1.0).text("unpacking..."));
+        }
+        DownloadPhase::Done => {
+            ui.add(egui::ProgressBar::new(1.0).text("finishing..."));
+        }
+    }
+
+    // Stall visibility, driven purely off the timestamp the callback records --
+    // this aborts nothing, it only tells the user a dead gyan.dev connection
+    // apart from a merely slow one.
+    if let Some(since) = view.stalled_for {
+        if download_is_stalled(since) {
+            ui.add_space(4.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 180, 80),
+                format!(
+                    "Download appears stalled -- no data for {}s. Check your connection, or \
+                     install ffmpeg manually and restart.",
+                    since.as_secs()
+                ),
+            );
+        }
+    }
+}
+
+/// The shared ffmpeg download-consent + download modal, bundling the three
+/// fields each pane used to carry separately (the pending consent request, the
+/// in-flight download `Promise`, and the progress cell) behind one type with
+/// the poll/draw logic attached.
+///
+/// A pane holds one of these, sets it going with [`FfmpegModal::request`] when
+/// a source needs an ffmpeg it lacks, and calls [`FfmpegModal::poll`] and
+/// [`FfmpegModal::draw`] once per frame. [`FfmpegModal::is_open`] is the gate
+/// the pane's Generate button reads.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub struct FfmpegModal {
+    /// The path awaiting a decision, and the marker that the modal is open at
+    /// all -- `Some` from the moment a pane calls [`FfmpegModal::request`]
+    /// until the user dismisses the modal (declining, abandoning, or
+    /// acknowledging the outcome). The path itself is not read (the pane
+    /// re-opens the file on the next Generate click rather than auto-resuming,
+    /// unchanged from before), but keeping it documents which file asked.
+    consent: Option<std::path::PathBuf>,
+    /// The in-flight download worker, once "Download" is clicked. `Some` only
+    /// while the network fetch is actually running; cleared when it resolves
+    /// (its outcome moves into `progress`) or when the wait is abandoned.
+    download: Option<Promise<Result<(), String>>>,
+    /// The shared progress cell, `Some` from the moment a download starts. It
+    /// outlives `download` so the resolved outcome can be shown in the modal.
+    progress: Option<Arc<FfmpegDownloadState>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FfmpegModal {
+    /// Whether the modal is showing -- the gate a pane's Generate button and
+    /// its "waiting on the ffmpeg prompt" notice both read.
+    pub fn is_open(&self) -> bool {
+        self.consent.is_some()
+    }
+
+    /// Ask for consent to download ffmpeg for `path`. Opens the modal on its
+    /// consent prompt; the download does not start until the user clicks
+    /// "Download". Resets any prior download/progress state.
+    pub fn request(&mut self, path: std::path::PathBuf) {
+        self.consent = Some(path);
+        self.download = None;
+        self.progress = None;
+    }
+
+    /// Poll the in-flight download, if any. On resolution the outcome is stored
+    /// in the progress cell (so [`FfmpegModal::draw`] can show "installed" /
+    /// "failed") and also logged, exactly as before; the modal stays open on
+    /// its outcome view until the user dismisses it. While the download is
+    /// still running this requests a repaint, since nothing else wakes the
+    /// event loop while it runs on its own thread.
+    pub fn poll(&mut self, ctx: &egui::Context) {
+        let Some(promise) = self.download.take() else {
+            return;
+        };
+        match promise.try_take() {
+            Ok(result) => {
+                match &result {
+                    Ok(()) => log::info!("ffmpeg installed -- click Generate again to continue"),
+                    Err(e) => log::error!("{e}"),
+                }
+                match &self.progress {
+                    Some(state) => state.set_outcome(result),
+                    // No progress cell should be impossible here (a download
+                    // only starts alongside one), but if it ever were, close
+                    // the modal rather than trap the user with no outcome view.
+                    None => self.consent = None,
+                }
+            }
+            Err(promise) => {
+                self.download = Some(promise);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// Draw the modal for one frame. `prompt` is the consent question body (the
+    /// panes word it slightly differently and interpolate the download URL);
+    /// `declined_log` is the info-level line logged when the user declines or
+    /// abandons.
+    pub fn draw(
+        &mut self,
+        ctx: &egui::Context,
+        id_prefix: &str,
+        prompt: &str,
+        declined_log: &str,
+    ) {
+        if self.consent.is_none() {
+            return;
+        }
+
+        // A download has been started (or has finished): show progress, or the
+        // terminal outcome once one is in.
+        if let Some(state) = &self.progress {
+            let outcome = state.outcome();
+            let mut dismiss = false;
+            let mut abandon = false;
+            egui::Modal::new(egui::Id::new(format!("{id_prefix}_ffmpeg_download_modal"))).show(
+                ctx,
+                |ui| {
+                    ui.set_max_width(420.0);
+                    match &outcome {
+                        Some(Ok(())) => {
+                            ui.heading("ffmpeg installed");
+                            ui.label(
+                                "ffmpeg was downloaded and installed. Click Generate again to \
+                                 continue.",
+                            );
+                            ui.add_space(8.0);
+                            if ui.button("Close").clicked() {
+                                dismiss = true;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            ui.heading("ffmpeg download failed");
+                            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
+                            ui.add_space(8.0);
+                            ui.label(
+                                "You can try again, or install ffmpeg manually and make sure it \
+                                 is on PATH, then restart.",
+                            );
+                            ui.add_space(8.0);
+                            if ui.button("Close").clicked() {
+                                dismiss = true;
+                            }
+                        }
+                        None => {
+                            ui.heading("Downloading ffmpeg...");
+                            draw_ffmpeg_download_body(ui, state.view());
+                            ui.add_space(8.0);
+                            // Cancel ABANDONS THE WAIT. The sidecar's progress
+                            // callback returns `()` and cannot hard-abort the
+                            // in-flight ureq read, so this does NOT interrupt
+                            // the HTTP stream: it closes the modal and drops our
+                            // Promise handle, and the orphaned download thread
+                            // finishes or dies with the process. The value is
+                            // that the user is no longer trapped watching a bar
+                            // that may be crawling on a rate-limited mirror.
+                            if ui.button("Cancel").clicked() {
+                                abandon = true;
+                            }
+                        }
+                    }
+                },
+            );
+            if dismiss {
+                self.consent = None;
+                self.progress = None;
+            }
+            if abandon {
+                // Drop both handles and close: the thread keeps running,
+                // unwatched, on its own `Arc` clone of the state (see
+                // `FfmpegDownloadState`'s doc).
+                self.download = None;
+                self.progress = None;
+                self.consent = None;
+                log::info!("ffmpeg download abandoned; {declined_log}");
+            }
+            return;
+        }
+
+        // No download yet: the consent prompt.
+        let mut start = false;
+        let mut decline = false;
+        egui::Modal::new(egui::Id::new(format!("{id_prefix}_ffmpeg_consent_modal"))).show(
+            ctx,
+            |ui| {
+                ui.set_max_width(420.0);
+                ui.heading("Download ffmpeg?");
+                ui.label(prompt);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Download").clicked() {
+                        start = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decline = true;
+                    }
+                });
+            },
+        );
+        if start {
+            let state = FfmpegDownloadState::new();
+            let sink_state = Arc::clone(&state);
+            self.progress = Some(state);
+            self.download = Some(Promise::spawn_thread("ffmpeg_download", move || {
+                crate::video::ffmpeg::ensure_ffmpeg_with_progress(
+                    crate::video::ffmpeg::DownloadConsent::Always,
+                    move |p| sink_state.record(p),
+                )
+            }));
+        }
+        if decline {
+            log::info!("ffmpeg download declined; {declined_log}");
+            self.consent = None;
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::video::ffmpeg::FfmpegDownloadProgress;
+
+    /// The modal's shared cell must reflect the events the download thread
+    /// records: a `Downloading` event moves `done`/`total` and stamps a
+    /// last-byte time (so the freshly-recorded byte is NOT yet stalled), and a
+    /// later phase event advances the phase. This is the GUI half of the
+    /// plumbing proof -- the sink writes, the view reads back what was written.
+    #[test]
+    fn the_progress_cell_reflects_recorded_events() {
+        let state = FfmpegDownloadState::new();
+
+        // Before any byte: no last-byte stamp, so nothing to call stalled.
+        assert!(state.view().stalled_for.is_none());
+
+        state.record(FfmpegDownloadProgress::Downloading { done: 40, total: 100 });
+        let v = state.view();
+        assert_eq!(v.done, 40);
+        assert_eq!(v.total, 100);
+        let since = v.stalled_for.expect("a recorded byte stamps a time");
+        assert!(
+            !crate::video::ffmpeg::download_is_stalled(since),
+            "a byte recorded this instant must not read as stalled"
+        );
+
+        state.record(FfmpegDownloadProgress::Unpacking);
+        assert!(
+            matches!(state.view().phase, DownloadPhase::Unpacking),
+            "a later event must advance the phase the modal shows"
+        );
+    }
+
+    /// The outcome the UI thread writes on the resolved `Promise` must be the
+    /// one the modal reads back, so it can show "installed" / "failed" rather
+    /// than only logging it.
+    #[test]
+    fn the_outcome_written_on_the_ui_thread_is_read_back() {
+        let ok = FfmpegDownloadState::new();
+        assert!(ok.outcome().is_none(), "no outcome until the worker resolves");
+        ok.set_outcome(Ok(()));
+        assert!(matches!(ok.outcome(), Some(Ok(()))));
+
+        let err = FfmpegDownloadState::new();
+        err.set_outcome(Err("mirror timed out".to_string()));
+        assert_eq!(err.outcome(), Some(Err("mirror timed out".to_string())));
+    }
+
+    /// A fresh modal is closed, and `request` opens it without starting a
+    /// download (the network fetch only begins on the user's "Download"
+    /// click) -- the consent step the task's constraints say not to change.
+    #[test]
+    fn request_opens_the_modal_on_the_consent_prompt() {
+        let mut modal = FfmpegModal::default();
+        assert!(!modal.is_open());
+        modal.request(std::path::PathBuf::from("clip.mkv"));
+        assert!(modal.is_open(), "request opens the modal");
+        assert!(modal.download.is_none(), "but starts no download until Download is clicked");
+        assert!(modal.progress.is_none());
+    }
 }

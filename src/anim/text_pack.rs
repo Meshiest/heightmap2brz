@@ -3,14 +3,14 @@
 //! This is the sibling of [`super::pack::Packer`] and [`super::color_pack::ColorPacker`]:
 //! push one frame at a time, retain no images, and finish into the per-band
 //! arrays a renderer wires up. Unlike those two, this one is band-major on
-//! the OUTPUT ([`TextPacker::finish`] returns `bands[band][frame]`) because
+//! the output ([`TextPacker::finish`] returns `bands[band][frame]`) because
 //! that is exactly the shape one band's `ArrayVar` needs -- one string per
 //! frame, for that band alone.
 //!
 //! # Memory
 //!
 //! Unlike brick mode's fixed 6 bytes per pixel per frame (or colour-array
-//! mode's fixed 16), text mode's retention is CONTENT-DEPENDENT and larger:
+//! mode's fixed 16), text mode's retention is content-dependent and larger:
 //! measured at ~25 MB for 60 frames at 192x108 unquantized, which
 //! extrapolates to roughly 3 GB for ten minutes at 12 fps. A palette cuts
 //! that by about a third (shorter strings from longer colour runs). This is
@@ -36,7 +36,7 @@
 //! # Colour state
 //!
 //! [`crate::text::encode_bands`] carries its last emitted `<color>` tag
-//! across pixels, gaps and rows WITHIN a band, starting fresh at each band.
+//! across pixels, gaps and rows within a band, starting fresh at each band.
 //! Feeding it one band's rows as its own sub-image (below) gives exactly
 //! that behaviour for free -- fresh colour state per band, per frame -- which
 //! is also what [`super::text_layout::worst_case_row_chars`]'s bound assumes.
@@ -46,7 +46,7 @@ use crate::anim::text_layout::BandPlan;
 use crate::text::{MAX_COMPONENT_CHARS, TextOptions, encode_bands};
 use image::RgbaImage;
 
-/// Builds one string per frame per band, in ONE traversal of the frames, so
+/// Builds one string per frame per band, in one traversal of the frames, so
 /// no frame is ever retained -- only the encoded strings are.
 pub struct TextPacker {
     plan: Vec<BandPlan>,
@@ -113,13 +113,9 @@ impl TextPacker {
         super::pack::MAX_FRAMES
     }
 
-    pub fn frames_pushed(&self) -> usize {
-        self.frames_pushed
-    }
-
     /// Push one frame's contribution to every band's string array.
     ///
-    /// `frame` MUST be exactly the `width` x `height` this packer was built
+    /// `frame` must be exactly the `width` x `height` this packer was built
     /// with -- the dimensions the source's `SourceInfo` reported, and the ones
     /// the band plan was computed for. A mismatch is a `FrameStream` contract
     /// violation and is rejected here, on the first frame as much as the last;
@@ -249,7 +245,7 @@ const MIN_BANDS_PER_JOB: usize = 4;
 /// fans out across rayon's pool on native. `rayon` is a native-only dependency
 /// (see `Cargo.toml`), so wasm gets the identical serial walk below.
 ///
-/// Errors are collected per band and then reduced IN INDEX ORDER, so the
+/// Errors are collected per band and then reduced in index order, so the
 /// error a caller sees is the lowest-numbered failing band whichever order the
 /// jobs actually finished in. A parallel run must not report a different
 /// failure than a serial one.
@@ -318,7 +314,7 @@ mod tests {
     fn a_wrongly_sized_frame_is_rejected_naming_both_sizes() {
         let plan = plan_bands(8, 4, 2).unwrap();
         let mut p = TextPacker::new(8, 4, plan, opts(), Palette::default());
-        // No priming push: the very FIRST frame is checked, because the
+        // No priming push: the very first frame is checked, because the
         // expected size comes from the source's SourceInfo rather than from
         // whatever happened to arrive first. A stream whose first frame
         // already disagrees with info() is exactly the case worth catching.

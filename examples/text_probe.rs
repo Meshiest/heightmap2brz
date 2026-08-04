@@ -192,9 +192,10 @@ struct Report {
 }
 
 /// Gates the shared clock and the change detector contribute, independent of
-/// the clip: `Timer -> Multiply -> BitwiseOR -> ModuloFloored`, plus the
-/// detector. The rest of what `build_clock` adds are microchip pins, not gates.
-const SERVICE_GATES: usize = 5;
+/// the clip: `Timer -> Multiply -> BitwiseOR -> ModuloFloored` plus the length
+/// and progress status taps (6 clock gates), plus the detector. The rest of
+/// what `build_clock` adds are microchip pins, not gates.
+const SERVICE_GATES: usize = 7;
 
 /// Build the animated text world. Streams `source` exactly once; no frame is
 /// ever retained (only the encoded strings are).
@@ -753,8 +754,8 @@ mod tests {
             "one anchor cube per band plus the chip shell"
         );
         // 3 wires into each Get (ArrayVarRef, Index, Exec) + 1 out to the
-        // TextDisplay, plus the detector feed and the clock's own 8.
-        assert_eq!(report.wires, 4 * report.bands + 1 + 8);
+        // TextDisplay, plus the detector feed and the clock's own 11.
+        assert_eq!(report.wires, 4 * report.bands + 1 + 11);
 
         // Each band anchors at its OWN image row: one distinct height per
         // band, and the whole column stays within one depth slot. A stack of

@@ -144,7 +144,11 @@ fn clock_emits_four_gates_and_three_pins_without_collision() {
         true,
         Position { x: 5, y: 5, z: 2 },
     );
-    assert_eq!(c.placed().len() - before, 9, "4 clock gates + 3 control pins + Rate in + Done out");
+    assert_eq!(
+        c.placed().len() - before,
+        13,
+        "6 clock gates + 3 control pins + Rate in + Done/Length/Progress out"
+    );
     assert_ne!(clock.pause_pin, clock.restart_pin);
     chip::finish(&mut world, c).expect("clock layout must be collision-free");
 
@@ -312,7 +316,7 @@ fn a_non_looping_clock_writes_a_limit_landing_on_the_last_frame() {
 /// Turning looping off must change the `Limit` and NOTHING else.
 ///
 /// The cost readout has to describe the graph that actually gets built, and
-/// the estimators count a flat 4 clock gates and 8 clock wires without ever
+/// the estimators count a flat 6 clock gates and 11 clock wires without ever
 /// seeing this flag. That stays correct only while both settings emit the
 /// identical structure, which is what this pins -- separately from the limit
 /// value, so a future change that bought "stop at the end" with an extra gate
@@ -331,7 +335,10 @@ fn looping_and_non_looping_clocks_differ_only_in_the_limit() {
         looping_bricks, stopping_bricks,
         "same gates and pins either way -- the flag changes one inlined value, not the graph"
     );
-    assert_eq!(looping_bricks, 9, "4 clock gates + 3 control pins + Rate in + Done out");
+    assert_eq!(
+        looping_bricks, 13,
+        "6 clock gates + 3 control pins + Rate in + Done/Length/Progress out"
+    );
 }
 
 // --- Task 6 spike: structural validation -----------------------------------
@@ -525,13 +532,14 @@ fn spike_anim_graph_is_structurally_valid() {
     let (bricks, wires) = count_bricks_and_wires(&path);
     wire_integrity::assert_wires_valid(&path);
 
-    // 4 display + 1 chip shell (main grid) + 20 inside the chip (4 clock gates +
-    // 3 control pins + Rate in + Done out + detector + array + get + 4 pixels x
-    // (Substring + MakeColorHex)).
-    assert_eq!(bricks, 25, "brick count must match hand-traced total");
-    // 3 clock-internal + 3 control-pin + 1 rate->mul + 1 timer->done + 1 detector +
-    // 1 array->get + 1 clock->index + 1 detector->exec + 4 pixels x 3.
-    assert_eq!(wires, 24, "wire count must match hand-traced total");
+    // 4 display + 1 chip shell (main grid) + 24 inside the chip (6 clock gates +
+    // 3 control pins + Rate in + Done/Length/Progress out + detector + array +
+    // get + 4 pixels x (Substring + MakeColorHex)).
+    assert_eq!(bricks, 29, "brick count must match hand-traced total");
+    // 3 clock-internal + 3 control-pin + 1 rate->mul + 1 timer->done + 1 length->pin +
+    // 1 modulo->progress + 1 progress->pin + 1 detector + 1 array->get +
+    // 1 clock->index + 1 detector->exec + 4 pixels x 3.
+    assert_eq!(wires, 27, "wire count must match hand-traced total");
 
     let _ = std::fs::remove_file(&path);
 }
@@ -580,13 +588,18 @@ fn tiny_clip(w: u32, h: u32, n: usize) -> Clip {
 #[test]
 fn brick_world_has_two_gates_per_pixel_plus_overhead() {
     let clip = tiny_clip(4, 3, 5);
-    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
+    // `control_buttons: false` to isolate the display + shell count from the
+    // pre-wired control buttons (which add 3 main-grid bricks by default); this
+    // test is about the pixel gates, not the buttons. Their own coverage is in
+    // `controls.rs` and `the_control_buttons_appear_on_a_written_render` below.
+    let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+    let world = build_brick_world(&clip, &opts, &mut NoProgress).unwrap();
     // 12 display bricks + 1 microchip shell on the main grid
     assert_eq!(world.bricks.len(), 13);
-    // inner grid: 2*12 pixel gates + 2 chunk gates + 1 detector + 4 clock
-    //             + 5 clock pins (Pause, Restart, Resume, Rate, Done)
+    // inner grid: 2*12 pixel gates + 2 chunk gates + 1 detector + 6 clock
+    //             + 7 clock pins (Pause, Restart, Resume, Rate, Done, Length, Progress)
     let inner = &world.grids[0].1;
-    assert_eq!(inner.len(), 24 + 2 + 1 + 4 + 5);
+    assert_eq!(inner.len(), 24 + 2 + 1 + 6 + 7);
 }
 
 #[test]
@@ -604,7 +617,9 @@ fn fully_transparent_pixels_emit_no_brick() {
     let mut img = RgbaImage::from_pixel(2, 1, Rgba([255, 0, 0, 255]));
     img.put_pixel(1, 0, Rgba([0, 0, 0, 0]));
     let clip = Clip { width: 2, height: 1, fps: 10.0, frames: vec![img] };
-    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
+    // Buttons off: this counts display bricks + shell, not the control buttons.
+    let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+    let world = build_brick_world(&clip, &opts, &mut NoProgress).unwrap();
     assert_eq!(world.bricks.len(), 2, "1 display brick + 1 chip shell");
 }
 
@@ -974,18 +989,18 @@ fn a_screen_wider_than_one_chunk_gets_more_arrays() {
     let clip = tiny_clip(n as u32, 1, 2);
     let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
     let inner = &world.grids[0].1;
-    // 2 chunks => 2 ArrayVar + 2 Get; 4 clock gates + 1 detector + 5 clock pins
-    assert_eq!(inner.len(), 2 * n + 4 + 1 + 4 + 5);
+    // 2 chunks => 2 ArrayVar + 2 Get; 6 clock gates + 1 detector + 7 clock pins
+    assert_eq!(inner.len(), 2 * n + 4 + 1 + 6 + 7);
 }
 
-// --- Task 10 follow-up: cross-chunk `Start` correctness ---------------------
+// --- Cross-chunk `Start` correctness -----------------------------------------
 //
-// Task 10's review flagged a gap: no test exercised `slice_of`/content
-// correctness in a SECOND chunk (`first_pixel > 0`) with varying per-pixel
-// colours -- exactly where a `first_pixel` vs `pixel_in_chunk` (global vs
-// chunk-local index) confusion in `build_brick_world`'s Substring `Start`
-// math would hide. `a_screen_wider_than_one_chunk_gets_more_arrays` above
-// only counts gates; it never reads a single `Start` value back.
+// No test exercised `slice_of`/content correctness in a second chunk
+// (`first_pixel > 0`) with varying per-pixel colours -- exactly where a
+// `first_pixel` vs `pixel_in_chunk` (global vs chunk-local index) confusion
+// in `build_brick_world`'s Substring `Start` math would hide.
+// `a_screen_wider_than_one_chunk_gets_more_arrays` above only counts gates;
+// it never reads a single `Start` value back.
 //
 // This test builds a real multi-chunk screen, writes it, reads the actual
 // persisted `Substring.Start` values and `ArrayVar` string contents back out
@@ -1536,9 +1551,11 @@ fn boundary_constants_are_the_real_multiples_of_the_bank_size() {
 #[test]
 fn rendering_from_a_source_matches_rendering_from_a_clip() {
     let clip = tiny_clip(4, 3, 5);
-    let world =
-        build_brick_world(&clip as &dyn FrameSource, &AnimOptions::default(), &mut NoProgress)
-            .expect("build");
+    // Buttons off: this compares a `FrameSource` render against the display +
+    // shell count, which the default-on control buttons would otherwise inflate.
+    let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+    let world = build_brick_world(&clip as &dyn FrameSource, &opts, &mut NoProgress)
+        .expect("build");
     // 12 pixels, all opaque -> 12 display bricks + the chip shell
     assert_eq!(world.bricks.len(), 13);
 }
@@ -1768,7 +1785,10 @@ fn visibility_indexing_follows_the_packers_row_major_layout_on_a_non_square_clip
     img.put_pixel(2, 1, Rgba([200, 100, 50, 255]));
     let clip = Clip { width: w, height: h, fps: 10.0, frames: vec![img] };
 
-    let world = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress)
+    // Buttons off: this asserts the display brick count and its exact position,
+    // neither of which is about the default-on control buttons.
+    let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+    let world = build_brick_world(&clip, &opts, &mut NoProgress)
         .expect("a single opaque pixel must build");
 
     // 1 display brick (the lone opaque pixel) + 1 chip shell.
@@ -1824,15 +1844,15 @@ fn the_hex_cost_estimate_matches_a_real_render() {
         let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
         let est = cost::estimate(w, h, n, &opts);
 
-        // Gates are every inner-grid brick that is not one of the clock's five
-        // I/O pins (Pause, Restart, Resume, Rate, Done).
+        // Gates are every inner-grid brick that is not one of the clock's seven
+        // I/O pins (Pause, Restart, Resume, Rate, Done, Length, Progress).
         let inner = world.grids[0].1.len();
         assert_eq!(
-            inner - 5,
+            inner - 7,
             est.gates,
             "{w}x{h}x{n} bank {bank}: estimate said {} gates, the render emitted {}",
             est.gates,
-            inner - 5
+            inner - 7
         );
         assert_eq!(
             world.wires.len(),
@@ -1857,7 +1877,7 @@ fn the_hex_cost_estimate_matches_a_real_multi_chunk_render() {
     let est = cost::estimate(w, 1, 4, &opts);
     assert_eq!(est.chunks, 2, "the test assumes two pack chunks");
     assert_eq!(est.banks, 2, "the test assumes two banks");
-    assert_eq!(world.grids[0].1.len() - 5, est.gates, "gate count");
+    assert_eq!(world.grids[0].1.len() - 7, est.gates, "gate count");
     assert_eq!(world.wires.len(), est.wires, "wire count");
     assert_eq!(world.bricks.len(), est.bricks, "brick count");
 }
@@ -1882,7 +1902,7 @@ fn the_hex_cost_estimate_matches_a_subtitled_render() {
         };
         let world = build_brick_world(&clip, &opts, &mut NoProgress).expect("build");
         let est = cost::estimate(4, 5, 6, &opts);
-        assert_eq!(world.grids[0].1.len() - 5, est.gates, "bank {bank}: gate count");
+        assert_eq!(world.grids[0].1.len() - 7, est.gates, "bank {bank}: gate count");
         assert_eq!(world.wires.len(), est.wires, "bank {bank}: wire count");
         assert_eq!(world.bricks.len(), est.bricks, "bank {bank}: brick count");
     }
@@ -1990,10 +2010,20 @@ fn srgb_to_linear_reaches_the_hex_a_render_writes() {
 #[test]
 fn external_clock_replaces_the_whole_timer_chain_with_one_frame_pin() {
     let clip = tiny_clip(4, 3, 5);
-    let internal = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
+    // `control_buttons: false` on BOTH so the only difference measured is the
+    // clock swap: the buttons are default-on and add 3 main-grid bricks + 3
+    // wires to the internal build (and none to the external one, which has no
+    // pins), which would otherwise swamp the exact clock-swap delta this test
+    // pins.
+    let internal = build_brick_world(
+        &clip,
+        &AnimOptions { control_buttons: false, ..AnimOptions::default() },
+        &mut NoProgress,
+    )
+    .unwrap();
     let external = build_brick_world(
         &clip,
-        &AnimOptions { external_clock: true, ..AnimOptions::default() },
+        &AnimOptions { external_clock: true, control_buttons: false, ..AnimOptions::default() },
         &mut NoProgress,
     )
     .unwrap();
@@ -2010,30 +2040,35 @@ fn external_clock_replaces_the_whole_timer_chain_with_one_frame_pin() {
             .count()
     };
 
-    for class in ["Pseudo_Timer", "MathMultiply", "BitwiseOR", "MathModuloFloored"] {
+    for class in ["Pseudo_Timer", "BitwiseOR", "MathModuloFloored"] {
         assert_eq!(count(&internal, class), 1, "the built-in clock has one {class}");
         assert_eq!(count(&external, class), 0, "--external-clock must build no {class}");
     }
-    // Five pins become one: Pause/Restart/Resume/Rate go, Done (an OUTPUT pin)
-    // goes with them, and a single `Frame` INPUT pin arrives.
+    // Three MathMultiply: the fps multiply in the index chain plus the length
+    // and progress status taps.
+    assert_eq!(count(&internal, "MathMultiply"), 3, "fps multiply + length + progress");
+    assert_eq!(count(&external, "MathMultiply"), 0, "--external-clock must build no MathMultiply");
+    // Seven pins become one: Pause/Restart/Resume/Rate go, the three OUTPUT
+    // pins (Done, Length, Progress) go with them, and a single `Frame` INPUT
+    // pin arrives.
     assert_eq!(count(&internal, "MicrochipInput"), 4, "Pause, Restart, Resume, Rate");
-    assert_eq!(count(&internal, "MicrochipOutput"), 1, "Done");
+    assert_eq!(count(&internal, "MicrochipOutput"), 3, "Done, Length, Progress");
     assert_eq!(count(&external, "MicrochipInput"), 1, "just Frame");
-    assert_eq!(count(&external, "MicrochipOutput"), 0, "no timer, no Done");
+    assert_eq!(count(&external, "MicrochipOutput"), 0, "no timer, no outputs");
 
-    // 4 clock gates + 5 pins out, 1 pin in: 8 fewer inner bricks.
+    // 6 clock gates + 7 pins go, 1 pin in: 12 fewer inner bricks.
     assert_eq!(
         internal.grids[0].1.len() - external.grids[0].1.len(),
-        8,
+        12,
         "the swap must cost exactly the clock chain and its pins"
     );
-    // ...and the clock's 8 wires go with it, replaced by nothing: the pin's
+    // ...and the clock's 11 wires go with it, replaced by nothing: the pin's
     // own output IS the frame index, so no extra wire is needed to reach the
     // detector or the Gets.
     assert_eq!(
         internal.wires.len() - external.wires.len(),
-        8,
-        "exactly the clock's own 8 wires"
+        11,
+        "exactly the clock's own 11 wires"
     );
     // The screen itself is untouched.
     assert_eq!(internal.bricks.len(), external.bricks.len(), "same display bricks and shell");
@@ -2045,14 +2080,121 @@ fn external_clock_replaces_the_whole_timer_chain_with_one_frame_pin() {
 fn external_clock_replaces_the_timer_chain_in_colour_array_mode_too() {
     use heightmap::anim::color_bricks::build_color_array_world;
     let clip = tiny_clip(3, 2, 4);
-    let internal =
-        build_color_array_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
-    let external = build_color_array_world(
+    // Buttons off on both -- see the hex-mode twin above -- so the delta is the
+    // clock swap alone, not the default-on control buttons.
+    let internal = build_color_array_world(
         &clip,
-        &AnimOptions { external_clock: true, ..AnimOptions::default() },
+        &AnimOptions { control_buttons: false, ..AnimOptions::default() },
         &mut NoProgress,
     )
     .unwrap();
-    assert_eq!(internal.grids[0].1.len() - external.grids[0].1.len(), 8);
-    assert_eq!(internal.wires.len() - external.wires.len(), 8);
+    let external = build_color_array_world(
+        &clip,
+        &AnimOptions { external_clock: true, control_buttons: false, ..AnimOptions::default() },
+        &mut NoProgress,
+    )
+    .unwrap();
+    assert_eq!(internal.grids[0].1.len() - external.grids[0].1.len(), 12);
+    assert_eq!(internal.wires.len() - external.wires.len(), 11);
+}
+
+// --- Control buttons --------------------------------------------------------
+
+const BUTTON: &str = "Component_Internal_AnimatedButton";
+const TEXT_DISPLAY: &str = "Component_TextDisplay";
+const MICROCHIP_INPUT: &str = "BrickComponentType_Internal_MicrochipInput";
+const TIMER: &str = "BrickComponentType_WireGraphPseudo_Timer";
+
+/// Main-grid bricks carrying `needle`.
+fn count_main_grid(world: &brdb::World, needle: &str) -> usize {
+    world
+        .bricks
+        .iter()
+        .filter(|b| {
+            b.components
+                .iter()
+                .any(|c| c.component_type().is_some_and(|t| t.to_string() == needle))
+        })
+        .count()
+}
+
+/// The pre-wired control buttons, verified against a written save.
+///
+/// With the toggle on a default render carries three animated-button bricks on
+/// the main grid, each also carrying a `Component_TextDisplay` label; each
+/// button's `bHeld` resolves to a distinct clock control pin -- the very pins
+/// the timer's `Pause`/`Restart`/`Resume` ports read -- and every wire in the
+/// written `.brz` resolves. With it off the build is byte-structurally the
+/// render it was before the feature: not one of those bricks or wires appears.
+///
+/// What this canNOT check, and the owner must confirm in game, is that pressing
+/// a button actually pauses/restarts/resumes the Timer, that `PromptCustomLabel`
+/// shows on look, and that a `Component_TextDisplay` riding on the same brick as
+/// the animated button renders.
+#[test]
+fn the_control_buttons_appear_on_a_written_render_and_vanish_when_disabled() {
+    let clip = tiny_clip(4, 3, 5);
+    let on = build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
+    let off = build_brick_world(
+        &clip,
+        &AnimOptions { control_buttons: false, ..AnimOptions::default() },
+        &mut NoProgress,
+    )
+    .unwrap();
+
+    // ON: three buttons and three labels, on the main grid.
+    assert_eq!(count_main_grid(&on, BUTTON), 3, "three physical buttons");
+    assert_eq!(count_main_grid(&on, TEXT_DISPLAY), 3, "three labels");
+    // OFF: none of them, and a brick screen carries no TextDisplay at all.
+    assert_eq!(count_main_grid(&off, BUTTON), 0);
+    assert_eq!(count_main_grid(&off, TEXT_DISPLAY), 0);
+    assert_eq!(on.bricks.len() - off.bricks.len(), 3, "3 buttons, each carrying a label");
+    assert_eq!(on.wires.len() - off.wires.len(), 3, "1 wire per control");
+
+    // Each button's bHeld targets a pin (its RER_Input); the timer reads three
+    // pins on its Pause/Restart/Resume ports (their RER_Output). The two pin
+    // sets must be identical -- every button drives a real control pin, and
+    // every control pin is driven.
+    let mut button_pins: Vec<usize> = on
+        .wires
+        .iter()
+        .filter(|w| {
+            w.source.component_type.to_string() == BUTTON
+                && w.source.port_name.to_string() == "bHeld"
+                && w.target.component_type.to_string() == MICROCHIP_INPUT
+        })
+        .map(|w| {
+            assert_eq!(w.target.port_name.to_string(), "RER_Input");
+            w.target.brick_id
+        })
+        .collect();
+    let mut timer_control_pins: Vec<usize> = on
+        .wires
+        .iter()
+        .filter(|w| {
+            w.target.component_type.to_string() == TIMER
+                && matches!(w.target.port_name.to_string().as_str(), "Pause" | "Restart" | "Resume")
+                && w.source.component_type.to_string() == MICROCHIP_INPUT
+        })
+        .map(|w| w.source.brick_id)
+        .collect();
+    button_pins.sort_unstable();
+    timer_control_pins.sort_unstable();
+    assert_eq!(button_pins.len(), 3, "one button per control pin");
+    assert_eq!(
+        button_pins, timer_control_pins,
+        "each button must resolve to a Pause/Restart/Resume pin the timer reads"
+    );
+
+    // The written save's wires must all resolve -- buttons on AND off.
+    for (world, tag) in [(&on, "on"), (&off, "off")] {
+        let path = std::env::temp_dir()
+            .join(format!("h2b_buttons_{tag}_{}.brz", std::process::id()));
+        std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
+        let result = std::panic::catch_unwind(|| wire_integrity::assert_wires_valid(&path));
+        let _ = std::fs::remove_file(&path);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
 }

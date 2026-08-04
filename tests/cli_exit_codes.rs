@@ -122,12 +122,8 @@ fn the_pre_branch_flag_validation_exits_nonzero() {
     );
 }
 
-/// **The output name is refused BEFORE the render, not after it.**
-///
-/// `write_world` is the last call in every branch, so `-o out` used to decode
-/// the whole clip, print a cost line, build the world and only then refuse the
-/// name -- discarding a 40-minute render over something knowable from argv
-/// alone. This asserts both halves: non-zero, and no cost line printed.
+// Asserts both halves: non-zero, and no cost line printed -- the name must
+// be refused before the render is even costed, not after.
 #[test]
 fn a_bad_output_extension_is_refused_before_anything_is_rendered() {
     let png = tiny_png().to_string_lossy().to_string();
@@ -147,9 +143,7 @@ fn a_bad_output_extension_is_refused_before_anything_is_rendered() {
     assert!(!PathBuf::from("out").exists(), "nothing may be written");
 }
 
-/// The `--audio-mode` branch. Every one of these is knowable from the flags
-/// alone, and every one used to exit 0 -- the inverted radius pair after
-/// running the whole analysis first.
+/// The `--audio-mode` branch.
 #[test]
 fn the_audio_branch_exits_nonzero() {
     let wav = "nonexistent_song.wav";
@@ -185,9 +179,8 @@ fn the_audio_branch_exits_nonzero() {
         "--max-voices",
         &[wav, "--audio-mode", "voice", "--max-voices", "0"],
     );
-    // The M2 case: an Inner Radius above Max Distance. Refused from the flags,
-    // before the file is even opened -- it used to print the analysis summary
-    // first and the refusal after it.
+    // An Inner Radius above Max Distance, refused from the flags before the
+    // file is even opened.
     assert_fails(
         "audio_attenuation",
         "--inner-radius",
@@ -206,11 +199,6 @@ fn the_audio_branch_exits_nonzero() {
 }
 
 /// The `--anim-mode` branch, on the image/sequence path.
-///
-/// The numeric flags here are the H2 half: `--fps`, `--start`, `--duration`,
-/// `--max-frames`, `--width`, `--height` and `--pixel-extent` all used to
-/// `.expect(...)` and exit 101 with a backtrace hint, while the identical flags
-/// in the audio and video branches errored cleanly.
 #[test]
 fn the_anim_branch_exits_nonzero() {
     let png = tiny_png().to_string_lossy().to_string();
@@ -250,9 +238,7 @@ fn the_anim_branch_exits_nonzero() {
     );
 }
 
-/// The `--text` branch. `--font bogus` exited 1 under `--anim-mode text` and 0
-/// here, from the identical `text_options` error -- the sharpest instance of
-/// the whole finding.
+/// The `--text` branch.
 #[test]
 fn the_text_branch_exits_nonzero() {
     let png = tiny_png().to_string_lossy().to_string();
@@ -272,8 +258,7 @@ fn the_text_branch_exits_nonzero() {
     );
 }
 
-/// The heightmap / `--img` branch, the oldest one and the last to keep its
-/// `.expect(...)`s.
+/// The heightmap / `--img` branch.
 #[test]
 fn the_heightmap_branch_exits_nonzero() {
     let png = tiny_png().to_string_lossy().to_string();
@@ -294,13 +279,8 @@ fn the_heightmap_branch_exits_nonzero() {
     let _ = std::fs::remove_file(&txt);
 }
 
-/// **A zero-pixel render is refused, not "Done!".**
-///
-/// `--width 0 --height 0` in brick mode used to print a cost line reading "0
-/// pixel(s)", write a 5678-byte save and exit 0, while `--anim-mode text`
-/// refused the identical input and the GUI's sliders could not express it at
-/// all. `--size 0` / `--vertical 0` are the same shape on the heightmap path,
-/// where the GUI's sliders likewise start at 1.
+// A zero-pixel render is refused, not "Done!": `--width`/`--height` in brick
+// mode and `--size`/`--vertical` on the heightmap path, same shape.
 #[test]
 fn a_zero_sized_render_is_refused_everywhere() {
     let png = tiny_png().to_string_lossy().to_string();
@@ -325,15 +305,9 @@ fn a_zero_sized_render_is_refused_everywhere() {
     assert_fails("zero_vertical", "--vertical", &[png, "--vertical", "0"]);
 }
 
-/// **`--braille`/`--blocks` under `--anim-mode text` is refused, not warned
-/// about and then shipped.**
-///
-/// The two disagree by construction: `text_options` replaces the geometry with
-/// `mono_geometry(Braille, ..)`, so the world is laid out for braille, while the
-/// animated text encoder (`text::encode_bands`/`encode_row`) never consults
-/// `opts.mode` and emits colour runs regardless. The old behaviour printed the
-/// warning, printed a cost readout describing the COLOUR render, wrote a
-/// 7721-byte save and exited 0.
+// The two disagree by construction: `text_options` lays the geometry out for
+// braille, while the animated text encoder never consults `opts.mode` and
+// emits colour runs regardless.
 #[test]
 fn braille_under_anim_text_is_refused_rather_than_rendered_wrong() {
     let png = tiny_png().to_string_lossy().to_string();

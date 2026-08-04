@@ -2,14 +2,10 @@
 //! UI shows this before the user commits to a render.
 //!
 //! Every estimator here takes the whole [`AnimOptions`] rather than the loose
-//! numbers it happens to need. That is not tidiness -- it is the one property
-//! that keeps the readout and the render describing the same graph. Both
-//! failures this file has actually shipped were the other shape: a
-//! `char_repeat` hard-coded to `2` made a single-glyph `--font` band 192x108
-//! thirty-six ways while the readout still claimed fifty-four, and a
-//! subtitle track's two gates were built but never counted, so a subtitled
-//! render came in two gates over what the user was shown. A parameter list
-//! that cannot express the difference cannot get it wrong.
+//! numbers it happens to need -- the one property that keeps the readout and
+//! the render describing the same graph. A parameter list that cannot
+//! express a difference (e.g. `char_repeat`, or whether a subtitle track is
+//! set) cannot get it wrong the way a hand-picked subset can.
 use super::bricks::AnimOptions;
 use super::pack::{HEX_STRIDE, PIXELS_PER_CHUNK};
 
@@ -28,7 +24,7 @@ pub struct Cost {
 /// What a subtitle track adds to a render, in `(gates, wires, bricks)`.
 ///
 /// Exactly what [`crate::anim::subtitle_display::add_subtitle_display`]
-/// builds, which is the same shape as ONE MORE BAND of text mode: an
+/// builds, which is the same shape as one more band of text mode: an
 /// `ArrayVar` + an `ArrayVar_Get` per bank, a `Select` per bank boundary,
 /// three wires per bank (`ArrayVarRef`, `Index`, `Exec`) plus three per
 /// boundary (the select's inputs) plus one into the `TextDisplay`'s `Text`
@@ -55,10 +51,34 @@ fn subtitle_cost(opts: &AnimOptions, banks: usize) -> (usize, usize, usize) {
     )
 }
 
+/// What the pre-wired control buttons add, in `(gates, wires, bricks)`.
+///
+/// Exactly what [`crate::anim::controls::add_control_buttons`] builds: three
+/// animated-button bricks on the main grid, each carrying its own label
+/// component (no separate cube), so [`crate::anim::controls::CONTROL_BRICKS`]
+/// main-grid bricks and [`crate::anim::controls::CONTROL_WIRES`] wires (one
+/// `bHeld` wire per button), and no gate: the buttons are main-grid bricks, and
+/// `gates` here (as the estimate-vs-render tests measure it) counts inner-grid
+/// gates only. The buttons are counted in `bricks`, the same slot the shell,
+/// display bricks and subtitle anchor already sit in.
+///
+/// `(0, 0, 0)` when off, and also when [`AnimOptions::external_clock`] is set --
+/// that render builds no timer, so there are no pins to drive and the renderer
+/// skips the buttons. This matches the render exactly rather than following the
+/// clock's own over-count, and no estimate-vs-render test pairs an external
+/// clock with the buttons on.
+fn control_button_cost(opts: &AnimOptions) -> (usize, usize, usize) {
+    if opts.control_buttons && !opts.external_clock {
+        (0, super::controls::CONTROL_WIRES, super::controls::CONTROL_BRICKS)
+    } else {
+        (0, 0, 0)
+    }
+}
+
 /// Estimate the build cost of a `width * height` screen over `frames` frames,
 /// spilling across arrays of at most `opts.bank_size` frames each.
 ///
-/// This is an **upper bound**, and the bound is not uniform across fields.
+/// This is an upper bound, and the bound is not uniform across fields.
 /// `gates`, `wires` and `bricks` assume every pixel survives; a pixel that is
 /// fully transparent across the whole clip is culled and emits no display
 /// brick and no gates, so a real render of a mostly-transparent clip can come
@@ -66,7 +86,7 @@ fn subtitle_cost(opts: &AnimOptions, banks: usize) -> (usize, usize, usize) {
 /// readout shown before a render is committed to, and it deliberately never
 /// under-promises.
 ///
-/// `chars` is **exact**, not a bound. A culled pixel still reserves its
+/// `chars` is exact, not a bound. A culled pixel still reserves its
 /// [`HEX_STRIDE`] characters in every frame string, so that each surviving
 /// pixel's offset stays a plain `pixel_in_chunk * HEX_STRIDE` with no remap
 /// table -- see [`super::pack`].
@@ -80,34 +100,37 @@ pub fn estimate(width: u32, height: u32, frames: usize, opts: &AnimOptions) -> C
     let banks = frames.div_ceil(opts.bank_size.max(1)).max(1);
     let boundaries = banks - 1;
     let (sub_gates, sub_wires, sub_bricks) = subtitle_cost(opts, banks);
+    let (cb_gates, cb_wires, cb_bricks) = control_button_cost(opts);
     Cost {
         pixels,
-        // 2 per pixel + 2 per chunk per bank (ArrayVar, Get) + 4 clock
+        // 2 per pixel + 2 per chunk per bank (ArrayVar, Get) + 6 clock
         // + 1 detector, plus per boundary: comparator, branch, index subtract,
-        // and one value select per chunk
-        gates: 2 * pixels + 2 * chunks * banks + 5 + boundaries * 3 + boundaries * chunks
-            + sub_gates,
+        // and one value select per chunk. The 6 clock gates are the 4 index
+        // gates plus the length and progress status taps.
+        gates: 2 * pixels + 2 * chunks * banks + 7 + boundaries * 3 + boundaries * chunks
+            + sub_gates
+            + cb_gates,
         // 3 per pixel + 2 per chunk per bank + exec chain + detector feed
-        // + 8 clock (3 chain + 3 control pins + Rate + Done), plus per
+        // + 11 clock (3 chain + 3 control pins + Rate + Done + the length and
+        // progress taps: 2 pin writes + 1 shared frame-index read), plus per
         // boundary: comparator InputA (1) + subtract InputA (1) + branch
         // bCond/Exec (2) + one select's bSelectB/InputA/InputB (3) per chunk
         //
-        // The exec chain is `chunks * banks`, NOT `chunks * banks - 1`:
-        // `build_brick_world` writes one wire per `Get` INCLUDING the first
+        // The exec chain is `chunks * banks`, not `chunks * banks - 1`:
+        // `build_brick_world` writes one wire per `Get` including the first
         // (`detector.OnChanged -> get0.Exec`), and the separate `+ 1` here is
         // the detector's own feed (`frame_index -> detector.Input`), so
-        // nothing absorbs that first link. Counting the chain as one short and
-        // the clock as 6 instead of 8 is how this estimate spent its whole
-        // life exactly 3 wires under every real render.
+        // nothing absorbs that first link.
         wires: 3 * pixels
             + 2 * chunks * banks
             + chunks * banks
             + 1
-            + 8
+            + 11
             + boundaries * (3 * chunks + 4)
-            + sub_wires,
-        // one display brick per pixel + the microchip shell
-        bricks: pixels + 1 + sub_bricks,
+            + sub_wires
+            + cb_wires,
+        // one display brick per pixel + the microchip shell + control buttons
+        bricks: pixels + 1 + sub_bricks + cb_bricks,
         chunks,
         banks,
         frames,
@@ -115,27 +138,27 @@ pub fn estimate(width: u32, height: u32, frames: usize, opts: &AnimOptions) -> C
     }
 }
 
-/// Estimate the build cost of the SAME screen rendered in colour-array mode
+/// Estimate the build cost of the same screen rendered in colour-array mode
 /// ([`crate::anim::color_bricks`]) instead of hex mode.
 ///
 /// A separate function rather than a parameter on [`estimate`], because
 /// almost every term differs: there are no pack chunks, no characters, one
-/// array and one `Get` per PIXEL rather than per chunk, no `Substring` or
-/// `MakeColorHex`, and a `Select` per PIXEL (not per chunk) at every bank
+/// array and one `Get` per pixel rather than per chunk, no `Substring` or
+/// `MakeColorHex`, and a `Select` per pixel (not per chunk) at every bank
 /// boundary. Handing [`estimate`]'s number to a colour-array render would be
 /// wrong in both directions at once -- it over-counts the per-pixel expression
 /// gates and wildly under-counts a boundary.
 ///
-/// Like [`estimate`] this is an **upper bound** on `gates`, `wires` and
-/// `bricks`: it assumes every pixel survives, and a pixel transparent across
-/// the whole clip is culled and emits nothing at all.
+/// Like [`estimate`] this is an upper bound on `gates`, `wires` and `bricks`:
+/// it assumes every pixel survives, and a pixel transparent across the whole
+/// clip is culled and emits nothing at all.
 ///
 /// The counts assume the built-in clock. `AnimOptions::external_clock`
-/// replaces the 4 clock gates and their 8 wires with a single input pin, so
+/// replaces the 6 clock gates and their 11 wires with a single input pin, so
 /// that render comes in slightly under -- the same simplification [`estimate`]
 /// makes.
 ///
-/// `chunks` and `chars` are reported as **0**, and that is the true answer
+/// `chunks` and `chars` are reported as 0, and that is the true answer
 /// rather than a placeholder: this encoding tiles nothing into chunks and
 /// writes no strings whatsoever. What it does write is
 /// `pixels * frames` `(R,G,B,A)` array elements, which
@@ -145,21 +168,24 @@ pub fn estimate_color_array(width: u32, height: u32, frames: usize, opts: &AnimO
     let banks = frames.div_ceil(opts.bank_size.max(1)).max(1);
     let boundaries = banks - 1;
     let (sub_gates, sub_wires, sub_bricks) = subtitle_cost(opts, banks);
+    let (cb_gates, cb_wires, cb_bricks) = control_button_cost(opts);
     Cost {
         pixels,
         // per pixel: one ArrayVar + one Get per bank, plus one Select per
-        // boundary; plus 4 clock + 1 detector; plus per boundary a comparator,
-        // a branch and an index subtract.
-        gates: pixels * (2 * banks + boundaries) + 5 + boundaries * 3 + sub_gates,
+        // boundary; plus 6 clock + 1 detector; plus per boundary a comparator,
+        // a branch and an index subtract. The 6 clock gates are the 4 index
+        // gates plus the length and progress status taps.
+        gates: pixels * (2 * banks + boundaries) + 7 + boundaries * 3 + sub_gates + cb_gates,
         // per pixel: ArrayVarRef + Index + Exec per bank (3), plus
         // bSelectB/InputA/InputB per boundary (3), plus the one wire into the
         // display brick's Color; plus the detector feed (1), the clock's own
-        // 8 (3 chain + 3 control pins + Rate + Done); plus per boundary the
-        // comparator's InputA, the subtract's InputA and the branch's
-        // bCond/Exec.
-        wires: pixels * (3 * banks + 3 * boundaries + 1) + 1 + 8 + boundaries * 4 + sub_wires,
-        // one display brick per pixel + the microchip shell
-        bricks: pixels + 1 + sub_bricks,
+        // 11 (3 chain + 3 control pins + Rate + Done + length/progress taps);
+        // plus per boundary the comparator's InputA, the subtract's InputA and
+        // the branch's bCond/Exec.
+        wires: pixels * (3 * banks + 3 * boundaries + 1) + 1 + 11 + boundaries * 4 + sub_wires
+            + cb_wires,
+        // one display brick per pixel + the microchip shell + control buttons
+        bricks: pixels + 1 + sub_bricks + cb_bricks,
         // Genuinely zero, not unknown: see the doc comment.
         chunks: 0,
         banks,
@@ -172,7 +198,7 @@ pub fn estimate_color_array(width: u32, height: u32, frames: usize, opts: &AnimO
 /// ([`crate::anim::text_bricks`]) over `frames` frames, spilling across
 /// arrays of at most `opts.bank_size` frames each.
 ///
-/// Text mode's unit of cost is the BAND
+/// Text mode's unit of cost is the band
 /// ([`crate::anim::text_layout::plan_bands`]), not the pixel: each band gets
 /// its own `ArrayVar` + `ArrayVar_Get` per bank, plus a `Select` per boundary
 /// -- the same shape [`estimate`] and [`estimate_color_array`] use, just
@@ -182,25 +208,23 @@ pub fn estimate_color_array(width: u32, height: u32, frames: usize, opts: &AnimO
 /// but only 54 bands.
 ///
 /// The band layout depends on `opts.text.char_repeat`
-/// ([`crate::text::TextOptions`]). It was briefly hard-coded to `2` (the value
-/// `FontPreset::MonaspaceArgon` sets), which made this readout disagree with
-/// the render it described whenever `--font` chose a single-glyph cell: 192x108
-/// bands 36 ways at `char_repeat` 1 but the estimate still claimed 54. Reading
-/// it off the same `AnimOptions` the render is built from is what makes that
-/// unrepresentable -- see the module doc.
+/// ([`crate::text::TextOptions`]); reading it off the same `AnimOptions` the
+/// render is built from (rather than a separate parameter) is what keeps a
+/// `--font` choosing a different-width glyph from silently disagreeing with
+/// the render it describes -- see the module doc.
 ///
-/// This is NOT the same tradeoff [`estimate`] and [`estimate_color_array`] make
+/// This is not the same tradeoff [`estimate`] and [`estimate_color_array`] make
 /// by assuming the built-in clock. That assumption is off by a fixed handful of
 /// gates; this one changes the unit the whole estimate is counted in.
 ///
 /// Confirmed against a real render, not just arithmetic: a 192x108 clip
-/// renders at exactly 113 gates and 55 bricks in
+/// renders at exactly 115 gates and 55 bricks in
 /// `text_bricks::tests::a_192x108_render_costs_two_gates_per_band_plus_the_clock`,
-/// matching `2 * 54 + 5` and `54 + 1` here.
+/// matching `2 * 54 + 7` and `54 + 1` here.
 ///
-/// `chars` is reported as **0**, and that is the honest answer rather than a
+/// `chars` is reported as 0, and that is the honest answer rather than a
 /// placeholder. Unlike hex mode's fixed per-pixel stride, text mode writes an
-/// explicit `<color="RRGGBB">` tag at the start of every colour RUN, so
+/// explicit `<color="RRGGBB">` tag at the start of every colour run, so
 /// length depends on the clip's actual content -- something this function has
 /// no way to know before a render. A number that looks like a measurement but
 /// is a guess is worse than no number: the CLI instead prints
@@ -208,22 +232,19 @@ pub fn estimate_color_array(width: u32, height: u32, frames: usize, opts: &AnimO
 /// clearly labelled as a bound rather than an estimate.
 ///
 /// `pixels` is still `width * height`, for display purposes (it is not the
-/// unit gates/bricks are counted in here). `chunks` is genuinely **0**: text
+/// unit gates/bricks are counted in here). `chunks` is genuinely 0: text
 /// mode tiles nothing into [`super::pack`] chunks, the same true-zero
 /// [`estimate_color_array`] reports for the same reason.
 ///
 /// # Why this returns a `Result` and its two siblings do not
 ///
-/// Text mode is the only encoding whose GEOMETRY can be impossible:
+/// Text mode is the only encoding whose geometry can be impossible:
 /// [`super::text_layout::plan_bands`] caps the width it can band (555 px at
-/// `char_repeat` 2), and past that there is no layout at all. This used to
-/// swallow that with `.unwrap_or(0)` -- the only place in the three estimators
-/// where a `Result` became a number -- and 0 bands reads out as *"5 gate(s),
-/// 1 brick(s)"*: a plausible, unusually CHEAP render, printed by the CLI and
-/// shown in the GUI panel next to the Generate button, for a configuration
-/// `build_text_world` then refuses outright. An impossible geometry has to
-/// surface as impossible; a small number is the one thing it must not look
-/// like.
+/// `char_repeat` 2), and past that there is no layout at all. Swallowing
+/// that into a band count of 0 reads out as "5 gate(s), 1 brick(s)" -- a
+/// plausible, cheap-looking render for a configuration `build_text_world`
+/// then refuses outright. An impossible geometry has to surface as
+/// impossible, not as a small number.
 pub fn estimate_text(
     width: u32,
     height: u32,
@@ -232,13 +253,11 @@ pub fn estimate_text(
 ) -> Result<Cost, String> {
     // The band count depends on `char_repeat`: a single-glyph font (Orbitron,
     // `char_repeat` 1) fits more rows per component than a double-glyph one,
-    // so 192x108 bands 36 ways rather than 54. Hard-coding the default
-    // silently made this readout disagree with the render it was describing
-    // whenever `--font` changed it -- which is why this reads the option off
-    // the same struct the render is built from rather than taking it as a
-    // parameter a caller could supply from somewhere else.
+    // so 192x108 bands 36 ways rather than 54. Reading the option off the
+    // same struct the render is built from, rather than taking it as a
+    // separate parameter, is what keeps this in sync with `--font`.
     //
-    // Propagated, NOT swallowed: see this function's doc.
+    // Propagated, not swallowed: see this function's doc.
     let bands = super::text_layout::plan_bands(
         width as usize,
         height as usize,
@@ -248,20 +267,24 @@ pub fn estimate_text(
     let banks = frames.div_ceil(opts.bank_size.max(1)).max(1);
     let boundaries = banks - 1;
     let (sub_gates, sub_wires, sub_bricks) = subtitle_cost(opts, banks);
+    let (cb_gates, cb_wires, cb_bricks) = control_button_cost(opts);
     Ok(Cost {
         pixels: width as usize * height as usize,
-        // 2 per band per bank (ArrayVar, Get) + 4 clock + 1 detector, plus
+        // 2 per band per bank (ArrayVar, Get) + 6 clock + 1 detector, plus
         // per boundary: comparator, branch, index subtract, and one select
-        // per band.
-        gates: 2 * bands * banks + 5 + boundaries * 3 + boundaries * bands + sub_gates,
+        // per band. The 6 clock gates are the 4 index gates plus the length
+        // and progress status taps.
+        gates: 2 * bands * banks + 7 + boundaries * 3 + boundaries * bands + sub_gates + cb_gates,
         // 3 per band per bank (ArrayVarRef, Index, Exec) + 1 per band (the
         // wire into the TextDisplay's Text port) + detector feed (1) + 3
-        // clock chain + 3 control pins + Rate + Done (8), plus per boundary:
-        // comparator InputA (1) + subtract InputA (1) + branch bCond/Exec (2)
-        // + one select's bSelectB/InputA/InputB (3) per band.
-        wires: bands * (3 * banks + 3 * boundaries + 1) + 1 + 8 + boundaries * 4 + sub_wires,
-        // one TextDisplay anchor per band + the microchip shell
-        bricks: bands + 1 + sub_bricks,
+        // clock chain + 3 control pins + Rate + Done + length/progress taps
+        // (11), plus per boundary: comparator InputA (1) + subtract InputA (1)
+        // + branch bCond/Exec (2) + one select's bSelectB/InputA/InputB (3)
+        // per band.
+        wires: bands * (3 * banks + 3 * boundaries + 1) + 1 + 11 + boundaries * 4 + sub_wires
+            + cb_wires,
+        // one TextDisplay anchor per band + the microchip shell + control buttons
+        bricks: bands + 1 + sub_bricks + cb_bricks,
         // Genuinely zero, not unknown: text mode tiles nothing into chunks.
         chunks: 0,
         banks,
@@ -282,15 +305,23 @@ mod tests {
     /// assertion in this module is written against, so the numbers below stay
     /// the ones a render without subtitles has always produced.
     fn opts(bank_size: usize) -> AnimOptions {
-        AnimOptions { bank_size, ..AnimOptions::default() }
+        // `control_buttons: false` so every absolute formula assertion below
+        // stays the button-free number it has always been; the buttons add a
+        // flat main-grid cost measured separately in
+        // `the_control_buttons_add_a_flat_main_grid_cost`.
+        AnimOptions { bank_size, control_buttons: false, ..AnimOptions::default() }
     }
 
-    /// The same, with a subtitle track. The track's CONTENT is irrelevant to
+    /// The same, with a subtitle track. The track's content is irrelevant to
     /// the cost -- one `ArrayVar` holds every frame's line however many cues
     /// there are -- so this is deliberately a single cue.
     fn subbed(bank_size: usize) -> AnimOptions {
         AnimOptions {
             bank_size,
+            // Buttons off too, so the subtitle delta tests (`with` - `without`)
+            // isolate the subtitle cost -- both sides carry the same (zero)
+            // button cost.
+            control_buttons: false,
             subtitles: Some(Arc::new(Subtitles::new(vec![Cue {
                 start_s: 0.0,
                 end_s: 1.0,
@@ -300,21 +331,55 @@ mod tests {
         }
     }
 
+    /// The control buttons add a flat main-grid cost -- 3 bricks and 3 wires, no
+    /// gate -- on top of any render, in every mode, exactly as
+    /// `crate::anim::controls` builds it and each renderer wires it.
+    #[test]
+    fn the_control_buttons_add_a_flat_main_grid_cost() {
+        use crate::anim::controls::{CONTROL_BRICKS, CONTROL_WIRES};
+        let on = |o: AnimOptions| AnimOptions { control_buttons: true, ..o };
+        for (without, with) in [
+            (
+                estimate(64, 36, 300, &opts(BANK_FRAMES)),
+                estimate(64, 36, 300, &on(opts(BANK_FRAMES))),
+            ),
+            (
+                estimate_color_array(64, 36, 300, &opts(BANK_FRAMES)),
+                estimate_color_array(64, 36, 300, &on(opts(BANK_FRAMES))),
+            ),
+            (
+                estimate_text(192, 108, 300, &opts(BANK_FRAMES)).unwrap(),
+                estimate_text(192, 108, 300, &on(opts(BANK_FRAMES))).unwrap(),
+            ),
+        ] {
+            assert_eq!(with.gates - without.gates, 0, "the detectors are main-grid, not gates");
+            assert_eq!(with.wires - without.wires, CONTROL_WIRES);
+            assert_eq!(with.bricks - without.bricks, CONTROL_BRICKS);
+        }
+        // And an external clock, which builds no timer, carries no buttons even
+        // with the toggle on -- there are no pins to drive.
+        let ext = AnimOptions { external_clock: true, control_buttons: true, ..opts(BANK_FRAMES) };
+        assert_eq!(
+            estimate(64, 36, 300, &ext).bricks,
+            estimate(64, 36, 300, &opts(BANK_FRAMES)).bricks,
+            "external clock exposes no control pins, so the estimate adds no buttons"
+        );
+    }
+
     #[test]
     fn matches_the_spec_formula() {
         // 64x36 = 2304 px; ceil(2304/1666) = 2 chunks
-        // gates = 2*2304 + 2*2 + 5 = 4617
+        // gates = 2*2304 + 2*2 + 7 = 4619
         let c = estimate(64, 36, 300, &opts(BANK_FRAMES));
         assert_eq!(c.pixels, 2304);
         assert_eq!(c.chunks, 2);
-        assert_eq!(c.gates, 4617);
+        assert_eq!(c.gates, 4619);
         // wires = 3/pixel + 2/chunk (ArrayVarRef, Index) + chunks exec chain
-        //         + 1 detector feed + 8 clock
-        //       = 6912 + 4 + 2 + 1 + 8 = 6927
+        //         + 1 detector feed + 11 clock
+        //       = 6912 + 4 + 2 + 1 + 11 = 6930
         // Pinned against a real render in
-        // `tests/anim_world.rs::the_hex_cost_estimate_matches_a_real_render`;
-        // this used to read 6924, which no render ever produced.
-        assert_eq!(c.wires, 6927);
+        // `tests/anim_world.rs::the_hex_cost_estimate_matches_a_real_render`.
+        assert_eq!(c.wires, 6930);
     }
 
     #[test]
@@ -345,7 +410,7 @@ mod tests {
     fn a_sub_limit_clip_is_one_bank_and_costs_what_it_used_to() {
         let c = estimate(64, 36, 300, &opts(BANK_FRAMES));
         assert_eq!(c.banks, 1);
-        assert_eq!(c.gates, 4617, "unchanged from the pre-spillover formula");
+        assert_eq!(c.gates, 4619, "unchanged from the pre-spillover formula");
     }
 
     #[test]
@@ -391,15 +456,15 @@ mod tests {
 
     /// The headline comparison, at the reference 64x36 screen: colour-array
     /// mode keeps hex mode's 2 components per pixel and drops the per-chunk
-    /// array/Get pair, so it comes in slightly CHEAPER on gates while doing
+    /// array/Get pair, so it comes in slightly cheaper on gates while doing
     /// half the per-frame work.
     #[test]
     fn a_single_bank_colour_array_render_is_two_gates_per_pixel_plus_overhead() {
         let c = estimate_color_array(64, 36, 300, &opts(BANK_FRAMES));
         assert_eq!(c.pixels, 2304);
         assert_eq!(c.banks, 1);
-        assert_eq!(c.gates, 2 * 2304 + 5, "2 gates per pixel + 4 clock + 1 detector");
-        assert_eq!(c.wires, 4 * 2304 + 9, "4 wires per pixel + detector feed + 8 clock");
+        assert_eq!(c.gates, 2 * 2304 + 7, "2 gates per pixel + 6 clock + 1 detector");
+        assert_eq!(c.wires, 4 * 2304 + 12, "4 wires per pixel + detector feed + 11 clock");
         assert_eq!(c.bricks, 2304 + 1);
 
         // Against hex mode's own estimate for the same screen: the two
@@ -419,8 +484,8 @@ mod tests {
         }
     }
 
-    /// **The reason this mode gets its own estimate.** A bank boundary costs a
-    /// Select per PIXEL here, against a Select per CHUNK in hex mode -- on a
+    /// The reason this mode gets its own estimate: a bank boundary costs a
+    /// Select per pixel here, against a Select per chunk in hex mode -- on a
     /// 64x36 screen that is 2304 versus 2. Handing a colour-array render hex
     /// mode's boundary arithmetic would under-count it by three orders of
     /// magnitude.
@@ -457,7 +522,7 @@ mod tests {
 
     /// Frame count must not move the gate count while it stays inside one
     /// bank: a longer clip in colour-array mode is a longer array, not more
-    /// hardware. (It IS more host memory -- see `color_pack`.)
+    /// hardware. (It is more host memory -- see `color_pack`.)
     #[test]
     fn a_longer_clip_inside_one_bank_costs_no_extra_gates() {
         let short = estimate_color_array(32, 18, 10, &opts(BANK_FRAMES));
@@ -474,7 +539,7 @@ mod tests {
         // 192x108 at char_repeat 2 -> 54 bands.
         let c = estimate_text(192, 108, 300, &opts(BANK_FRAMES)).expect("a legal geometry must estimate");
         assert_eq!(c.banks, 1);
-        assert_eq!(c.gates, 2 * 54 + 5);
+        assert_eq!(c.gates, 2 * 54 + 7);
         assert_eq!(c.bricks, 54 + 1);
     }
 
@@ -498,15 +563,11 @@ mod tests {
         );
     }
 
-    /// **An impossible text geometry must read as impossible, not as a
-    /// bargain.**
-    ///
-    /// `plan_bands` caps the width it can lay out (555 px at `char_repeat` 2).
-    /// Past that this used to `.unwrap_or(0)` the layout error into a band
-    /// count of zero, which comes out as 5 gates and 1 brick -- a plausible,
-    /// unusually CHEAP render. The CLI printed it and the GUI showed it beside
-    /// the Generate button, and only pressing Generate revealed that
-    /// `build_text_world` refuses the configuration outright.
+    /// An impossible text geometry must read as impossible, not as a bargain:
+    /// `plan_bands` caps the width it can lay out (555 px at `char_repeat` 2),
+    /// and past that a band count of 0 reads out as 5 gates and 1 brick -- a
+    /// plausible, unusually cheap render for a config `build_text_world`
+    /// refuses outright.
     #[test]
     fn an_unlayoutable_text_geometry_is_an_error_not_a_five_gate_render() {
         let o = opts(BANK_FRAMES);
@@ -533,17 +594,16 @@ mod tests {
                 o.text.char_repeat.max(1)
             )
             .unwrap_err(),
-            "the estimate must surface the layout's OWN error, which is the one the \
+            "the estimate must surface the layout's own error, which is the one the \
              renderer would fail with"
         );
 
-        // And the number it used to report instead, stated so the failure mode
-        // cannot quietly come back: 0 bands is 5 gates and 1 brick, which is
-        // indistinguishable from a tiny legal render.
+        // 0 bands is 5 gates and 1 brick, indistinguishable from a tiny legal
+        // render -- exactly the number this Result now prevents.
         let zero_band_gates = 2 * 0 * 1 + 5;
         assert_eq!(zero_band_gates, 5, "0 bands reads as a 5-gate render");
 
-        // The widest geometry that IS layoutable must still estimate, so this
+        // The widest geometry that is layoutable must still estimate, so this
         // rejects only what the renderer rejects.
         assert!(
             estimate_text(555, 108, 300, &o).is_ok(),
@@ -559,12 +619,8 @@ mod tests {
 
     // --- subtitles -------------------------------------------------------
     //
-    // The readout must match the render. A subtitle track is two gates and
-    // these tests are what stop the estimate quietly disagreeing about them
-    // again: the first version of this feature built the gates and counted
-    // none of them, so a subtitled render came in exactly 2 over what the
-    // user was shown -- the same class of bug as the `char_repeat` one above,
-    // and invisible for the same reason (both numbers look plausible).
+    // The readout must match the render: a subtitle track adds exactly two
+    // gates, and these tests are what stop the estimate silently missing them.
 
     /// The headline: two gates, in every mode, at one bank.
     #[test]

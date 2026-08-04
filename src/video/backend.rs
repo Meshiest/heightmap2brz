@@ -2,41 +2,27 @@
 //! video file, and enforces the two safety guards that keep the builtin
 //! decoder away from streams it decodes incorrectly.
 //!
-//! Two guards, same shape:
+//! Two guards, same shape -- [`BuiltinVideoSource::open_path`]'s own checks
+//! are belt, this module is suspenders, and [`Backend::Auto`] routes around
+//! a refusal instead of surfacing it as a hard error:
 //!
 //! - **CAVLC entropy** ([`crate::video::demux::EntropyCoding::Cavlc`], and
-//!   [`crate::video::demux::EntropyCoding::Unknown`] treated the same way,
-//!   unsafe on purpose). `rust_h264` decodes these to visibly wrong pixels
-//!   with no error and no panic (measured: mean abs channel diff up to ~27
-//!   luma, ~49 chroma -- see `.superpowers/sdd/2026-07-27-video-decode-
-//!   backends/task-1-evaluation.md`). [`BuiltinVideoSource::open_path`] already
-//!   refuses this before this module exists at all; this module's job is to
-//!   make [`Backend::Auto`] route AROUND it rather than surface the refusal
-//!   as a hard error.
-//! - **BT.2020 colour matrix** (`matrix_coefficients` 9 or 10). Not in the
-//!   original task brief -- added because Task 5's fix-round-1 report
-//!   (`progress.md`) flagged it as a known, MEASURED gap: falling back to
-//!   BT.601 scores 2.83-2.91 mean abs per-channel diff against ffmpeg on
-//!   synthetic content, close enough to this project's 3.0 "structurally
-//!   wrong" threshold that real saturated footage could plausibly exceed it
-//!   silently. `colour_info_from_sps_rbsp` in `builtin.rs` folds 9/10 into
-//!   BT.601 without erroring -- safe only because THIS module is the one
-//!   meant to intercept it first, exactly the same division of labour as the
-//!   CAVLC guard (builtin.rs's own checks are belt, this module is
-//!   suspenders -- see `BuiltinVideoSource::open_path`'s doc for that framing).
+//!   `Unknown` treated the same way). `rust_h264` decodes these to visibly
+//!   wrong pixels with no error and no panic.
+//! - **BT.2020 colour matrix** (`matrix_coefficients` 9 or 10).
+//!   `colour_info_from_sps_rbsp` in `builtin.rs` folds 9/10 into BT.601
+//!   without erroring -- safe only because this module intercepts it first.
 //!
-//! **Selection happens exactly once**, inside [`open_video`]. The returned
-//! `Box<dyn FrameSource>` is a concrete, already-chosen backend; nothing
-//! stored in it re-probes on a later [`FrameSource::open`] call. This matters
-//! beyond tidiness: a later feature's two-pass scan calls `open()` twice on
-//! the same source, and a source that could land on a different backend
-//! between those two calls would silently compare two different decoders'
-//! output against each other.
+//! Selection happens exactly once, inside [`open_video`]: the returned
+//! `Box<dyn FrameSource>` is a concrete, already-chosen backend that never
+//! re-probes on a later [`FrameSource::open`] call, so two opens of the same
+//! source can't silently land on different decoders and compare against
+//! each other.
 //!
-//! **On wasm there is no ffmpeg backend at all** (`video::ffmpeg` is
-//! `#[cfg(not(target_arch = "wasm32"))]`). A CAVLC or BT.2020 stream there has
-//! no correct decode path and [`open_video`] fails with a clear message --
-//! never a best-effort decode through the guard.
+//! On wasm there is no ffmpeg backend at all (`video::ffmpeg` is
+//! `#[cfg(not(target_arch = "wasm32"))]`), so a CAVLC or BT.2020 stream
+//! there has no correct decode path and [`open_video`] fails with a clear
+//! message rather than a best-effort decode through the guard.
 
 use crate::video::demux::Demuxer;
 use crate::video::builtin::{self, BuiltinVideoSource};
@@ -166,23 +152,16 @@ fn open_builtin_checked(path: &Path) -> Result<BuiltinVideoSource, String> {
 /// today and break silently the first time one of those messages is reworded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltinFailure {
-    /// The container parsed fine, but a guard refused this specific stream:
-    /// CAVLC or unknown entropy coding, a BT.2020 colour matrix, a non-H.264
-    /// codec, or no out-of-band parameter sets. ffmpeg decodes all of these
-    /// correctly, so it is exactly the right next step.
+    /// The container parsed fine, but a guard refused this stream (CAVLC,
+    /// BT.2020, wrong codec, no out-of-band parameter sets) -- ffmpeg
+    /// decodes all of these correctly.
     Guard,
-    /// The file is readable, but [`Demuxer::open`] could not parse it: an AVI
-    /// (this demuxer handles only MP4/MOV and MKV/WebM, yet `avi` is one of
-    /// `video::source::VIDEO_EXTENSIONS`), or a corrupt or otherwise
-    /// unsupported file. ffmpeg may still manage it -- it demuxes far more
-    /// containers, and tolerates damage this one refuses -- so this warrants a
-    /// fallback too; lumping it in with [`BuiltinFailure::Unreadable`] would make
-    /// `--backend auto` refuse every AVI outright, which it handles today.
+    /// The file is readable, but [`Demuxer::open`] could not parse the
+    /// container (e.g. an AVI, which this demuxer does not handle) -- ffmpeg
+    /// demuxes far more containers, so this warrants a fallback too.
     Container,
-    /// The file could not be opened for reading at all: missing, a directory,
-    /// or permission denied. No decode backend can fix that, so this is the
-    /// one class that must NOT be retried under ffmpeg -- doing so would
-    /// report a missing-ffmpeg problem for a file that was simply not there.
+    /// The file could not be opened for reading at all -- no decode backend
+    /// can fix that, so this must never be retried under ffmpeg.
     Unreadable,
 }
 
@@ -260,24 +239,14 @@ pub fn open_video_ensuring(
             }
 
             if let Err(ffmpeg_err) = ensure_ffmpeg() {
-                // BOTH reasons, never just the second: the builtin refusal
-                // is the one that says what is actually wrong with the file
-                // (e.g. "this stream uses CAVLC entropy coding"), and
-                // swallowing it in favour of "ffmpeg was not found" would
-                // leave the user holding the less actionable half.
-                //
-                // Each half's own text carries a "next step" suggestion
-                // written for when IT is the only backend that failed --
-                // `builtin_err` says "use --backend ffmpeg instead", and
-                // `ffmpeg_err` (from `ffmpeg::refusal`) says "run with
-                // --backend builtin". Concatenated as-is those two sentences
-                // point in opposite directions and neither is actually
-                // actionable here, since BOTH backends have already refused
-                // this exact file. The closing paragraph below is what
-                // resolves that: it says so explicitly, and names what
-                // genuinely would help, so a reader doesn't have to notice
-                // the contradiction and guess which suggestion (if either)
-                // still applies.
+                // Both reasons, never just the second -- the builtin refusal
+                // is what says what's actually wrong with the file. Each
+                // half's own text also suggests trying the OTHER backend
+                // (`builtin_err`: "use --backend ffmpeg"; `ffmpeg_err`: "run
+                // with --backend builtin"), which is nonsense once both have
+                // already failed, so the closing paragraph below overrides
+                // both suggestions explicitly instead of leaving the reader
+                // to notice the contradiction.
                 return Err(format!(
                     "{}: neither decode backend can handle this file.\n  \
                      builtin backend: {builtin_err}\n  ffmpeg backend: {ffmpeg_err}\n\n\
@@ -439,13 +408,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// GUARD 2, not in the original brief: added because Task 5's fix-round-1
-    /// report flagged BT.2020 (`matrix_coefficients` 9/10 falling back to
-    /// BT.601) as a known, MEASURED gap -- 2.83-2.91 mean abs per-channel
-    /// diff against ffmpeg on synthetic content, close enough to the 3.0
-    /// "wrong" threshold that real saturated footage could silently exceed
-    /// it. Treated exactly like CAVLC: `Auto` routes around it silently,
-    /// `Backend::Builtin` refuses it by name.
+    /// The BT.2020 guard, treated exactly like CAVLC: `Auto` routes around
+    /// it silently, `Backend::Builtin` refuses it by name (see
+    /// `bt2020_refusal` for the measured divergence that motivates it).
     #[test]
     fn bt2020_never_reaches_the_builtin_decoder() {
         let Some(path) = crate::video::ffmpeg::tests::sample_clip_args(
@@ -474,20 +439,15 @@ mod tests {
 
     // --- `open_video_ensuring`: when ffmpeg's availability is consulted ---
     //
-    // The bug these pin: `Backend::Auto` is the CLI DEFAULT, and an earlier
-    // version confirmed ffmpeg was installed BEFORE calling `open_video` for
-    // it. On a machine without ffmpeg, run headlessly (so consent downgrades
-    // to `Never`), that refused every video by default -- including CABAC
-    // H.264 files the builtin backend decodes perfectly well by itself.
+    // `Backend::Auto` is the CLI default; an earlier version checked ffmpeg
+    // was installed before calling `open_video`, which refused every video
+    // on a machine without ffmpeg -- including CABAC files the builtin
+    // backend decodes fine by itself.
     //
     // Availability is simulated through the injected `ensure_ffmpeg` closure
-    // rather than by scrubbing `PATH`, deliberately: `PATH` is process-wide
-    // and `cargo test` runs these in parallel with tests that need a real
-    // ffmpeg to generate their fixtures, so mutating it would make unrelated
-    // tests fail nondeterministically. (Task 3 hit exactly this and deleted
-    // its own `PATH`-scrubbing test for the same reason.) The real
-    // `PATH`-stripped case is covered end-to-end by hand at the CLI level --
-    // see this task's report.
+    // rather than by scrubbing `PATH`: `PATH` is process-wide and shared by
+    // parallel tests that need a real ffmpeg for their own fixtures, so
+    // mutating it would make unrelated tests fail nondeterministically.
 
     /// A closure standing in for an ffmpeg that is absent with consent
     /// denied, recording whether it was ever consulted.
@@ -498,9 +458,8 @@ mod tests {
         }
     }
 
-    /// THE regression test for this fix: a CABAC file, ffmpeg unavailable,
-    /// consent denied -- `Auto` must still render it, and must not so much as
-    /// ask about ffmpeg.
+    /// A CABAC file, ffmpeg unavailable, consent denied -- `Auto` must still
+    /// render it, and must not so much as ask about ffmpeg.
     #[test]
     fn auto_decodes_a_cabac_file_without_ever_consulting_ffmpeg() {
         let Some(path) = crate::video::ffmpeg::tests::sample_clip_args(
@@ -582,16 +541,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **MINOR 4's regression test.** Each half's own refusal names the
-    /// OTHER backend as its next step -- the builtin refusal says "use
-    /// --backend ffmpeg instead", and a real `video::ffmpeg::refusal()` (its
-    /// actual wording is reproduced here rather than called directly: it is
-    /// private to that module, and PATH cannot be scrubbed in this suite to
-    /// provoke the real thing -- see the block comment above) says "run
-    /// with --backend builtin". Concatenated naively, those two sentences give
-    /// directly OPPOSITE advice once both backends have already refused
-    /// this exact file, so neither is actually actionable. The combined
-    /// message must resolve that rather than just print it.
+    /// `ffmpeg::refusal()`'s real wording is reproduced here rather than
+    /// called directly: it is private to that module, and `PATH` cannot be
+    /// scrubbed in this suite to provoke the real thing (see the block
+    /// comment above `open_video_ensuring`'s combined-refusal branch).
     #[test]
     fn combined_refusal_gives_coherent_advice_not_contradictory_suggestions() {
         let Some(path) = crate::video::ffmpeg::tests::sample_clip_args(

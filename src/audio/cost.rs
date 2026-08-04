@@ -4,28 +4,19 @@
 //! reason: gate count is what actually limits a build, so a UI has to show it
 //! before the user commits to a render that may take minutes.
 //!
-//! # Why this takes `AudioOptions` and nothing loose
-//!
 //! [`estimate`] derives the speaker count the same way the renderer does --
 //! [`band_plan`] in bank mode, `opts.max_voices` in voice mode -- from the
-//! **same** [`AudioOptions`] value the render will be handed. A readout that
-//! disagrees with its render has shipped twice in this codebase already (a
-//! hard-coded `char_repeat`, and an uncounted subtitle track), and both times
-//! the shape of the bug was a parameter list that could express the
-//! difference. This one cannot: there is no way to ask it about a band count
-//! the render would not build.
+//! same [`AudioOptions`] value the render will be handed, so there is no way
+//! to ask it about a band count the render would not build.
 //!
-//! It returns `Result`, not a `Cost`, for the same reason. A `--subdiv` of 14
-//! or a voice-mode `--max-voices` of 0 is a render that CANNOT happen, and the
-//! honest readout for it is the renderer's own refusal -- not a plausible
-//! number for a build nothing will produce. Both checks are the renderer's
-//! ([`check_subdiv`], [`check_voice_count`]), called here rather than
-//! reimplemented.
-//!
-//! # What is exact and what is not
+//! It returns `Result`, not a `Cost`: a `--subdiv` of 14 or a voice-mode
+//! `--max-voices` of 0 is a render that cannot happen, and the honest readout
+//! for it is the renderer's own refusal, not a plausible number for a build
+//! nothing will produce. Both checks are the renderer's ([`check_subdiv`],
+//! [`check_voice_count`]), called here rather than reimplemented.
 //!
 //! Everything derived from the options -- speakers, streams, gates, wires,
-//! bricks per bank -- is **exact**, and
+//! bricks per bank -- is exact, and
 //! [`tests::the_estimate_matches_a_real_bank_build`] pins it against a real
 //! [`build_speaker_world`](crate::audio::speakers::build_speaker_world) rather
 //! than against arithmetic. Audio has no equivalent of brick mode's culled
@@ -41,45 +32,46 @@ use super::track::{AudioOptions, band_plan, check_subdiv};
 use super::voices::check_voice_count;
 use super::AudioMode;
 
-/// The clock's own gates: timer -> multiply -> truncate -> modulo. See
-/// [`crate::anim::clock::build_clock`], which both render modes reuse
-/// unchanged.
-const CLOCK_GATES: usize = 4;
+/// The clock's own gates: timer -> multiply -> truncate -> modulo (4), plus the
+/// length and progress status taps (2). See [`crate::anim::clock::build_clock`],
+/// which both render modes reuse unchanged.
+const CLOCK_GATES: usize = 6;
 
 /// The clock's own wires: 3 down its chain, 3 control pins
-/// (Pause/Restart/Resume), the Rate pin, and the Done output.
-const CLOCK_WIRES: usize = 8;
+/// (Pause/Restart/Resume), the Rate pin, the Done output, and the length and
+/// progress taps (2 pin writes + 1 shared frame-index read).
+const CLOCK_WIRES: usize = 11;
 
 /// The pause-mute detector's gates: a `BufferTicks`, a `CompareNotEqual` and a
 /// `Select`, shared by the whole bank (see
 /// [`crate::audio::speakers::scaffold`]). Flat -- +3 regardless of speaker
-/// count -- because the Select gates ONE master volume that every speaker's
+/// count -- because the Select gates one master volume that every speaker's
 /// multiply then reads.
 const PAUSE_MUTE_GATES: usize = 3;
 
 /// The pause-mute detector's wires: `Time -> BufferTicks.Input`,
 /// `Time -> CompareNotEqual.InputA`, `BufferTicks.Output ->
 /// CompareNotEqual.InputB`, `CompareNotEqual.bOutput -> Select.bSelectB`, and
-/// the `Volume` pin into `Select.InputB`. The Select's OUTPUT reuses the wire
+/// the `Volume` pin into `Select.InputB`. The Select's output reuses the wire
 /// each per-speaker multiply already spent on its `InputB` (it now sources from
 /// the Select instead of straight from the pin), so those are not new.
 const PAUSE_MUTE_WIRES: usize = 5;
 
-/// Every chip input/output pin an audio build carries: the clock's five
-/// (Pause, Restart, Resume, Rate, Done) plus the four `scaffold` adds
-/// (Inner Radius, Max Distance, Directional, Volume).
+/// Every chip input/output pin an audio build carries: the clock's seven
+/// (Pause, Restart, Resume, Rate, Done, Length, Progress) plus the four
+/// `scaffold` adds (Inner Radius, Max Distance, Directional, Volume).
 ///
-/// Pins are inner-grid bricks but are NOT gates, and [`AudioCost::gates`]
+/// Pins are inner-grid bricks but are not gates, and [`AudioCost::gates`]
 /// excludes them -- the same convention `anim`'s own tests count by
 /// (`world.grids[0].1.len() - pins`).
-pub const CHIP_PINS: usize = 9;
+pub const CHIP_PINS: usize = 11;
 
 /// What a render costs to build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioCost {
     /// Emitter bricks: one per band in bank mode, one per voice in voice mode.
     pub speakers: usize,
-    /// Per-frame data streams. One per speaker in bank mode (its volume); TWO
+    /// Per-frame data streams. One per speaker in bank mode (its volume); two
     /// per speaker in voice mode (its pitch and its volume), which is why a
     /// voice-mode build of the same speaker count costs roughly twice the
     /// array machinery.
@@ -92,7 +84,7 @@ pub struct AudioCost {
     pub gates: usize,
     pub wires: usize,
     /// Main-grid bricks: the speakers plus the microchip shell. The gates
-    /// live on the chip's INNER grid and are not counted here.
+    /// live on the chip's inner grid and are not counted here.
     pub bricks: usize,
     /// Numbers written into wire arrays: `streams * frames`. Audio writes
     /// numeric arrays directly -- no hex packing, no strings -- so this is the
@@ -115,38 +107,20 @@ impl AudioCost {
 ///
 /// `Err` is the renderer's own refusal, verbatim -- see the module doc for why
 /// this reports one instead of a number.
-///
-/// # The counts
-///
-/// With `S` speakers, `T` streams and `N` banks (`boundaries = N - 1`):
-///
-/// * **gates** = clock (4) + pause-mute detector (3: BufferTicks, CompareNotEqual,
-///   Select) + change detector (1) + one master-volume multiply per speaker + an
-///   `ArrayVar` and an `ArrayVar_Get` per stream per bank + an index subtract, a
-///   comparator and a branch per boundary + a `Select` per stream per boundary.
-/// * **wires** = clock (8) + pause-mute detector (5: Time into the buffer and
-///   the comparator, the buffer into the comparator, the comparator into the
-///   Select, and the Volume pin into the Select) + three attenuation pins fanned
-///   out to every speaker (3S) + two per volume multiply (the gated master in,
-///   the emitter out) + the detector feed + `ArrayVarRef`/`Index` per stream per
-///   bank + the per-bank exec chain (one per stream per bank) + the final wire
-///   from each stream into its target + four per boundary (subtract and
-///   comparator `InputA`, branch `bCond` and `Exec`) + three per `Select`.
-/// * **bricks** = one emitter per speaker plus the chip shell.
 pub fn estimate(
     mode: AudioMode,
     frames: usize,
     opts: &AudioOptions,
 ) -> Result<AudioCost, String> {
     // The renderer's checks, called rather than copied. `check_subdiv` runs
-    // even in voice mode, where the grid is unused, ONLY through `band_plan`
+    // even in voice mode, where the grid is unused, only through `band_plan`
     // below -- voice mode genuinely ignores `--subdiv`, and refusing a value
     // it never reads would be a readout stricter than its render.
     //
-    // The attenuation pair is checked here as well as in `check` so the READOUT
-    // refuses it too: both builders reject an inverted or non-positive pair, so
-    // a cost line for one would describe a build that cannot happen, next to a
-    // Generate button that (rightly) refuses it.
+    // The attenuation pair is checked here as well as in `check` so the
+    // readout refuses it too: both builders reject an inverted or
+    // non-positive pair, so a cost line for one would describe a build that
+    // cannot happen, next to a Generate button that (rightly) refuses it.
     super::speakers::check_attenuation(opts)?;
     let (speakers, streams_per_speaker) = match mode {
         AudioMode::Bank => (band_plan(opts)?.len(), 1),
@@ -164,6 +138,18 @@ pub fn estimate(
     let streams = speakers * streams_per_speaker;
     let banks = frames.div_ceil(opts.bank_size).max(1);
     let boundaries = banks - 1;
+
+    // The pre-wired control buttons: three button + detector + label
+    // assemblies on the main grid (see `crate::anim::controls`), added by
+    // both audio builders unless the toggle is off. No inner-grid gate -- the
+    // three `ChangeDetectorExec`s are main-grid loose bricks, counted in
+    // `bricks` beside the shell, the same convention `gates` (inner grid
+    // only) follows.
+    let (cb_wires, cb_bricks) = if opts.control_buttons {
+        (crate::anim::controls::CONTROL_WIRES, crate::anim::controls::CONTROL_BRICKS)
+    } else {
+        (0, 0)
+    };
 
     Ok(AudioCost {
         speakers,
@@ -186,8 +172,9 @@ pub fn estimate(
             + streams * banks
             + streams
             + 4 * boundaries
-            + 3 * streams * boundaries,
-        bricks: speakers + 1,
+            + 3 * streams * boundaries
+            + cb_wires,
+        bricks: speakers + 1 + cb_bricks,
         elements: streams * frames,
     })
 }
@@ -195,7 +182,7 @@ pub fn estimate(
 /// The frame count `frames` seconds of audio analyses to under `opts`, or
 /// `None` if the caller has no duration to work from.
 ///
-/// The SAME derivation [`crate::audio::track::analyze`] uses for its progress
+/// The same derivation [`crate::audio::track::analyze`] uses for its progress
 /// denominator -- `hop_for` then `frame_count_for`, capped at `--max-frames` --
 /// so a live readout and the render it describes count frames the same way.
 /// A UI that divided a duration by fps itself would be off by most of a
@@ -211,17 +198,17 @@ pub fn frames_for_duration(
 
 /// Whether a set of options can be rendered at all, without costing anything.
 ///
-/// [`estimate`]'s refusals **plus the attenuation pair**, which is the point: a
+/// [`estimate`]'s refusals plus the attenuation pair, which is the point: a
 /// UI that disables its Generate button on one rule and shows a cost under
 /// another would let a render start that the estimate had already refused.
 /// `subdiv` is checked in bank mode only, matching what the renderer reads.
 ///
 /// [`check_attenuation`](crate::audio::speakers::check_attenuation) is called
-/// here, and not only from the builders, because it was the one refusal that
-/// arrived AFTER the whole analysis: an Inner Radius above Max Distance showed a
-/// full, plausible cost, offered Generate, ran for minutes and only then failed.
-/// Both builders still check it themselves -- this is the same guard reaching
-/// the front end, not a guard moved away from the renderer.
+/// here, and not only from the builders, because an Inner Radius above Max
+/// Distance used to show a full, plausible cost, offer Generate, and only
+/// fail minutes into the render. Both builders still check it themselves --
+/// this is the same guard reaching the front end, not a guard moved away
+/// from the renderer.
 pub fn check(mode: AudioMode, opts: &AudioOptions) -> Result<(), String> {
     super::speakers::check_attenuation(opts)?;
     match mode {
@@ -275,10 +262,9 @@ mod tests {
         w.grids[0].1.len() - CHIP_PINS
     }
 
-    /// **The property this module exists for.** The estimate is not checked
-    /// against arithmetic -- it is checked against a world that was actually
-    /// built, in both bank layouts a render can have (one bank, and spilled
-    /// across three).
+    /// The estimate is not checked against arithmetic -- it is checked
+    /// against a world that was actually built, in both bank layouts a
+    /// render can have (one bank, and spilled across three).
     #[test]
     fn the_estimate_matches_a_real_bank_build() {
         for (bank_size, frames) in [(64, 40), (64, 130), (10, 10)] {
@@ -297,7 +283,7 @@ mod tests {
         }
     }
 
-    /// The same, for the mode whose stream count is DOUBLE its speaker count.
+    /// The same, for the mode whose stream count is double its speaker count.
     /// A single formula parameterised only by speakers would pass the bank
     /// test above and be wrong by a factor of two here.
     #[test]

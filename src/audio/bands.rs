@@ -1,38 +1,20 @@
 //! The fixed band bank: which speaker sits at which pitch, and how a
 //! magnitude spectrum folds onto them.
 //!
-//! Pitches are set once at BUILD time and never written again. That is the
-//! whole reason this design does not depend on how the game handles a live
-//! pitch change -- the risk that gates sub-project 2 does not exist here.
-//!
-//! # The bands sit on real notes
+//! Pitches are set once at build time and never written again, so this
+//! design does not depend on how the game handles a live pitch change.
 //!
 //! Every tonal band is an exact equal-tempered interval from A440:
 //! `PitchMultiplier = 2^(step / subdiv)`, `step` an integer, so step 0 is
-//! *exactly* 1.0 -- A440 itself, because [`BASE_HZ`] is what the synth assets
+//! exactly 1.0 -- A440 itself, because [`BASE_HZ`] is what the synth assets
 //! are authored at. At the default [`DEFAULT_SUBDIV`] of 12 that is one band
 //! per semitone, and an in-tune equal-tempered recording has its notes land
-//! on band centres with **zero** quantisation error.
-//!
-//! The grid used to be geometric across the whole pitch range instead --
-//! `PITCH_MIN * (PITCH_MAX/PITCH_MIN)^(k/(n-1))`. That spaces bands evenly in
-//! log-frequency but at an interval that has nothing to do with the scale:
-//! 0.839 semitones per band at 96 bands, so the grid walks against the
-//! chromatic scale and a note lands up to **41.96 cents** from the nearest
-//! band. Measured over the 79 semitones inside that bank, the mean was
-//! **20.76 cents** and only 15% of notes were inside the 5-cent threshold
-//! where detuning stops being audible. Worse, the error differs from note to
-//! note, so a chord is detuned inconsistently -- which is heard as "off key"
-//! rather than as a uniform transposition. A dense pop master masked it;
-//! solo harmonic material (a listener rendered Canon in D) did not.
-//!
-//! # What the range costs
+//! on band centres with zero quantisation error.
 //!
 //! `2^(-40/12)` is 0.0992 and `2^(40/12)` is 10.079, both outside the
 //! emitter's legal `PitchMultiplier`, so the usable span at 12 steps per
-//! octave is exactly **-39..=39 semitones -- 79 bands**, 46.25 Hz (F#1) to
-//! 4186.0 Hz (C8). That is the top 79 keys of an 88-key piano. See
-//! [`max_step`].
+//! octave is exactly -39..=39 semitones -- 79 bands, 46.25 Hz (F#1) to
+//! 4186.0 Hz (C8), the top 79 keys of an 88-key piano. See [`max_step`].
 
 /// The synth assets' authored frequency. Every pitch is a multiplier on it,
 /// and it is also the tuning anchor: a band at `PitchMultiplier` 1.0 plays
@@ -44,22 +26,16 @@ pub const PITCH_MAX: f32 = 10.0;
 /// At most white + pink.
 pub const MAX_NOISE_BANDS: usize = 2;
 
-/// Bands per octave in the tonal grid: how finely equal temperament is
-/// subdivided.
+/// Bands per octave in the tonal grid.
 ///
-/// **12 -- one band per semitone -- is the default**, because that is the scale
-/// the sources are actually played in. Every note of an in-tune equal-tempered
-/// recording then lands exactly on a band centre and the tuning error is zero,
-/// which is the entire point of the grid.
+/// 12 -- one band per semitone -- is the default, matching the scale sources
+/// are actually played in: an in-tune equal-tempered recording then lands
+/// exactly on a band centre with zero tuning error.
 ///
-/// 24 (quarter-tones) is the useful alternative and is offered by `--subdiv`.
-/// It is not the default because it doubles the speaker count to buy something
-/// only *mistuned* sources need: a recording pitched away from A440, or vibrato
-/// and bends that genuinely sit between semitones, whose worst-case error it
-/// halves from 50 to 25 cents. For material that IS in tune it changes nothing
-/// -- the semitone bands are a subset of the quarter-tone bands -- while making
-/// each band half as wide, so the same note's energy is split across two
-/// speakers more often.
+/// 24 (quarter-tones, via `--subdiv`) halves the worst-case error for
+/// mistuned sources (50 to 25 cents) at the cost of doubling the speaker
+/// count; it changes nothing for in-tune material, since the semitone bands
+/// are a subset of the quarter-tone ones.
 pub const DEFAULT_SUBDIV: u32 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,12 +46,8 @@ pub enum BandKind {
 }
 
 /// The `PitchMultiplier` of grid step `step` at `subdiv` steps per octave.
-///
-/// **This is the definition of a band pitch, and the only place it is
-/// computed.** `2^(step/subdiv)` in f64, narrowed once, so what reaches the
-/// save is the correctly-rounded f32 of the exact interval rather than an
-/// accumulated product -- repeated multiplication by a step ratio drifts, and
-/// drift is the defect this grid exists to remove.
+/// The only place a band pitch is computed: `2^(step/subdiv)` in f64, cast to
+/// f32 once -- never an accumulated product, which would drift.
 ///
 /// Step 0 returns exactly 1.0, so one speaker always sits precisely on A440.
 pub fn step_pitch(step: i32, subdiv: u32) -> f32 {
@@ -85,12 +57,12 @@ pub fn step_pitch(step: i32, subdiv: u32) -> f32 {
 /// The largest `|step|` whose pitch is still a legal `PitchMultiplier`, at
 /// `subdiv` steps per octave.
 ///
-/// At `subdiv` 12 this is **39**: `2^(39/12)` is 9.5137 and `2^(-39/12)` is
+/// At `subdiv` 12 this is 39: `2^(39/12)` is 9.5137 and `2^(-39/12)` is
 /// 0.10511, both legal, while 40 steps gives 10.079 and 0.09921, which the
 /// game would clamp silently.
 ///
 /// The floor of the logarithm is only the first guess. The invariant that
-/// matters is the PITCH, not the exponent, so the guess is walked back until
+/// matters is the pitch, not the exponent, so the guess is walked back until
 /// both ends really are inside the range -- that keeps this correct if the
 /// hardware limits ever move, or become asymmetric, and costs one f64 compare.
 pub fn max_step(subdiv: u32) -> Result<i32, String> {
@@ -108,8 +80,7 @@ pub fn max_step(subdiv: u32) -> Result<i32, String> {
 
 /// How many tonal bands the emitter's legal pitch range holds at `subdiv`
 /// steps per octave: `2 * max_step + 1`, the steps `-max_step ..= max_step`.
-///
-/// **79** at the default 12 (one per semitone), **159** at 24 (quarter-tones).
+/// 79 at the default 12 (one per semitone), 159 at 24 (quarter-tones).
 pub fn max_tonal_bands(subdiv: u32) -> Result<usize, String> {
     Ok(2 * max_step(subdiv)? as usize + 1)
 }
@@ -135,10 +106,9 @@ impl BandPlan {
     }
 
     /// Every tonal band the legal pitch range holds at `subdiv`, plus the
-    /// noise bands. **This is what a render gets when `--bands` is not
-    /// passed**: the count follows from the hardware range and the
-    /// subdivision, because with the spacing musically fixed there is no
-    /// other honest default. 79 tonal at `subdiv` 12, 159 at 24.
+    /// noise bands. What a render gets when `--bands` is not passed: the
+    /// count follows from the hardware range and subdivision, since the
+    /// spacing is musically fixed. 79 tonal at `subdiv` 12, 159 at 24.
     pub fn full(noise_bands: usize, subdiv: u32) -> Result<Self, String> {
         let tonal = max_tonal_bands(subdiv)?;
         Self::with_subdiv(tonal + noise_bands, noise_bands, subdiv)
@@ -147,7 +117,7 @@ impl BandPlan {
     /// The general constructor. `bands - noise_bands` tonal steps, centred on
     /// A440 so step 0 (`PitchMultiplier` exactly 1.0) is always one of them.
     ///
-    /// The count SELECTS THE SPAN -- it cannot change the spacing, which is
+    /// The count selects the span; it cannot change the spacing, which is
     /// fixed by `subdiv`. Asking for more bands than the pitch range holds is
     /// an error naming the maximum, never a silent clamp: a clamp would hand
     /// back a different number of speakers than the flag asked for.
@@ -179,7 +149,7 @@ impl BandPlan {
             ));
         }
 
-        // Centred on A440: an even count takes the extra band DOWNWARD, where
+        // Centred on A440: an even count takes the extra band downward, where
         // the bass lives, and an odd count is symmetric. Either way step 0 is
         // in range, so exactly one speaker plays A440 itself.
         //
@@ -249,13 +219,9 @@ impl BandPlan {
     /// Where `hz` falls on the tonal grid, as a *continuous* band index:
     /// `subdiv * log2(hz / 440) - lowest_step`. Band `k` owns `[k-0.5, k+0.5)`.
     ///
-    /// **`fold` uses this and nothing else** -- the floor test, the ceiling
-    /// test and the bin→band choice are all one comparison against one
-    /// expression, so they cannot drift apart. The previous version derived a
-    /// geometric ratio independently in `fold` and in `edges_hz`; a review
-    /// found that changing one and not the other silently destroyed every bin
-    /// near the ceiling, because they rounded to a band index the fold then
-    /// threw away. There is now no second copy to desynchronise.
+    /// `fold` uses this and nothing else, so the floor test, the ceiling test
+    /// and the bin->band choice are all one comparison against one
+    /// expression and cannot drift apart.
     ///
     /// `hz == 0.0` (the DC bin) gives `-inf`, which compares below band 0 and
     /// folds to pink like any other sub-bank content. It never produces a NaN.
@@ -263,52 +229,19 @@ impl BandPlan {
         self.subdiv as f64 * (hz / BASE_HZ as f64).log2() - self.lowest_step as f64
     }
 
-    /// Fold a magnitude spectrum onto the bank: each band gets the ENERGY of
-    /// the bins it owns, as an amplitude.
+    /// Fold a magnitude spectrum onto the bank: each band gets
+    /// `sqrt(sum of |X[k]|^2)` over the bins it owns -- the band's energy
+    /// (Parseval) expressed as the amplitude of one equivalent sine, not a
+    /// width-biased sum of magnitudes.
     ///
-    /// # Aggregation is by power, not by magnitude
-    ///
-    /// A band accumulates `|X[k]|^2` and returns `sqrt` of the total, which is
-    /// the band's actual energy (Parseval) expressed as the amplitude of one
-    /// equivalent sine -- exactly what a single speaker can play. A plain sum
-    /// of `|X[k]|` is not a physical quantity at all, and it is WIDTH-BIASED:
-    /// across `n` bins of incoherent content it grows like `n`, where true
-    /// energy grows like `sqrt(n)`. The bands are constant-Q, so `n` scales
-    /// with centre frequency, and the bias therefore tilts the whole render
-    /// bright -- measured on a real pop master, magnitude-summing named a
-    /// 3.2 kHz band as the loudest tonal band, while power aggregation puts
-    /// the peak at 252 Hz, where that mix's energy actually is.
-    ///
-    /// # Off the ends of the bank
-    ///
-    /// The tonal bands span 44.9 Hz to 4308.7 Hz on the default full plan
-    /// (79 semitones, F#1..C8, plus the half-semitone edges), so energy off
-    /// either end has to go somewhere. Both ends fold onto a noise band,
-    /// because dropping that energy makes real content disappear with no error
-    /// anywhere -- a silent lie about the source.
-    ///
-    /// * Above the top tonal band's upper edge -> the WHITE-noise band.
-    ///   Sines cannot render cymbals or sibilance; broadband hiss can.
-    /// * Below the bottom tonal band's lower edge -> the PINK-noise band.
-    ///   Pink noise has a 1/f spectrum, so its own energy is concentrated at
-    ///   the low end -- it is the acoustically right carrier for sub-bass,
-    ///   where white noise would put a rumble cue in the wrong octaves.
-    ///
-    /// The white band is the reason the aggregation above is load-bearing
-    /// rather than a nicety: it alone covers ceiling..Nyquist, which is far
-    /// more bins than any one semitone-wide tonal band. Summed as magnitude it
-    /// took 22.3% of the average frame and was the loudest band in 89.8% of
-    /// frames on a real track, which reads in game as noise with music
-    /// somewhere behind it. Summed as power it takes a few percent -- one
-    /// band's worth, which is what it is. No per-band fudge factor is applied
-    /// to get there; the dominance was an artefact of the wrong aggregation,
-    /// not a missing weight.
-    ///
-    /// Either fold is skipped when that noise band does not exist (a plan
-    /// with `noise_bands` of 1 has only white, and 0 has neither). Such
-    /// energy is discarded rather than redirected into a tonal band: piling
-    /// every DC offset and rumble onto the lowest speaker, or every cymbal
-    /// onto the highest, would be a louder lie than dropping it.
+    /// Energy off either end of the tonal span has to go somewhere rather
+    /// than disappear silently: above the top tonal band's upper edge folds
+    /// to the white-noise band (sines cannot render cymbals or sibilance;
+    /// broadband hiss can), and below the bottom tonal band's lower edge
+    /// folds to the pink-noise band (its 1/f spectrum is itself low-heavy,
+    /// the right carrier for sub-bass). Either fold is skipped, and that
+    /// energy discarded, when the corresponding noise band does not exist in
+    /// this plan.
     pub fn fold(&self, spectrum: &[f32], sample_rate: u32, window: usize) -> Vec<f32> {
         if spectrum.is_empty() || window == 0 {
             return vec![0.0f32; self.len()];
@@ -328,13 +261,9 @@ impl BandPlan {
             }
             let power = mag as f64 * mag as f64;
             let hz = bin as f64 * hz_per_bin;
-            // ONE expression decides everything: which band owns the bin, and
-            // whether it is off either end. `+ 0.5` then `floor` is
-            // round-half-UP, which keeps the bands half-open `[lower, upper)`
-            // on both sides of A440 -- plain `round()` breaks away from zero
-            // and would give band 0 an exclusive lower edge that every other
-            // band has inclusive. `hz == 0` gives `-inf` here, so DC folds to
-            // pink without ever producing a NaN.
+            // `+ 0.5` then `floor` is round-half-up, keeping bands half-open
+            // `[lower, upper)` on both sides of A440. `hz == 0` gives `-inf`
+            // here, so DC folds to pink without ever producing a NaN.
             let k = (self.position(hz) + 0.5).floor();
             if k < 0.0 {
                 if let Some(p) = pink {
@@ -389,19 +318,10 @@ mod tests {
         c - (c / 100.0).round() * 100.0
     }
 
-    // ------------------------------------------------------------------
-    // EQUAL TEMPERAMENT. The reason this module was rewritten.
-    // ------------------------------------------------------------------
-
-    /// **THE POINT OF THE GRID.** Every tonal pitch must be an exact power of
-    /// `2^(1/subdiv)` relative to 1.0 -- i.e. an exact equal-tempered interval
-    /// from A440, since the synth assets are authored at [`BASE_HZ`].
-    ///
-    /// This is what the geometric grid could not do. It spaced bands at
-    /// 0.839 semitones, so the pitches were exact powers of nothing musical
-    /// and a note sat up to 41.96 cents from the nearest band; musicians hear
-    /// 5-10. The tolerance below is 0.02 cents -- f32 rounding of the exact
-    /// interval, and roughly 400x tighter than audibility.
+    /// Every tonal pitch must be an exact power of `2^(1/subdiv)` relative to
+    /// 1.0 -- an exact equal-tempered interval from A440, since the synth
+    /// assets are authored at [`BASE_HZ`]. Tolerance is 0.02 cents, roughly
+    /// 400x tighter than audibility.
     #[test]
     fn every_tonal_pitch_is_an_exact_equal_tempered_interval() {
         for subdiv in [1u32, 3, 12, 19, 24, 31] {
@@ -413,10 +333,10 @@ mod tests {
                 let p = BandPlan::with_subdiv(tonal, 0, subdiv)
                     .unwrap_or_else(|e| panic!("{tonal} bands at subdiv {subdiv}: {e}"));
                 for (k, &pitch) in p.pitches.iter().enumerate() {
-                    // The exponent this pitch claims, in grid steps...
+                    // The exponent this pitch claims, in grid steps, must be
+                    // an integer -- that is what "exact equal-tempered
+                    // interval" means.
                     let steps = subdiv as f64 * (pitch as f64).log2();
-                    // ...must be an INTEGER. That is what "exact equal-tempered
-                    // interval" means, and it is the whole change.
                     let off_cents = (steps - steps.round()) * 1200.0 / subdiv as f64;
                     assert!(
                         off_cents.abs() < 0.02,
@@ -436,9 +356,8 @@ mod tests {
     }
 
     /// At the default 12 steps per octave, "exact interval" means exactly a
-    /// SEMITONE -- so every band is a real note and an in-tune recording
-    /// quantises to zero error. This is the musical form of the test above,
-    /// and it is the one the listener's complaint was about.
+    /// semitone, so every band is a real note and an in-tune recording
+    /// quantises to zero error.
     #[test]
     fn at_twelve_per_octave_every_band_is_a_real_note() {
         for p in [BandPlan::new(32, 2).unwrap(), BandPlan::full(0, 12).unwrap()] {
@@ -456,9 +375,8 @@ mod tests {
     }
 
     /// The anchor. One speaker must play A440 itself, at `PitchMultiplier`
-    /// EXACTLY 1.0 -- not 0.99999. An anchor off by a rounding step puts the
-    /// whole grid off by that step, and the point of the change is that these
-    /// numbers are exact.
+    /// exactly 1.0 -- not 0.99999. An anchor off by a rounding step puts the
+    /// whole grid off by that step.
     #[test]
     fn one_band_sits_exactly_on_a440() {
         for p in [
@@ -499,8 +417,8 @@ mod tests {
     }
 
     /// Band edges are half a grid step either side of the centre, so at the
-    /// default subdivision each band captures **exactly one semitone**:
-    /// ±50 cents. Wider and it steals its neighbours' notes; narrower and the
+    /// default subdivision each band captures exactly one semitone: ±50
+    /// cents. Wider and it steals its neighbours' notes; narrower and the
     /// gaps between bands drop energy on the floor.
     #[test]
     fn band_edges_are_half_a_step_either_side() {
@@ -517,8 +435,8 @@ mod tests {
                      want -{want_cents}..+{want_cents}"
                 );
             }
-            // ...and consecutive bands must therefore MEET, with no gap and no
-            // overlap: band k-1's upper edge is band k's lower edge.
+            // ...and consecutive bands must therefore meet, with no gap and
+            // no overlap: band k-1's upper edge is band k's lower edge.
             for k in 1..p.tonal_count() {
                 let (lo, _) = p.edges_hz(k);
                 let (_, hi_prev) = p.edges_hz(k - 1);
@@ -531,12 +449,9 @@ mod tests {
         }
     }
 
-    /// `edges_hz` and `fold` must classify identically. They are now derived
-    /// from one expression ([`BandPlan::position`]) precisely so they cannot
-    /// disagree, and this is the test that catches it if a change ever
-    /// reintroduces a second copy -- the desynchronisation a review found in
-    /// the previous version, where a bin just under the ceiling rounded to a
-    /// band index the fold then threw away.
+    /// `edges_hz` and `fold` must classify identically: both derive from one
+    /// expression ([`BandPlan::position`]), so this is the test that catches
+    /// it if a change ever reintroduces a second copy that can disagree.
     #[test]
     fn fold_agrees_with_edges_hz_on_every_band() {
         // A window fine enough to place a bin inside any band of the full
@@ -546,7 +461,7 @@ mod tests {
         let p = BandPlan::full(0, 12).unwrap();
         let hz_per_bin = SR as f64 / W as f64;
         let bins = W / 2 + 1;
-        // EVERY bin, not a probe near each edge: a rounded probe can land
+        // Every bin, not a probe near each edge: a rounded probe can land
         // outside the band it was aimed at, and then the test is measuring
         // its own arithmetic. The band each bin belongs to is read off
         // `edges_hz`, and `fold` must agree on all of them.
@@ -609,14 +524,10 @@ mod tests {
         assert_eq!(p.kinds[31], BandKind::PinkNoise);
     }
 
-    /// REPLACES `tonal_pitches_span_exactly_the_legal_range`, which asserted
-    /// the first band was exactly `PITCH_MIN` and the last exactly
-    /// `PITCH_MAX`. A semitone grid anchored on A440 cannot end on those
-    /// numbers -- 0.1 and 10.0 are not equal-tempered intervals from 440 Hz --
-    /// and pretending otherwise is precisely the defect being removed. What
-    /// survives, and is the property that actually mattered, is that a plan
-    /// fills as much of the legal range as the scale allows and never leaves
-    /// it.
+    /// A semitone grid anchored on A440 cannot end exactly on `PITCH_MIN` or
+    /// `PITCH_MAX` -- 0.1 and 10.0 are not equal-tempered intervals from
+    /// 440 Hz. A plan fills as much of the legal range as the scale allows
+    /// and never leaves it.
     #[test]
     fn the_full_plan_is_the_widest_legal_equal_tempered_span() {
         let p = BandPlan::full(0, 12).unwrap();
@@ -631,7 +542,7 @@ mod tests {
             );
         }
         // ...and one more step at either end would leave it, which is what
-        // makes this the WIDEST span rather than merely a legal one.
+        // makes this the widest span rather than merely a legal one.
         assert!(step_pitch(-40, 12) < PITCH_MIN, "step -40 must be below the floor");
         assert!(step_pitch(40, 12) > PITCH_MAX, "step 40 must be above the ceiling");
         // F#1 to C8: the top 79 keys of an 88-key piano.
@@ -658,7 +569,7 @@ mod tests {
         assert_eq!(p.len() - semis, 80, "the rest must be quarter-tones");
     }
 
-    /// Asking for more bands than the pitch range holds is an ERROR, not a
+    /// Asking for more bands than the pitch range holds is an error, not a
     /// silent clamp. A clamp would hand back a different speaker count than
     /// `--bands` asked for and the user would never know.
     #[test]
@@ -667,7 +578,6 @@ mod tests {
         let e = BandPlan::new(80, 0).expect_err("80 tonal must not fit at 12 per octave");
         assert!(e.contains("79"), "the error must name the maximum: {e}");
         assert!(e.contains("--subdiv"), "the error must point at the way out: {e}");
-        // The old 96-band renders are exactly this case.
         assert!(BandPlan::new(96, 0).is_err());
         assert!(BandPlan::new(96, 2).is_err());
         // ...and --subdiv 24 really is the way out.
@@ -697,9 +607,9 @@ mod tests {
         }
     }
 
-    /// THE ORACLE. A tone at a band's own centre frequency must land in that
-    /// band and nowhere else. This is what catches an off-by-one in the
-    /// bin->band mapping, which reading the code will not.
+    /// A tone at a band's own centre frequency must land in that band and
+    /// nowhere else -- catches an off-by-one in the bin->band mapping that
+    /// reading the code will not.
     #[test]
     fn a_tone_at_a_band_centre_lands_in_that_band() {
         let p = plan();
@@ -731,8 +641,8 @@ mod tests {
         assert!(checked >= 28, "the sub-bin guard skipped too much: only {checked} bands tested");
     }
 
-    /// The same oracle over EVERY band of the default full plan, at a window
-    /// fine enough that no band is sub-bin. Nothing is skipped here.
+    /// The same oracle over every band of the default full plan, at a window
+    /// fine enough that no band is sub-bin.
     #[test]
     fn a_tone_at_a_band_centre_lands_in_that_band_across_the_full_plan() {
         const W: usize = 65_536;
@@ -785,10 +695,6 @@ mod tests {
     }
 
     /// A plan with no noise bands is legal and must still be on the scale.
-    /// (Was `a_plan_with_no_noise_bands_is_all_tonal`, which additionally
-    /// asserted the top pitch was exactly `PITCH_MAX`; see
-    /// `the_full_plan_is_the_widest_legal_equal_tempered_span` for why that
-    /// assertion had to go.)
     #[test]
     fn a_plan_with_no_noise_bands_is_all_tonal() {
         let p = BandPlan::new(16, 0).expect("16 tonal bands is valid");
@@ -800,10 +706,6 @@ mod tests {
             assert!((PITCH_MIN..=PITCH_MAX).contains(&pitch));
         }
     }
-
-    // --- Tests added beyond the task brief, each closing a gap a mutation
-    // --- campaign proved was unprotected. Every one guards a property the
-    // --- brief's own doc comments already state.
 
     /// The ceiling and the bin->band rounding must coincide exactly: a
     /// ceiling that is too low routes real top-octave tone into hiss, and one
@@ -901,10 +803,10 @@ mod tests {
     }
 
     /// `--noise-bands 1` buys white only. Sub-bass has nowhere legal to go,
-    /// so it is discarded exactly as before -- NOT redirected into white (the
-    /// wrong end of the spectrum) and NOT written to a band index that does
-    /// not exist. All three plans below have 30 tonal bands, so they share
-    /// the default plan's 179.73 Hz floor.
+    /// so it is discarded -- not redirected into white (the wrong end of the
+    /// spectrum) and not written to a band index that does not exist. All
+    /// three plans below have 30 tonal bands, so they share the default
+    /// plan's 179.73 Hz floor.
     #[test]
     fn with_only_a_white_band_sub_bass_is_still_discarded() {
         let p = BandPlan::new(31, 1).expect("30 tonal + white is valid");
@@ -921,7 +823,7 @@ mod tests {
         assert_eq!(p.fold(&impulse_at(12_000.0), SR, WIN)[30], 1.0);
     }
 
-    /// `--noise-bands 0` buys neither, so BOTH ends are discarded.
+    /// `--noise-bands 0` buys neither, so both ends are discarded.
     #[test]
     fn with_no_noise_bands_both_ends_are_discarded() {
         let p = BandPlan::new(30, 0).expect("30 tonal bands is valid");
@@ -936,13 +838,12 @@ mod tests {
         }
     }
 
-    // --- Aggregation. Every test above uses a SINGLE unit impulse, whose
-    // --- fold is identical under a magnitude sum and a power sum -- so none
-    // --- of them can see the width bias that made the render sound like
-    // --- noise with music behind it. These are the ones that can.
+    // --- Aggregation. Every test above uses a single unit impulse, whose
+    // --- fold is identical under a magnitude sum and a power sum, so none
+    // --- of them can see the width bias. These are the ones that can.
 
     /// `n` equal bins inside one band must fold to `sqrt(n)` times a single
-    /// bin, not `n` times: a band reports the ENERGY it owns, as the
+    /// bin, not `n` times: a band reports the energy it owns, as the
     /// amplitude of one equivalent sine. Magnitude-summing instead grows
     /// linearly with a band's bin count, and because the bank is constant-Q
     /// that count scales with centre frequency -- so the error is a systematic
@@ -978,15 +879,12 @@ mod tests {
         );
     }
 
-    /// THE IN-GAME REGRESSION. The white band alone covers ceiling..Nyquist,
-    /// hundreds of times more bins than any one semitone-wide tonal band.
-    /// Under a magnitude sum a flat spectrum handed white that whole ratio --
-    /// on a real track it took 22% of every frame and led 90% of them: the
-    /// render the owner described as noise with the music somewhere behind
-    /// it. Energy aggregation makes the gap the SQUARE ROOT of the bin ratio,
-    /// which is the honest amount of energy a wide band holds.
+    /// The white band alone covers ceiling..Nyquist, hundreds of times more
+    /// bins than any one semitone-wide tonal band. Energy aggregation makes
+    /// the gap the square root of the bin ratio, the honest amount of energy
+    /// a wide band holds.
     ///
-    /// The expected values are computed from the band edges rather than
+    /// Expected values are computed from the band edges rather than
     /// hardcoded, so this keeps testing the aggregation law and not the
     /// geometry of one particular plan.
     #[test]

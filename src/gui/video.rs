@@ -5,7 +5,7 @@
 //! struct, `poll_promise` for async picking, `deliver_save` for output, and
 //! every failure routed through `log::error!` rather than a panic.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::{
     anim::{
@@ -18,9 +18,9 @@ use crate::{
     gui::{
         SharedOptions,
         util::{
-            PickedImage, bound_pane_width, deliver_world_unless_cancelled,
-            draw_out_file_warnings, note, pick_animated_bytes, pick_images, pick_subtitle_bytes,
-            refuse_bad_out_file, section, settings_grid, thumb,
+            self, PickedImage, RenderMsg, bound_pane_width, deliver_world_unless_cancelled,
+            draw_out_file_warnings, draw_progress_bar, note, pick_animated_bytes, pick_images,
+            pick_subtitle_bytes, refuse_bad_out_file, section, settings_grid, thumb,
         },
     },
     progress::Progress,
@@ -50,7 +50,7 @@ use poll_promise::Promise;
 // (animated file, frame sequence) on wasm.
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{
-    gui::util::pick_video_path,
+    gui::util::{FfmpegModal, draw_cancel_button, pick_video_path},
     video::{
         backend::{self, Backend},
         ffmpeg::{DownloadConsent, ensure_ffmpeg, ffmpeg_available},
@@ -80,77 +80,62 @@ use crate::{
 /// the degenerate zero-extent brick.
 const MIN_PIXEL_EXTENT: u16 = 1;
 
-/// What the render thread tells the UI about its progress.
+/// A throttled snapshot of the frame just processed -- see
+/// [`ChannelProgress::frame`]. Never constructed on wasm (see there for why),
+/// which is the one payload kept here purely so `poll_generate`'s match stays
+/// identical on both targets -- hence the wasm-only `allow(dead_code)`.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #[derive(Clone, Debug)]
-enum ProgressMsg {
-    Begin { label: String, total: Option<u64> },
-    Tick(u64),
-    Finish,
-    /// A throttled snapshot of the frame just processed -- see
-    /// [`ChannelProgress::frame`]. Never constructed on wasm (see there for
-    /// why), which is the one variant kept here purely so `poll_generate`'s
-    /// match stays identical on both targets -- hence the wasm-only
-    /// `allow(dead_code)`.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    Preview { width: u32, height: u32, rgba: Vec<u8> },
+struct Preview {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
-/// Reports progress from the render thread to the UI over a channel.
-///
-/// Send failures are ignored on purpose: a closed channel means the UI went
-/// away, which must never abort a render that is otherwise fine.
+/// What the render thread tells the UI about its progress: the shared
+/// Begin/Tick/Finish core (see [`util::RenderMsg`]) plus this pane's one
+/// extra payload, a frame [`Preview`] -- the audio pane, which has no
+/// picture to show, carries no `Extra` at all.
+type ProgressMsg = RenderMsg<Preview>;
+
+/// Reports progress from the render thread to the UI over a channel, wrapping
+/// the shared [`util::ChannelProgress`] to add the one thing only this pane
+/// needs on top of its Begin/Tick/Finish/is_cancelled core: a throttled frame
+/// preview.
 struct ChannelProgress {
-    tx: std::sync::mpsc::Sender<ProgressMsg>,
+    inner: util::ChannelProgress<Preview>,
     /// Wall-clock time of the last `Preview` actually sent, for throttling
     /// `frame`. Native only -- see `frame`'s wasm arm for why wasm needs
     /// none of this.
     #[cfg(not(target_arch = "wasm32"))]
     last_preview: Option<std::time::Instant>,
-    /// Set by the UI thread's Cancel button, read once per frame by
-    /// `is_cancelled`. Always present (even on wasm, where nothing ever sets
-    /// it -- see `VideoApp::cancel_flag`'s doc) so this struct needs no cfg
-    /// split of its own.
-    cancel: Arc<AtomicBool>,
 }
 
 impl ChannelProgress {
     fn new(tx: std::sync::mpsc::Sender<ProgressMsg>, cancel: Arc<AtomicBool>) -> Self {
         Self {
-            tx,
+            inner: util::ChannelProgress::new(tx, cancel),
             #[cfg(not(target_arch = "wasm32"))]
             last_preview: None,
-            cancel,
         }
     }
 }
 
 impl Progress for ChannelProgress {
     fn begin(&mut self, label: &str, total: Option<u64>) {
-        let _ = self.tx.send(ProgressMsg::Begin { label: label.to_string(), total });
+        self.inner.begin(label, total);
     }
     fn tick(&mut self, n: u64) {
-        let _ = self.tx.send(ProgressMsg::Tick(n));
+        self.inner.tick(n);
     }
     fn finish(&mut self) {
-        let _ = self.tx.send(ProgressMsg::Finish);
+        self.inner.finish();
     }
 
-    /// Throttled to roughly 10 updates/sec (every ~100ms): `build_brick_world`
-    /// calls this once per frame, and copying + sending tens of thousands of
-    /// frames' worth of pixels would cost far more than the render itself.
-    /// The pixel copy (`rgba.to_vec()`) only happens once the throttle
-    /// actually allows a send -- everywhere else this returns immediately,
-    /// untouched.
-    ///
-    /// Native only. `Instant::now()` panics on wasm32-unknown-unknown, and a
-    /// preview would never be seen mid-render there anyway: `VideoApp::generate`
-    /// runs `work` synchronously inline on the UI thread on wasm (no
-    /// `std::thread::spawn`), so nothing repaints until the render -- and the
-    /// save it produces -- is already done. Every `Preview` sent during that
-    /// window would just sit unseen in the channel until `poll_generate`'s
-    /// first drain, which happens after the promise has already resolved, so
-    /// this skips previews entirely on wasm rather than pay for copies no one
-    /// can look at.
+    /// Throttled to ~10 updates/sec; the pixel copy only happens when the
+    /// throttle allows a send. Native only -- `Instant::now()` panics on
+    /// wasm, and `generate` runs synchronously there anyway so no preview
+    /// would be seen mid-render.
     #[cfg(not(target_arch = "wasm32"))]
     fn frame(&mut self, width: u32, height: u32, rgba: &[u8]) {
         const PREVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -162,19 +147,17 @@ impl Progress for ChannelProgress {
             return;
         }
         self.last_preview = Some(now);
-        let _ = self.tx.send(ProgressMsg::Preview { width, height, rgba: rgba.to_vec() });
+        self.inner.send_extra(Preview { width, height, rgba: rgba.to_vec() });
     }
 
     #[cfg(target_arch = "wasm32")]
     fn frame(&mut self, _width: u32, _height: u32, _rgba: &[u8]) {}
 
     /// Backed by the same `Arc<AtomicBool>` the UI thread's Cancel button
-    /// sets (native only -- see `VideoApp::cancel_flag`'s doc for why wasm's
-    /// copy can never be set). `Relaxed` is enough: this is a single flag
-    /// with no other state it needs to stay ordered with, the same as every
-    /// other cancel-flag pattern in the standard library's own docs.
+    /// sets. `Relaxed` is enough: a single flag with no other state to stay
+    /// ordered with.
     fn is_cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
+        self.inner.is_cancelled()
     }
 }
 
@@ -182,56 +165,37 @@ impl Progress for ChannelProgress {
 /// render step both work without redundant decoding.
 enum Input {
     None,
-    /// A single animated file, decoded once right after picking. Caching the
-    /// full decode (not just the raw bytes) means every render -- including
-    /// a second click after the user tweaks fps/size -- reuses the same
-    /// parse instead of re-decoding the GIF/APNG/WebP from scratch, and the
-    /// live cost estimate has real numbers instead of a guess.
+    /// Decoded once right after picking, so a repeated render or the live
+    /// cost estimate reuses the same parse instead of re-decoding.
     Animated {
         name: String,
         clip: Clip,
         preview: PickedImage,
     },
-    /// A frame sequence, left as picked images rather than decoded into a
-    /// `Clip` up front: `decode_sequence` bakes the *current* fps into both
-    /// the source and target rate, so decoding eagerly would freeze fps at
-    /// pick time and go stale the moment the user moves the slider. Decoding
-    /// stays cheap here regardless -- the images are already RGBA8, so it's
-    /// just a sort and a clone.
+    /// Left undecoded: `decode_sequence` bakes the *current* fps in, so
+    /// decoding eagerly would go stale the moment the user moves the slider.
     Sequence(Vec<PickedImage>),
-    /// A video file, identified only by path -- opening it is deferred all
-    /// the way to `generate`, unlike `Animated`'s eager decode. Two reasons:
-    /// probing a video can spawn `ffprobe` (the ffmpeg backend) or need a
-    /// download-consent decision this pane cannot make on its own, and doing
-    /// either at pick time (before the user has even chosen a backend or
-    /// pressed Generate) would be surprising. `draw_cost` shows a plain
-    /// notice instead of a real estimate for this variant -- see there.
+    /// Identified only by path; opening is deferred to `generate`, unlike
+    /// `Animated`'s eager decode -- probing can spawn `ffprobe` or need a
+    /// download-consent decision this pane can't make at pick time.
+    /// `draw_cost` shows a plain notice rather than a real estimate here.
     #[cfg(not(target_arch = "wasm32"))]
     Video { path: std::path::PathBuf, name: String },
 }
 
 /// The picked input, captured just before a render is handed to the worker.
 ///
-/// `Animated`'s `Clip` is already decoded (and cached in `Input` for reuse
-/// across renders), so it crosses the thread boundary as-is -- `Clip::frames`
-/// is a plain `Vec<RgbaImage>`, so that one really is a deep copy with no
-/// cheaper option available from here.
-///
-/// A `Sequence` crosses as `Arc`s, NOT as copied pixel buffers. Capturing it
-/// out of `&self` forces *a* clone, but `PickedImage::image` is already an
-/// `Arc<RgbaImage>`, so that clone is an O(frames) refcount bump rather than
-/// a full per-frame pixel copy. The deep copy `decode` does require (it needs
-/// owned `RgbaImage`s) then happens inside the worker, right next to the
-/// `decode` call -- keeping every byte-touching step off the UI thread, and
-/// matching `HeightmapApp::run_converter`, which likewise clones only
-/// `PickedImage`s (i.e. `Arc`s) up front and defers its `maps_from_images`
-/// decode into its worker closure.
+/// `Animated`'s `Clip` is already decoded, so it crosses as a real deep copy
+/// (`Clip::frames` is a plain `Vec<RgbaImage>`, no cheaper option here). A
+/// `Sequence` crosses as `Arc`s instead of copied pixel buffers --
+/// `PickedImage::image` is already `Arc<RgbaImage>`, so capturing it is an
+/// O(frames) refcount bump, and the real per-frame decode happens inside the
+/// worker, off the UI thread.
 enum GenSource {
     Clip(Clip),
     Sequence(Vec<(String, Arc<RgbaImage>)>),
-    /// Just the path -- opening happens inside the worker via
-    /// `backend::open_video_ensuring`, same call `main.rs` makes for the
-    /// CLI. See `generate`'s `work` closure.
+    /// Opening happens inside the worker via `backend::open_video_ensuring`,
+    /// the same call `main.rs` makes for the CLI.
     #[cfg(not(target_arch = "wasm32"))]
     Video(std::path::PathBuf),
 }
@@ -263,18 +227,12 @@ pub struct VideoApp {
     /// Which decode backend `generate` uses for an `Input::Video` source.
     #[cfg(not(target_arch = "wasm32"))]
     backend: Backend,
-    /// Set by `generate` (via `check_ffmpeg_consent`) when the selected
-    /// backend needs ffmpeg and ffmpeg is not installed. `draw_ffmpeg_modal`
-    /// shows a Download/Cancel dialog for it instead of `DownloadConsent::
-    /// Ask`'s stdin prompt, which the GUI has no terminal for. `None`
-    /// whenever the modal should not be showing.
+    /// Shared ffmpeg download-consent + progress modal (see [`FfmpegModal`]),
+    /// opened by `generate` when the selected backend needs an ffmpeg that
+    /// isn't installed -- a dialog instead of `DownloadConsent::Ask`'s stdin
+    /// prompt, which the GUI has no terminal for.
     #[cfg(not(target_arch = "wasm32"))]
-    pending_ffmpeg_consent: Option<std::path::PathBuf>,
-    /// The in-flight ffmpeg download, once the consent modal's "Download"
-    /// button has been clicked. A real network fetch, so it runs on a
-    /// background thread rather than blocking the UI.
-    #[cfg(not(target_arch = "wasm32"))]
-    pending_ffmpeg_download: Option<Promise<Result<(), String>>>,
+    modal: FfmpegModal,
     /// The in-flight render, if any. `Some` from the moment `generate` spawns
     /// the worker until `poll_generate` observes it's ready -- while `Some`,
     /// `draw_submit` hides the generate button so a second render can't start.
@@ -288,27 +246,17 @@ pub struct VideoApp {
     progress_label: String,
     progress_pos: u64,
     progress_total: Option<u64>,
-    /// The most recent live preview, if the worker has sent one for the
-    /// render currently in flight. One handle only -- each `Preview`
-    /// message replaces it rather than accumulating a new texture, which
-    /// would otherwise leak GPU memory every ~100ms of a render.
+    /// Most recent live preview, if any. One handle only: each `Preview`
+    /// message replaces it rather than accumulating textures, which would
+    /// otherwise leak GPU memory every ~100ms of a render.
     preview_texture: Option<egui::TextureHandle>,
-    /// The in-flight render's cancel flag, set by the Cancel button
-    /// (`draw_submit`) and read by the worker's `ChannelProgress::is_cancelled`.
-    /// `Some` for exactly as long as `pending_generate` is -- both are set
-    /// together in `generate` and cleared together in `poll_generate` -- so
-    /// the button disappears the same frame the "Generating..." state does,
-    /// and a FRESH flag (never a reused one left over `true`) backs every
-    /// new render, which is what makes "returning to idle clears the flag so
-    /// the next render is not instantly cancelled" true without any explicit
-    /// reset step.
+    /// The in-flight render's cancel flag: set by the Cancel button, read by
+    /// the worker's `ChannelProgress::is_cancelled`. A fresh flag backs every
+    /// new render, so returning to idle can't leave a stale `true` behind.
     ///
-    /// Native only: on wasm `generate`'s `work` runs synchronously to
-    /// completion before this field could ever be read back by a click
-    /// handler (see `ChannelProgress::frame`'s doc for the same reasoning
-    /// applied to live previews), so a Cancel button there could never
-    /// actually interrupt anything -- `draw_submit` hides it entirely rather
-    /// than offer a button that does nothing.
+    /// Native only: on wasm `generate` runs synchronously to completion, so
+    /// there is nothing a Cancel button could interrupt -- `draw_submit`
+    /// hides it entirely.
     #[cfg(not(target_arch = "wasm32"))]
     cancel_flag: Option<Arc<AtomicBool>>,
 
@@ -333,6 +281,10 @@ pub struct VideoApp {
     /// and changes no gate, wire or brick count either way. Inert while
     /// [`Self::external_clock`] is set, which builds no timer.
     loop_playback: bool,
+    /// Pre-generate the physical Pause/Restart/Resume buttons wired into the
+    /// clock ([`AnimOptions::control_buttons`]). On by default; inert while
+    /// [`Self::external_clock`] is set, which exposes no control pins.
+    control_buttons: bool,
     glow: bool,
 
     /// Which medium the render uses -- one display brick per pixel, or a
@@ -361,14 +313,10 @@ pub struct VideoApp {
     /// [`Self::shows_colours_control`] is true.
     colors: usize,
 
-    /// The picked subtitle track and the file name it came from, or `None`
-    /// for no subtitles at all.
-    ///
-    /// Parsed ONCE at pick time, not per render and not per UI frame: the
-    /// cost readout redraws every frame and re-parsing a few thousand cues
-    /// sixty times a second would be pure waste. The `Arc` is what makes
-    /// handing the same track to both the readout and the render thread free
-    /// (see [`AnimOptions::subtitles`]).
+    /// The picked subtitle track and its file name, or `None`. Parsed once
+    /// at pick time, not per frame -- the cost readout redraws every frame
+    /// and would waste re-parsing thousands of cues 60 times a second. The
+    /// `Arc` makes sharing it with the render thread free.
     subtitles: Option<(String, Arc<Subtitles>)>,
     /// The in-flight subtitle picker. Bytes, not a path -- see
     /// [`crate::gui::util::pick_subtitle_bytes`], which is why this works on
@@ -403,9 +351,7 @@ impl Default for VideoApp {
             #[cfg(not(target_arch = "wasm32"))]
             backend: Backend::Auto,
             #[cfg(not(target_arch = "wasm32"))]
-            pending_ffmpeg_consent: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            pending_ffmpeg_download: None,
+            modal: FfmpegModal::default(),
             pending_generate: None,
             progress_rx: None,
             progress_label: String::new(),
@@ -414,7 +360,10 @@ impl Default for VideoApp {
             preview_texture: None,
             #[cfg(not(target_arch = "wasm32"))]
             cancel_flag: None,
-            resize: false,
+            // Default to a 64x64 Contain render rather than the source
+            // resolution: a full-size video is an enormous brick build, and
+            // 64x64 is a sensible starting point the user can raise.
+            resize: true,
             width: 64,
             height: 64,
             fit: FitMode::Contain,
@@ -432,6 +381,7 @@ impl Default for VideoApp {
             brick_style: d.brick_style,
             external_clock: d.external_clock,
             loop_playback: d.loop_playback,
+            control_buttons: d.control_buttons,
             glow: d.glow,
             // Brick mode, unchanged default behaviour -- this GUI never
             // exposed an `AnimEncoding` choice even before this field
@@ -539,15 +489,8 @@ impl VideoApp {
             fill_char: self.text_fill_char.chars().next().unwrap_or('█'),
             empty_char: self.text_empty_char.chars().next().unwrap_or(' '),
             char_repeat: self.text_char_repeat.max(1),
-            // The SAME slider that culls brick-mode pixels, not a second
-            // control -- `text_bricks::build_text_world`'s palette reads
-            // `opts.text.alpha_threshold`, not `opts.alpha_threshold` (that's
-            // the encoder's own visibility rule), so leaving this at the
-            // preset default while the user tunes "Alpha Threshold" would
-            // silently build the palette against a different notion of which
-            // pixels are visible than the one the render actually draws --
-            // the same mismatch `main.rs`'s `--alpha-threshold` handling
-            // documents and avoids for the CLI.
+            // Same slider that culls brick-mode pixels, not a second control
+            // (see `anim_options` in main.rs for why both fields must match).
             alpha_threshold: self.alpha_threshold,
             line_height: self.text_line_height,
             ..self.text_preset.options(1.0)
@@ -558,6 +501,7 @@ impl VideoApp {
             brick_style: self.brick_style,
             external_clock: self.external_clock,
             loop_playback: self.loop_playback,
+            control_buttons: self.control_buttons,
             glow: self.glow,
             colors: self.colors,
             text,
@@ -772,38 +716,30 @@ impl VideoApp {
     fn poll_generate(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.progress_rx {
             while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    ProgressMsg::Begin { label, total } => {
-                        self.progress_label = label;
-                        self.progress_total = total;
-                        self.progress_pos = 0;
-                    }
-                    // A total that came from an ESTIMATE can be low; the
-                    // shared rule grows it to meet the position rather than
-                    // letting the bar draw past 100% and the readout say
-                    // "137/100". See `progress::reconcile_total`.
-                    ProgressMsg::Tick(n) => {
-                        let (pos, total) =
-                            crate::progress::reconcile_total(self.progress_total, n);
-                        self.progress_pos = pos;
-                        self.progress_total = total;
-                    }
-                    ProgressMsg::Finish => {}
-                    ProgressMsg::Preview { width, height, rgba } => {
-                        // Replaces the previous handle -- never accumulates
-                        // a new named texture -- so only the latest frame's
-                        // upload is ever resident on the GPU.
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [width as usize, height as usize],
-                            &rgba,
-                        );
-                        self.preview_texture = Some(ctx.load_texture(
-                            "video_preview",
-                            image,
-                            egui::TextureOptions::default(),
-                        ));
-                    }
-                }
+                // `apply_core` is the shared Begin/Tick/Finish bookkeeping
+                // (see `util::RenderMsg`, including the "grow an
+                // under-estimate rather than overflow the bar" rule); a
+                // `Preview` payload comes back out here, since what it means
+                // is pane-specific.
+                let Some(Preview { width, height, rgba }) = msg.apply_core(
+                    &mut self.progress_label,
+                    &mut self.progress_pos,
+                    &mut self.progress_total,
+                ) else {
+                    continue;
+                };
+                // Replaces the previous handle -- never accumulates a new
+                // named texture -- so only the latest frame's upload is ever
+                // resident on the GPU.
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [width as usize, height as usize],
+                    &rgba,
+                );
+                self.preview_texture = Some(ctx.load_texture(
+                    "video_preview",
+                    image,
+                    egui::TextureOptions::default(),
+                ));
             }
         }
 
@@ -830,38 +766,6 @@ impl VideoApp {
         }
     }
 
-    /// Poll the in-flight ffmpeg download, if the consent modal's "Download"
-    /// button was clicked. On resolution `pending_ffmpeg_consent` is cleared
-    /// either way -- success means ffmpeg is now installed, failure means it
-    /// still is not -- and either way the modal closes and the user presses
-    /// Generate again to retry. This does not resume the render
-    /// automatically: doing so would mean stashing a full copy of
-    /// `SharedOptions` and every render option across the download, for a
-    /// one-click saving that a `log::info!` plus a second Generate click
-    /// covers just as well.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn poll_ffmpeg_download(&mut self, ctx: &egui::Context) {
-        let Some(promise) = self.pending_ffmpeg_download.take() else {
-            return;
-        };
-        match promise.try_take() {
-            Ok(result) => {
-                self.pending_ffmpeg_consent = None;
-                match result {
-                    Ok(()) => info!("ffmpeg installed -- click Generate again to continue"),
-                    Err(e) => error!("{e}"),
-                }
-            }
-            Err(promise) => {
-                self.pending_ffmpeg_download = Some(promise);
-                // Same reasoning as `draw_submit`'s in-flight-render branch:
-                // nothing else is waking the event loop while the download
-                // runs on its own thread.
-                ctx.request_repaint();
-            }
-        }
-    }
-
     /// Whether resolving `path` with `self.backend` needs a download the
     /// user has not consented to yet.
     ///
@@ -869,10 +773,10 @@ impl VideoApp {
     /// (see that function's doc): try the backend, and only need ffmpeg if
     /// that attempt failed for a reason ffmpeg could fix AND ffmpeg is not
     /// currently installed. Running it here, synchronously on the UI thread,
-    /// rather than inside the worker `generate` spawns, is what lets
-    /// `draw_ffmpeg_modal` ask the question before any background work
-    /// starts -- a modal needs the UI thread to answer, and the worker
-    /// thread has none. Any `Box<dyn FrameSource>` this opens successfully
+    /// rather than inside the worker `generate` spawns, is what lets the modal
+    /// ask the question before any background work starts -- a modal needs the
+    /// UI thread to answer, and the worker thread has none. Any
+    /// `Box<dyn FrameSource>` this opens successfully
     /// is dropped immediately: it exists only to answer the question, and
     /// `generate`'s `work` closure opens its own via the identical call.
     ///
@@ -907,63 +811,6 @@ impl VideoApp {
                 error!("{e}");
                 FfmpegCheck::Failed
             }
-        }
-    }
-
-    /// Shown while `pending_ffmpeg_consent` is `Some`: a real modal (egui's
-    /// `Modal`, whose backdrop blocks input to the rest of the pane) rather
-    /// than `DownloadConsent::Ask`'s stdin prompt, which the GUI has no
-    /// terminal for. "Download" spawns `ensure_ffmpeg(DownloadConsent::
-    /// Always)` on a background thread -- a real network fetch, so it must
-    /// not block the UI -- and shows a spinner until `poll_ffmpeg_download`
-    /// observes it's done. "Cancel" clears the pending state and leaves the
-    /// render un-started. Neither path ever silently downloads or silently
-    /// hangs.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn draw_ffmpeg_modal(&mut self, ctx: &egui::Context) {
-        if self.pending_ffmpeg_consent.is_none() {
-            return;
-        }
-
-        if self.pending_ffmpeg_download.is_some() {
-            egui::Modal::new(egui::Id::new("video_ffmpeg_download_modal")).show(ctx, |ui| {
-                ui.set_max_width(360.0);
-                ui.heading("Downloading ffmpeg...");
-                ui.add(egui::ProgressBar::new(0.0).animate(true));
-            });
-            return;
-        }
-
-        let mut download = false;
-        let mut cancel = false;
-        egui::Modal::new(egui::Id::new("video_ffmpeg_consent_modal")).show(ctx, |ui| {
-            ui.set_max_width(420.0);
-            ui.heading("Download ffmpeg?");
-            ui.label(format!(
-                "This video needs the ffmpeg decode backend, and no ffmpeg install was found \
-                 on this machine. Download it now from {}?",
-                ffmpeg_sidecar::download::ffmpeg_download_url()
-                    .unwrap_or("the official ffmpeg build server")
-            ));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Download").clicked() {
-                    download = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
-        });
-
-        if download {
-            self.pending_ffmpeg_download = Some(Promise::spawn_thread("ffmpeg_download", || {
-                ensure_ffmpeg(DownloadConsent::Always)
-            }));
-        }
-        if cancel {
-            info!("ffmpeg download declined; video was not converted");
-            self.pending_ffmpeg_consent = None;
         }
     }
 
@@ -1185,6 +1032,11 @@ impl VideoApp {
         if self.external_clock {
             chips.push("external clock".to_string());
         }
+        // Buttons are ON by default, so only their ABSENCE is worth a chip --
+        // the same "summarise the non-default" rule the glow/clock chips follow.
+        if !self.control_buttons {
+            chips.push("no buttons".to_string());
+        }
         // No "no loop" chip: the Loop checkbox is on the always-visible grid
         // now, so its state is already in view and does not need a header
         // summary the way a collapsed section's contents do.
@@ -1197,6 +1049,7 @@ impl VideoApp {
             || self.brick_style != d.brick_style
             || self.pixel_extent != d.pixel_extent
             || self.external_clock != d.external_clock
+            || self.control_buttons != d.control_buttons
             || self.glow != d.glow
     }
 
@@ -1451,6 +1304,17 @@ impl VideoApp {
         ui.checkbox(&mut self.external_clock, "External clock");
         ui.end_row();
 
+        ui.label("Controls").on_hover_text(
+            "Pre-generate three physical Pause/Restart/Resume buttons on the main grid, \
+             wired into the clock so the render is controllable out of the box. Off means \
+             you wire the clock's control pins yourself. Inert with an external clock, \
+             which exposes no control pins.",
+        );
+        ui.add_enabled_ui(!self.external_clock, |ui| {
+            ui.checkbox(&mut self.control_buttons, "Control buttons");
+        });
+        ui.end_row();
+
         ui.label("Material").on_hover_text(
             "Glow at intensity 0: the screen lights itself instead of being lit by \
              the world, so its colours stay true at night",
@@ -1685,25 +1549,7 @@ impl VideoApp {
                 ui.add(egui::Image::new(tex).max_size(egui::vec2(MAX_PREVIEW_SIDE, MAX_PREVIEW_SIDE)));
                 ui.add_space(4.0);
             }
-            match self.progress_total {
-                Some(total) if total > 0 => {
-                    let frac = self.progress_pos as f32 / total as f32;
-                    ui.add(egui::ProgressBar::new(frac).text(format!(
-                        "{} {}/{}",
-                        self.progress_label, self.progress_pos, total
-                    )));
-                }
-                // Unknown total (or a degenerate `Some(0)`): an animated
-                // indeterminate bar, never a fabricated fraction that would
-                // reach 100% and keep going.
-                _ => {
-                    ui.add(
-                        egui::ProgressBar::new(0.0)
-                            .animate(true)
-                            .text(self.progress_label.clone()),
-                    );
-                }
-            }
+            draw_progress_bar(ui, &self.progress_label, self.progress_pos, self.progress_total);
             // Visible only while a render is actually in flight (this whole
             // branch), and only where a Cancel click can do anything -- on
             // wasm `work` already ran to completion before this button could
@@ -1711,16 +1557,7 @@ impl VideoApp {
             // is no flag here to back it with.
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(flag) = &self.cancel_flag {
-                ui.add_space(4.0);
-                let cancelling = flag.load(Ordering::Relaxed);
-                ui.add_enabled_ui(!cancelling, |ui| {
-                    if ui
-                        .add(Button::new(if cancelling { "Cancelling..." } else { "Cancel" }))
-                        .clicked()
-                    {
-                        flag.store(true, Ordering::Relaxed);
-                    }
-                });
+                draw_cancel_button(ui, flag);
             }
             return;
         }
@@ -1741,13 +1578,13 @@ impl VideoApp {
             Input::Video { .. } => true,
         };
 
-        // The ffmpeg consent modal (drawn elsewhere, see `draw_ffmpeg_modal`)
+        // The ffmpeg consent modal (drawn elsewhere, see `FfmpegModal::draw`)
         // already blocks input to the rest of the pane via its backdrop
         // while it's open; this is belt-and-suspenders so a click that
         // somehow lands here anyway can't start a second `generate` call
         // while one is already waiting on consent or mid-download.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.pending_ffmpeg_consent.is_some() {
+        if self.modal.is_open() {
             ui.label("Waiting on the ffmpeg download prompt above...");
             return;
         }
@@ -1767,34 +1604,15 @@ impl VideoApp {
         }
     }
 
-    /// On click: decode (already cached for an animated file; deferred to
-    /// the worker for a sequence) -> resize -> resample -> build the brick
-    /// world -> encode -> deliver.
-    ///
-    /// The heavy work (decode/resize/resample/`build_brick_world`/encode)
-    /// runs on a background thread on native, mirroring
-    /// `HeightmapApp::run_converter`: capture the inputs a render needs out
-    /// of `self`/`shared` up front, move them into a `work` closure, spawn
-    /// it, and hand back a `Promise` for `poll_generate` to collect.
-    /// `wasm32` has no usable `std::thread::spawn`, so there `work` just
-    /// runs in place, same as before -- the tab still blocks for the
-    /// render's duration on the web, which is unchanged from today.
-    ///
-    /// The captures below run in the click handler, so they are deliberately
-    /// cheap: scalars, an `AnimOptions`, two `String`s, and (for a sequence)
-    /// `Arc` refcount bumps -- see [`GenSource`]. The only unavoidably
-    /// expensive one is `Animated`'s `clip.clone()`, since `Clip::frames` is
-    /// a plain `Vec<RgbaImage>`.
-    ///
-    /// `deliver_save` runs *inside* `work`, i.e. on the worker on native:
-    /// it does a direct `std::fs::write` plus an optional clipboard-path
-    /// copy, neither of which needs the UI thread (no dialog is opened --
-    /// the destination is the already-typed `out_file` text box), and
-    /// `HeightmapApp::run_converter` already does the same. On `wasm32`
-    /// `work` never leaves the calling (UI) thread anyway, so the
-    /// browser-download path there is untouched.
-    ///
-    /// Every failure is logged through `log::error!`, never panicked.
+    /// On click: decode (cached for an animated file, deferred to the worker
+    /// for a sequence) -> resize -> resample -> build the brick world ->
+    /// encode -> deliver. Runs on a background thread on native (mirroring
+    /// `HeightmapApp::run_converter`); `wasm32` has no `std::thread::spawn`,
+    /// so `work` runs in place and the tab blocks for the render. Captures
+    /// are cheap (scalars, `Arc` bumps -- see [`GenSource`]) except
+    /// `Animated`'s `clip.clone()`. `deliver_save` runs inside `work`, so it
+    /// needs no UI thread. Every failure is logged via `log::error!`, never
+    /// panicked.
     fn generate(&mut self, shared: &SharedOptions) {
         // Belt-and-suspenders: `draw_submit` already hides the button while
         // a render is in flight, but refuse here too rather than trust the
@@ -1805,11 +1623,11 @@ impl VideoApp {
 
         // A video source needs to know, before any worker starts, whether
         // the selected backend needs ffmpeg and ffmpeg is missing --
-        // `draw_ffmpeg_modal` needs the UI thread to ask, and a worker
+        // `FfmpegModal::draw` needs the UI thread to ask, and a worker
         // thread has none. `check_ffmpeg_consent` makes exactly the same
         // trial `open_video_ensuring` would make internally; see its doc.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.pending_ffmpeg_consent.is_some() || self.pending_ffmpeg_download.is_some() {
+        if self.modal.is_open() {
             return error!("waiting on the ffmpeg download prompt");
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -1817,7 +1635,7 @@ impl VideoApp {
             match self.check_ffmpeg_consent(path) {
                 FfmpegCheck::Ready => {}
                 FfmpegCheck::NeedsConsent => {
-                    self.pending_ffmpeg_consent = Some(path.clone());
+                    self.modal.request(path.clone());
                     return;
                 }
                 // Already logged by `check_ffmpeg_consent`.
@@ -2013,9 +1831,17 @@ impl VideoApp {
         self.poll_picks();
         self.poll_generate(ui.ctx());
         #[cfg(not(target_arch = "wasm32"))]
-        self.poll_ffmpeg_download(ui.ctx());
-        #[cfg(not(target_arch = "wasm32"))]
-        self.draw_ffmpeg_modal(ui.ctx());
+        {
+            self.modal.poll(ui.ctx());
+            let prompt = format!(
+                "This video needs the ffmpeg decode backend, and no ffmpeg install was found \
+                 on this machine. Download it now from {}?",
+                ffmpeg_sidecar::download::ffmpeg_download_url()
+                    .unwrap_or("the official ffmpeg build server")
+            );
+            self.modal
+                .draw(ui.ctx(), "video", &prompt, "video was not converted");
+        }
         self.draw_settings(ui, shared);
         self.draw_input(ui);
         ui.add_space(8.0);
@@ -2029,6 +1855,7 @@ impl VideoApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use crate::anim::bricks::build_brick_world;
     use crate::progress::NoProgress;
     // Only the tests build a `World` directly now -- `generate` hands
@@ -2063,19 +1890,9 @@ mod tests {
         build_brick_world(&clip, &AnimOptions::default(), &mut NoProgress).expect("build")
     }
 
-    /// **The destination's extension decides the CONTAINER, on every pane.**
-    ///
-    /// This path used to call `world.to_brz_vec()` unconditionally and write
-    /// the bytes to whatever name it was given, so a `.brdb` destination
-    /// received a BRZ archive. It is reachable rather than theoretical: all
-    /// five panes share one `SharedOptions::out_file`, Image2Brick honours the
-    /// extension, and each pane's own warning fires only when the name ends in
-    /// NEITHER extension -- so `.brdb` is endorsed by the UI.
-    ///
-    /// Asserted on the FILE MAGIC rather than on which function was called: a
-    /// BRZ archive starts `BRZ\0` and a brdb is a SQLite database, so the two
-    /// are distinguishable from the bytes alone and nothing about how they were
-    /// produced can fake it.
+    // Asserted on the file magic rather than on which function was called:
+    // a BRZ archive starts `BRZ\0` and a brdb is a SQLite database, so
+    // nothing about how the bytes were produced can fake the check.
     #[test]
     fn the_output_extension_decides_the_container() {
         let base = std::env::temp_dir().join(format!("h2b_container_{}", std::process::id()));
@@ -2119,9 +1936,6 @@ mod tests {
         }
     }
 
-    /// A destination the tool cannot write at all is refused rather than
-    /// written to. The GUI shows the same rule as a red label, so a pane that
-    /// wrote the file anyway would contradict its own warning.
     #[test]
     fn a_destination_with_no_known_extension_is_refused() {
         let path = std::env::temp_dir().join(format!("h2b_container_{}_noext", std::process::id()));
@@ -2138,10 +1952,8 @@ mod tests {
         assert!(!path.exists(), "and nothing may be written to it");
     }
 
-    /// The regression test for the cancel path: a cancelled render must
-    /// write NO output file, and must still report success (`Ok(())`), not
-    /// an error -- `generate`'s worker logs any `Err` via `log::error!`,
-    /// which a cancellation must never trigger.
+    // Must return `Ok(())`, not `Err`: `generate`'s worker logs any `Err`
+    // via `log::error!`, which a cancellation must never trigger.
     #[test]
     fn a_cancelled_render_writes_no_output_file() {
         let path = std::env::temp_dir().join(format!(
@@ -2157,9 +1969,6 @@ mod tests {
         assert!(!path.exists(), "a cancelled render must write no output file");
     }
 
-    /// The complementary case: the default (non-cancelled) path must be
-    /// completely unaffected -- the save is still written exactly as before
-    /// this task's change.
     #[test]
     fn an_uncancelled_render_still_writes_its_output_file() {
         let path = std::env::temp_dir().join(format!(
@@ -2182,10 +1991,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `ChannelProgress::is_cancelled` must actually be backed by the shared
-    /// flag -- flipping it after construction (exactly what the UI thread's
-    /// Cancel button does to a clone of the same `Arc`) must be visible to
-    /// the reporter without needing a new one.
     #[test]
     fn channel_progress_is_cancelled_reflects_the_shared_flag() {
         let (tx, _rx) = std::sync::mpsc::channel::<ProgressMsg>();
@@ -2214,15 +2019,9 @@ mod tests {
         }
     }
 
-    /// The regression test for the bug this task's brief calls out by name:
-    /// `cost::estimate_text` once hard-coded `char_repeat = 2`, so the GUI's
-    /// readout could describe a different band count than the render it was
-    /// meant to describe. Routing `live_cost` through `self.mode.estimate`
-    /// over `self.anim_opts()` (the same options `generate` builds the world
-    /// from) is what this test actually pins: switching `mode` alone, with
-    /// everything else held fixed, must move the gate estimate by the
-    /// text-vs-brick order of magnitude `cost::estimate_text`'s own tests
-    /// document (>300x at 192x108).
+    // Pins `live_cost` routing through `self.anim_opts()`, the same options
+    // `generate` builds the world from -- switching `mode` alone must move
+    // the gate estimate by the text-vs-brick order of magnitude.
     #[test]
     fn the_live_estimate_follows_the_selected_mode() {
         let mut app = VideoApp::default();
@@ -2252,9 +2051,7 @@ mod tests {
         );
     }
 
-    /// The Colours control has no effect under brick mode -- `AnimOptions::
-    /// colors` is read only by `text_bricks::build_text_world` -- so it must
-    /// only be shown while text mode is selected.
+    // `AnimOptions::colors` is read only by `text_bricks::build_text_world`.
     #[test]
     fn the_colours_control_is_only_meaningful_in_text_mode() {
         let mut app = VideoApp::default();
@@ -2264,10 +2061,6 @@ mod tests {
         assert!(app.shows_colours_control());
     }
 
-    /// `anim_opts` must actually carry `colors` and the text controls through
-    /// to `AnimOptions` -- a UI control that updates `self` but never reaches
-    /// the options struct `generate` and `live_cost` both build from would be
-    /// dead weight that LOOKS wired but isn't.
     #[test]
     fn anim_opts_carries_the_colours_and_text_controls_through() {
         let mut app = VideoApp::default();
@@ -2298,10 +2091,8 @@ mod tests {
         }]))
     }
 
-    /// The same "a control that looks wired but isn't" check as above, for
-    /// the subtitle controls. `subtitle_scale`/`subtitle_lift` deliberately
-    /// differ from their defaults: an assertion against the default value
-    /// passes with the field unwired.
+    // `subtitle_scale`/`subtitle_lift` are deliberately set off their
+    // defaults: an assertion against the default would pass even unwired.
     #[test]
     fn anim_opts_carries_the_subtitle_controls_through() {
         let mut app = VideoApp::default();
@@ -2329,10 +2120,8 @@ mod tests {
         assert_eq!(opts.subtitle_lift, 3.5);
     }
 
-    /// **Defect 1's GUI half.** A subtitle file is in SOURCE time, so the
-    /// Start control has to reach `AnimOptions` too -- `generate` passes the
-    /// same value to the `AdaptedSource`, and a track timed from 0 against a
-    /// render that starts 120 s in is two minutes out.
+    // A subtitle file is in source time, so Start must reach `AnimOptions`
+    // too, or a track timed from 0 would be off by the render's own offset.
     #[test]
     fn anim_opts_carries_the_start_offset_the_subtitle_timing_needs() {
         let mut app = VideoApp::default();
@@ -2344,11 +2133,9 @@ mod tests {
         assert_eq!(app.anim_opts().source_start_s, 0.0);
     }
 
-    /// **Defect 2's GUI half.** The readout is routed through the same
-    /// `(mode, anim_opts())` pair the render dispatches on, so picking a
-    /// subtitle file must move the estimate by the two gates it actually
-    /// builds. A readout that ignored `subtitles` would look perfectly
-    /// plausible and be exactly 2 under every subtitled render.
+    // The readout is routed through the same `(mode, anim_opts())` pair the
+    // render dispatches on, so picking a subtitle file must move the estimate
+    // by the two gates it actually builds.
     #[test]
     fn the_live_estimate_counts_a_picked_subtitle_track() {
         let mut app = VideoApp::default();

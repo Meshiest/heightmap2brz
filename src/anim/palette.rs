@@ -1,7 +1,7 @@
 //! Median-cut colour quantization.
 //!
 //! Text mode writes an explicit `<color="RRGGBB">` tag at the start of every
-//! colour run, so its size is governed by how LONG runs are, not how wide a
+//! colour run, so its size is governed by how long runs are, not how wide a
 //! tag is. Collapsing the palette lengthens runs: measured on a real animated
 //! episode at 192x108, going from 24-bit to a 32-entry median-cut palette cuts
 //! characters per cell from 14.65 to 4.74 -- from 2.4x brick mode's cost to
@@ -296,15 +296,15 @@ mod tests {
         assert_eq!(p.map([0x12, 0x34, 0x56]), [0x12, 0x34, 0x56], "pass through");
     }
 
-    /// **`--colors N` must actually produce N entries.**
+    /// `--colors N` must actually produce N entries.
     ///
-    /// Every test above constrains the palette from ONE side only:
+    /// Every test above constrains the palette from one side only:
     /// `never_exceeds_the_requested_size` asserts `<= 8`,
     /// `fewer_distinct_colours_than_requested_yields_no_duplicates` uses a
     /// 2-colour source, and the rest use 1-3 entries. A `build` that silently
     /// capped every palette at 3 entries would pass all of them -- so
     /// `--colors 32` could have been rendering 3 colours with nothing in the
-    /// suite to say otherwise. This pins the count EXACTLY, at sizes well past
+    /// suite to say otherwise. This pins the count exactly, at sizes well past
     /// that cap, on a source with plenty of distinct colours to go round.
     #[test]
     fn a_palette_really_has_as_many_entries_as_were_asked_for() {
@@ -336,7 +336,7 @@ mod tests {
         }
     }
 
-    /// The other half: the entry count has to reach the MAPPING, not merely
+    /// The other half: the entry count has to reach the mapping, not merely
     /// sit in `entries()`. A bigger palette must resolve a gradient to more
     /// distinct outputs, and every output must be one of the entries.
     #[test]
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(three, 3, "a 3-entry palette must resolve exactly 3 colours");
         // Not exactly 32: a median-cut box average can land where no source
         // colour is nearest to it, so a handful of entries go unused on any
-        // given clip. The point is the ORDER OF MAGNITUDE -- a cap at 3 would
+        // given clip. The point is the order of magnitude -- a cap at 3 would
         // read as 3 here, not as the high twenties.
         assert!(
             thirty_two >= 24,

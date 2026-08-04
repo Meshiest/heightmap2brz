@@ -5,6 +5,79 @@ use super::speakers::{DEFAULT_INNER_RADIUS, DEFAULT_MAX_DISTANCE};
 use super::stft::{frame_count_for, hop_for, StftStream};
 use crate::anim::pack::BANK_FRAMES;
 use crate::progress::{FrameTotal, Progress};
+use brdb::BString;
+use brdb::assets::external::{
+    BA_SYNTH_BASIC_SAWTOOTH, BA_SYNTH_BASIC_SINE, BA_SYNTH_BASIC_SQUARE, BA_SYNTH_BASIC_TRIANGLE,
+};
+
+/// The synth waveform every tonal band plays through -- the `--synth` flag,
+/// as a type. Noise bands use their own `BA_Synth_Noise_*` assets and are
+/// unaffected. Sine is the default and first in [`Self::ALL`], so an
+/// unchanged command renders byte-for-byte as before this flag existed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SynthWave {
+    /// The behaviour before this flag existed, and the default.
+    #[default]
+    Sine,
+    Square,
+    Triangle,
+    Sawtooth,
+}
+
+impl SynthWave {
+    /// The four waves in selector order -- "the waves at the top". Sine first,
+    /// so `ALL[0]` is the default.
+    pub const ALL: [SynthWave; 4] = [
+        SynthWave::Sine,
+        SynthWave::Square,
+        SynthWave::Triangle,
+        SynthWave::Sawtooth,
+    ];
+
+    /// The `BA_Synth_Basic_*` asset this wave plays through.
+    pub fn asset(self) -> BString {
+        match self {
+            SynthWave::Sine => BA_SYNTH_BASIC_SINE,
+            SynthWave::Square => BA_SYNTH_BASIC_SQUARE,
+            SynthWave::Triangle => BA_SYNTH_BASIC_TRIANGLE,
+            SynthWave::Sawtooth => BA_SYNTH_BASIC_SAWTOOTH,
+        }
+    }
+
+    /// The `--synth` spelling. Round-trips with [`Self::parse`].
+    pub const fn flag(self) -> &'static str {
+        match self {
+            SynthWave::Sine => "sine",
+            SynthWave::Square => "square",
+            SynthWave::Triangle => "triangle",
+            SynthWave::Sawtooth => "sawtooth",
+        }
+    }
+
+    /// Display name for UIs (the dropdown label).
+    pub const fn name(self) -> &'static str {
+        match self {
+            SynthWave::Sine => "Sine",
+            SynthWave::Square => "Square",
+            SynthWave::Triangle => "Triangle",
+            SynthWave::Sawtooth => "Sawtooth",
+        }
+    }
+
+    /// Parse a `--synth` value. The error names the flag and every valid
+    /// spelling.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "sine" => Ok(SynthWave::Sine),
+            "square" => Ok(SynthWave::Square),
+            "triangle" => Ok(SynthWave::Triangle),
+            "sawtooth" => Ok(SynthWave::Sawtooth),
+            other => Err(format!(
+                "unsupported --synth '{other}' (sine, square, triangle, sawtooth)"
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct AudioOptions {
@@ -12,14 +85,11 @@ pub struct AudioOptions {
     /// Total speakers, noise bands included -- or `None` for "as many as the
     /// hardware pitch range holds at [`Self::subdiv`]".
     ///
-    /// The tonal spacing is no longer free: bands sit on exact equal-tempered
-    /// steps ([`BandPlan`]), so a count cannot change the interval, only how
-    /// much of the scale is covered. `Some(n)` therefore **selects the span**
-    /// -- the `n - noise_bands` steps closest to A440 -- and asking for more
-    /// than the range holds is an error naming the maximum, never a clamp.
-    ///
-    /// `None` is the default because with the spacing fixed there is no other
-    /// honest one: 79 tonal bands at 12 steps per octave (F#1..C8), 159 at 24.
+    /// Bands sit on exact equal-tempered steps ([`BandPlan`]), so a count
+    /// cannot change the interval, only how much of the scale is covered:
+    /// `Some(n)` selects the `n - noise_bands` steps closest to A440, and
+    /// asking for more than the range holds is an error naming the maximum,
+    /// not a clamp.
     pub bands: Option<usize>,
     pub noise_bands: usize,
     /// Tonal bands per octave. 12 = one per semitone; see
@@ -28,80 +98,49 @@ pub struct AudioOptions {
     pub window: usize,
     /// Post-normalisation multiplier. Clamped at 1.0 after application.
     pub gain: f32,
-    /// Band energies at or below this many dB below **the loudest band in
-    /// the same frame** become exactly zero.
-    ///
-    /// Relative to the frame, not to the track: see [`analyze`] for the
-    /// measurements that forced the change.
+    /// Band energies at or below this many dB below the loudest band in the
+    /// same frame become exactly zero. Relative to the frame, not the track.
     pub floor_db: f32,
-    /// Per-frame leveling, 0.0 (off) to 1.0 (full automatic gain control,
-    /// **and the default** -- see the `Default` impl below for the listening
-    /// that put it there). Every setting keeps the frame mix inside full
-    /// scale; see [`analyze`].
+    /// Per-frame leveling, 0.0 (off) to 1.0 (full automatic gain control, the
+    /// default). Every setting keeps the frame mix inside full scale; see
+    /// [`analyze`].
     pub leveling: f32,
-    /// How many bands may sound at once. Every other band in the frame is set
-    /// to exactly zero. `0` disables selection entirely and lets every band
-    /// through, which is the behaviour that made the render sound like noise.
-    ///
-    /// **This is the flag that turns a filterbank back into music.** See
-    /// [`select_peaks`] for the measurements.
+    /// How many bands may sound at once; every other band in the frame is set
+    /// to exactly zero. `0` disables selection and lets every band through.
+    /// See [`select_peaks`].
     pub max_voices: usize,
     /// How far a spectral peak must stand above its neighbourhood before it
-    /// counts as a note at all, as an amplitude RATIO -- see [`prominence`].
-    ///
-    /// **This, not [`Self::max_voices`], is what limits a dense frame.** The
-    /// gate leaves ~12-24 candidates per frame at the default 1.5, so
-    /// `--max-voices` above that is inert and every render at 24, 32, 48 and 64
-    /// voices is the same render. Lowering it is the only way to sound more
-    /// bands at once; 1.0 disables it entirely and lets every local maximum
-    /// through. See [`DEFAULT_PEAK_GATE`] for the measurements behind the
-    /// default and for what going below it costs.
+    /// counts as a note at all, as an amplitude ratio -- see [`prominence`]
+    /// and [`DEFAULT_PEAK_GATE`].
     ///
     /// Voice mode has its own gate of the same name and value
     /// (`voices::MIN_PROMINENCE`), measured over a different neighbourhood;
     /// this flag does not reach it.
     pub peak_gate: f32,
-    /// Envelope attack time in MILLISECONDS: how quickly a band's output level
+    /// Envelope attack time in milliseconds: how quickly a band's output level
     /// rises toward the level the analysis just measured. See [`Envelope`].
     pub attack_ms: f32,
-    /// Envelope release time in MILLISECONDS: how quickly it falls. Longer
-    /// than the attack by design -- see [`Envelope`], and
-    /// [`DEFAULT_RELEASE_MS`] for what it fixes.
+    /// Envelope release time in milliseconds: how quickly it falls. Longer
+    /// than the attack by design -- see [`Envelope`] and [`DEFAULT_RELEASE_MS`].
     pub release_ms: f32,
-    /// **Voice mode only.** How long a voice takes to fade to EXACTLY zero once
-    /// its partial has gone, in milliseconds.
-    ///
-    /// Separate from [`Self::release_ms`], which is a one-pole time constant on
-    /// a *sounding* voice's level and never reaches zero. This one is the end
-    /// of a note, and the material decides it: a piano note has a natural decay
-    /// and can afford a slow one, a spoken phoneme is 50-100 ms long and a
-    /// release anywhere near [`DEFAULT_RELEASE_MS`] smears clean across it --
-    /// which is what the owner heard as speech coming out "disembodied".
-    ///
-    /// See [`DEFAULT_VOICE_RELEASE_MS`].
+    /// Voice mode only: how long a voice takes to fade to exactly zero once
+    /// its partial has gone, in milliseconds. Separate from [`Self::release_ms`],
+    /// which is a one-pole time constant on a sounding voice's level and never
+    /// reaches zero -- this one is the end of a note. See
+    /// [`DEFAULT_VOICE_RELEASE_MS`].
     pub voice_release_ms: f32,
-    /// **Voice mode only.** A continuing voice whose pitch is within this many
+    /// Voice mode only: a continuing voice whose pitch is within this many
     /// cents of an equal-tempered semitone is pulled onto it. 0 (the default)
-    /// disables snapping entirely; `voices::MAX_PITCH_SNAP_CENTS` (50, half a
-    /// semitone) is the largest value that can mean anything, and larger ones
-    /// are refused by name at parse time rather than at the end of the render.
-    ///
-    /// Offered, and off, deliberately. The argument for voice mode is that a
-    /// tracked voice needs no grid, and this puts a shallow one back -- it
-    /// quantises real vibrato and glissando away along with the jitter. It
-    /// exists because a *stable* pitch a few cents wrong may still sound better
-    /// than a correct one that wobbles, which only a listener can settle. The
-    /// jitter itself is addressed first by `voices::PITCH_GLIDE_MS`, which
-    /// costs nothing musically.
+    /// disables snapping; `voices::MAX_PITCH_SNAP_CENTS` (50, half a semitone)
+    /// is the largest value that can mean anything and larger ones are refused
+    /// at parse time.
     pub pitch_snap_cents: f32,
     /// Baked `InnerRadius` on every speaker, in game units: the radius inside
-    /// which there is NO distance attenuation, so every band reaches the
-    /// listener at exactly the same level.
-    ///
-    /// Not cosmetic. `bSpatialization` is false, which turns panning off but
-    /// leaves distance attenuation on, so this and [`Self::max_distance`] are
-    /// what decide whether the bank sounds like one instrument or like a
-    /// distance-filtered slice of the spectrum. See `speakers::DEFAULT_INNER_RADIUS`.
+    /// which there is no distance attenuation, so every band reaches the
+    /// listener at the same level. `bSpatialization` is false (panning off,
+    /// attenuation still on), so this and [`Self::max_distance`] decide
+    /// whether the bank sounds like one instrument or a distance-filtered
+    /// slice of the spectrum. See `speakers::DEFAULT_INNER_RADIUS`.
     pub inner_radius: f32,
     /// Baked `MaxDistance` on every speaker, in game units: where the sound
     /// stops. See [`Self::inner_radius`].
@@ -110,99 +149,63 @@ pub struct AudioOptions {
     pub max_frames: usize,
     pub external_clock: bool,
     /// Repeat the track forever (`true`, the default) or stop on its last
-    /// analysis frame (`false`).
-    ///
-    /// The same field, the same meaning and the same single effect as
+    /// analysis frame (`false`). Same field and effect as
     /// [`crate::anim::bricks::AnimOptions::loop_playback`]: both render paths
-    /// drive one shared clock (`clock::build_clock`), and this becomes the
-    /// value inlined on its `Timer.Limit` -- see
-    /// [`crate::anim::clock::stop_limit`] for the arithmetic and for what
-    /// about it is still unverified in game. Costs nothing either way: same
-    /// gates, same wires, same speakers.
-    ///
-    /// Unlike [`Self::external_clock`], which the audio path refuses outright
-    /// because `speakers::build_speaker_world` reads none of it, this one IS
-    /// read there -- the speaker chip builds the shared clock like every other
-    /// render does.
+    /// share one clock (`clock::build_clock`), inlined on `Timer.Limit` (see
+    /// [`crate::anim::clock::stop_limit`]). Unlike [`Self::external_clock`],
+    /// which the audio path refuses outright, this one is read by
+    /// `speakers::build_speaker_world`.
     pub loop_playback: bool,
-    /// Place the speaker cluster INSIDE the microchip's own inner grid rather
-    /// than beside it on the world's main grid (`false`, the default and every
-    /// render before this flag existed).
-    ///
-    /// On (`true`) the whole audio device is one portable microchip: the
-    /// speakers sit in their own block of the inner grid clear of the gate
-    /// lattice (see `speakers::speaker_inner_position`), and the per-band
-    /// volume/pitch wires that were cross-grid remote wires become same-grid
-    /// internal ones. Nothing else changes -- same speakers, same gates, same
-    /// wires, same baked emitter data.
-    ///
-    /// **The inner-grid layout is physical placement only, NOT spatialisation.**
-    /// An `AudioEmitter` on a microchip inner grid emits from the CHIP'S WORLD
-    /// POSITION regardless of where its brick sits inside the grid, so the
-    /// cluster's shape here buys none of the near-field equal-level geometry the
-    /// beside-the-chip layout does (which is moot anyway with
-    /// `bSpatialization = false`). Whether an in-chip speaker plays at all, and
-    /// that it plays from the chip origin, are game-runtime facts the owner must
-    /// confirm on a test render.
+    /// Place the speaker cluster inside the microchip's own inner grid rather
+    /// than beside it on the world's main grid (`false`, the default). On,
+    /// the cross-grid remote wires to each band become same-grid internal
+    /// ones (see `speakers::speaker_inner_position`); otherwise nothing
+    /// changes. Placement only, not spatialisation: an `AudioEmitter` on a
+    /// microchip inner grid emits from the chip's world position regardless
+    /// of where its brick sits in the grid, and whether an in-chip speaker
+    /// plays at all is unverified in game.
     pub speakers_in_chip: bool,
+    /// Pre-generate three labelled button bricks on the main grid, wired into
+    /// the clock's `Pause`/`Restart`/`Resume` pins (see
+    /// [`crate::anim::controls`]). Same field, meaning and default (`true`)
+    /// as [`crate::anim::bricks::AnimOptions::control_buttons`].
+    pub control_buttons: bool,
+    /// The synth waveform every tonal band plays through. [`SynthWave::Sine`]
+    /// by default; noise bands keep their own `BA_Synth_Noise_*` assets. See
+    /// [`SynthWave`].
+    pub tonal_synth: SynthWave,
 }
 
 impl Default for AudioOptions {
     fn default() -> Self {
         Self {
             fps: 30.0,
-            // Fill the scale. See the field doc.
             bands: None,
-            // OFF. Every source tried in game -- speech, solo piano and a full
-            // pop mix -- was reported worse with the noise bands than without:
-            // "the noise sounds sound bad on all of those". They are kept
-            // behind the flag rather than deleted because percussion is the one
-            // case where a broadband bed plausibly earns its slot, and nothing
-            // else in the bank can render a cymbal at all.
+            // Off: every source tried in game (speech, solo piano, a full pop
+            // mix) sounded worse with noise bands than without. Kept behind
+            // the flag since percussion may plausibly want the broadband bed.
             noise_bands: 0,
             subdiv: crate::audio::bands::DEFAULT_SUBDIV,
             window: 4096,
             gain: 1.0,
             floor_db: -60.0,
-            // FULL. Opt-in was the wrong default and was reverted on
-            // listening evidence: 1.0 beat 0.5 and beat off, on every source
-            // tried in game -- piano, speech and a music box alike.
-            //
-            // The reasoning that made it opt-in ("a track that arrives with
-            // dynamics leaves with them") is true of a normal playback medium
-            // and false of this one. A bank of sine emitters has perhaps 30 dB
-            // of usable range before its quiet passages fall under the room,
-            // where a master has 60 or more, so the source's own dynamics do
-            // not survive the trip regardless -- and what a listener hears
-            // without leveling is not dynamics but a render that vanishes for
-            // half its length. `MAX_LEVELING_BOOST` is what keeps that from
-            // becoming an amplified noise floor.
+            // Full leveling beat 0.5 and off on every source tried in game.
             leveling: 1.0,
-            // The knee of the measured energy/voice-count curve. See
-            // `select_peaks`.
             max_voices: 12,
-            // The measured knee of the prominence/frame-power curve. See
-            // `DEFAULT_PEAK_GATE`.
             peak_gate: DEFAULT_PEAK_GATE,
             attack_ms: DEFAULT_ATTACK_MS,
             release_ms: DEFAULT_RELEASE_MS,
             voice_release_ms: DEFAULT_VOICE_RELEASE_MS,
-            // Off. Voice mode's whole claim is that it needs no grid.
             pitch_snap_cents: 0.0,
-            // Sourced from `speakers`, not spelled out again: these are the
-            // values baked into every emitter, and the reasoning for them
-            // lives next to the field they are written into.
             inner_radius: DEFAULT_INNER_RADIUS,
             max_distance: DEFAULT_MAX_DISTANCE,
             bank_size: BANK_FRAMES,
             max_frames: BANK_FRAMES * 16,
             external_clock: false,
-            // LOOPING, matching `AnimOptions` and matching what every audio
-            // render did before the flag existed.
             loop_playback: true,
-            // OFF: speakers beside the chip on the main grid, unchanged from
-            // every render before the flag. See the field doc.
             speakers_in_chip: false,
+            control_buttons: true,
+            tonal_synth: SynthWave::Sine,
         }
     }
 }
@@ -217,85 +220,31 @@ pub struct VoiceTrack {
     pub frame_count: usize,
 }
 
-/// Default envelope attack, in milliseconds.
-///
-/// One analysis frame at the default 30 fps is 33 ms, so 10 ms is a coefficient
-/// of `1 - exp(-33/10)` = 0.96: a band that is asked to get louder is
-/// essentially there within one frame. That is deliberate -- attacks are what
-/// make a render sound like an instrument being struck rather than a pad
-/// swelling, and the whole point of the asymmetry is that the fix for chatter
-/// must not cost transient definition.
+/// Default envelope attack, in milliseconds. Fast enough that a band reaches
+/// its measured level within about one analysis frame at 30 fps (coefficient
+/// 0.96 at 10 ms), so transients stay punchy while [`DEFAULT_RELEASE_MS`]
+/// absorbs the chatter.
 pub const DEFAULT_ATTACK_MS: f32 = 10.0;
 
-/// Default envelope release, in milliseconds.
-///
-/// **This is the fix for "a lot of random beep pitch sounds".**
-///
-/// The renderer had no envelope at all: a band's output was whatever that
-/// frame's FFT said, so a band selected for a single frame produced a 33 ms
-/// blip -- a beep. Piano was reported "really good" with the same code, and that
-/// contrast is the diagnosis rather than a coincidence: a piano partial is
-/// sustained, so a band selected once stays selected for many frames, while
-/// speech formants and percussion are transient and select for one or two.
-/// Every real channel vocoder has an attack/release envelope for exactly this
-/// reason and this one did not.
-///
-/// 150 ms is the middle of the standard vocoder range (50-200 ms). At 30 fps
-/// the coefficient is `1 - exp(-33/150)` = 0.20, so a band that loses its
-/// selection decays about 1.9 dB per frame instead of cutting to zero, and a
-/// one-frame blip becomes a short note with a tail. It applies **after
-/// deselection as well as during it**, which is most of the fix: the abrupt
-/// part of a blip is the end, not the start.
-///
-/// This is complementary to [`VOICE_HYSTERESIS`] and does not replace it.
-/// Hysteresis stabilises WHICH bands are selected; the envelope stabilises HOW
-/// THEIR LEVEL MOVES. A band can still be deselected and, without an envelope,
-/// still cuts.
+/// Default envelope release, in milliseconds: how long a band decays after
+/// losing selection, so a one-frame blip becomes a short note with a tail
+/// instead of a hard cut. Applies after deselection as well as during it.
+/// Complements [`VOICE_HYSTERESIS`], which stabilises which bands are
+/// selected rather than how a selected band's level moves.
 pub const DEFAULT_RELEASE_MS: f32 = 150.0;
 
 /// Default `--voice-release`, in milliseconds: how long a voice-mode speaker
-/// takes to fade to exactly zero once its partial has gone.
-///
-/// **This is the fix for "you might need to zero the volume after a note is
-/// done playing" and for speech coming out "disembodied".** Voice mode used to
-/// take this time from `--release` (150 ms), which is a level-follower time
-/// constant meant for a bank whose bands never stop existing. Fifty ms is one
-/// and a half analysis frames at the default 30 fps and roughly a third of a
-/// short phoneme, so a word's consonants no longer smear into its vowels.
-///
-/// # Why not shorter, and why shorter would not click
-///
-/// The floor is the format, not the ear. Volumes are written once per analysis
-/// frame, so the shortest fade that can be EXPRESSED is one frame -- 33 ms at 30
-/// fps -- and a linear fade only becomes audible as a click somewhere under
-/// about 5-10 ms on a full-scale sine. A one-frame release is therefore already
-/// 3-7x longer than the shortest inaudible fade, and there is no shorter
-/// setting to be had at any `--audio-fps` a build actually uses. (`--voice-release 0`
-/// is accepted and clamps to that one frame; it is the documented A/B.) The
-/// separate worry -- that a volume write RETRIGGERS the emitter rather than
-/// ramping it, which would click regardless of length -- was settled in game:
-/// diagnostic 3 fades smoothly.
-///
-/// 50 ms is one frame more than that minimum at 30 fps, which buys the one
-/// thing a hard cut gives up: a partial that dips under the prominence gate for
-/// a single frame is a dropout, not a note ending, and a voice with a frame of
-/// ramp in hand resumes it instead of dying and being reborn somewhere else.
-///
-/// Sustained material can afford far more -- `--voice-release 150` restores the
-/// old behaviour -- and that is exactly why this is a flag.
+/// fades to exactly zero once its partial has gone -- separate from
+/// `--release` (150 ms), a time constant for a band that never stops
+/// existing. 50 ms fits inside a short phoneme so consonants don't smear into
+/// vowels; `--voice-release 0` clamps to one analysis frame, the shortest
+/// fade the format can express.
 pub const DEFAULT_VOICE_RELEASE_MS: f32 = 50.0;
 
 /// An asymmetric one-pole level follower: fast up, slow down.
-///
-/// `level += (target - level) * coeff`, with `coeff` chosen by direction.
-/// `coeff = 1 - exp(-dt / tau)` is the exact discretisation of a first-order
-/// lag, so the time constants mean the same thing at any `--audio-fps` -- a
-/// coefficient written directly would silently change meaning with the frame
-/// rate.
-///
-/// A time of 0 gives a coefficient of exactly 1, i.e. no smoothing at all, and
-/// `--attack 0 --release 0` is therefore the documented A/B against the
-/// unsmoothed renderer.
+/// `level += (target - level) * coeff`, `coeff = 1 - exp(-dt / tau)` so the
+/// time constants mean the same thing at any `--audio-fps`. A time of 0 gives
+/// coeff 1 (no smoothing); `--attack 0 --release 0` is the unsmoothed A/B.
 #[derive(Clone, Copy, Debug)]
 pub struct Envelope {
     pub attack: f32,
@@ -348,152 +297,73 @@ impl Envelope {
     }
 }
 
-/// The largest per-frame boost [`AudioOptions::leveling`] may apply, as a
-/// linear amplitude factor (20 dB).
+/// The largest per-frame boost [`AudioOptions::leveling`] may apply (10x,
+/// 20 dB linear). Without a cap, full leveling divides by the frame's own
+/// mix, so a near-silent frame's noise floor would boost to full scale
+/// between notes. Not what bounds the output overall -- that comes from the
+/// ratio being taken between mixes; see [`analyze`].
 ///
-/// Without a cap, `leveling = 1.0` divides by the frame's own mix, so a
-/// near-silent frame gets an unbounded boost and the decoder's noise floor
-/// arrives at full scale between the notes. Measured on a pop track: the
-/// quietest 1% of frames peak at 0.004 of the track peak, which uncapped is a
-/// 250x boost.
-///
-/// It is NOT what bounds the output -- the cap only ever makes the scale
-/// smaller than the leveling asked for, and the bound comes from the ratio
-/// being taken between mixes. See [`analyze`].
-const MAX_LEVELING_BOOST: f32 = 10.0;
+/// `pub(crate)`: shared with [`leveling_scale`], the normalisation both this
+/// module's [`analyze`] and [`crate::audio::voices::analyze_voices`] call, so
+/// the cap has one source rather than two literals that could drift apart.
+pub(crate) const MAX_LEVELING_BOOST: f32 = 10.0;
 
-/// How much louder a band that is ALREADY sounding is treated as being when
-/// it competes for one of the [`AudioOptions::max_voices`] slots.
-///
-/// Pure rank bias: it never changes a volume, only the order candidates are
-/// ranked in, so the selected set is still exactly `max_voices` wide. A
-/// challenger has to beat an incumbent by this factor (3.5 dB) to take its
-/// slot.
-///
-/// Measured on a pop master at 96 bands / `--max-voices 12`: the fraction of
-/// "on" runs that last a single 33 ms frame -- a band that fires and dies
-/// inside one frame, which is a chirp rather than a note -- falls from 16.8%
-/// to 8.1%, and the per-frame set turnover from 4.97 bands to 3.93. The cost
-/// is 0.06 dB of captured frame power (0.4986 -> 0.4922), because the band it
-/// declines to swap in was, by construction, within 3.5 dB of the one it kept.
-/// Higher values keep buying stability at an accelerating price: 2.0 gives
-/// 7.2% / 3.48 for 0.13 dB, 3.0 gives 7.4% / 3.08 for 0.23 dB -- 3.0 is already
-/// past the point where the chatter stops falling.
+/// How much louder a band that is already sounding is treated as being when
+/// it competes for an [`AudioOptions::max_voices`] slot -- a pure rank bias
+/// (3.5 dB, never applied to the written volume) that a challenger must beat
+/// before taking an incumbent's slot. Cuts one-frame chirp runs roughly in
+/// half on a real track; values above this keep buying stability at a fast
+/// diminishing return in captured frame power.
 const VOICE_HYSTERESIS: f32 = 1.5;
 
-/// Half-width, in bands ON THE FREQUENCY AXIS, of the neighbourhood a band's
-/// [`prominence`] is measured against. The window is `2 * this + 1` bands wide
-/// and excludes the band itself.
-///
-/// Measured, not guessed. It has to straddle two lengths:
-///
-/// * **Wider than one tone's own footprint**, or a note's leakage skirt becomes
-///   its own neighbourhood and every prominence collapses toward 1. A pure sine
-///   through the real pipeline (96 bands, window 16384) lights **1 band** above
-///   10% of its apex at 208 Hz and above, and **3 bands** at the very bottom of
-///   the bank, where a band is narrower than the FFT's own bin spacing.
-/// * **Narrower than the gap between separate notes**, or one chord tone is
-///   measured against another and both look flat. At 96 bands over the emitter's
-///   0.1..10 pitch range a band is 0.845 semitones, so the closest interval that
-///   is still a chord -- a minor third, 3 semitones -- is 3.6 bands away.
-///
-/// 3 is the tightest half-width that clears the 3-band worst-case footprint,
-/// and it stays inside the 3.6-band note spacing. Measured mean prominence of
-/// selected bands falls monotonically with width (1.84/1.61/1.50/1.47/1.41/1.39
-/// at half-widths 1/2/3/4/6/8 in the low third), which is the skirt-dilution
-/// effect above; the number itself carries no information about the right width,
-/// only the two lengths do.
+/// Half-width, in bands on the frequency axis, of the neighbourhood a band's
+/// [`prominence`] is measured against (window `2 * this + 1`, excluding the
+/// band itself). Has to straddle two lengths: wide enough that a note's own
+/// leakage skirt (up to 3 bands, measured) is not its own neighbourhood, and
+/// narrow enough that an adjacent chord tone (3.6 bands away at minimum, a
+/// minor third) is not measured against it. 3 is the tightest width clearing
+/// the first without violating the second.
 const PROMINENCE_WIDTH: usize = 3;
 
-/// The [`prominence`] a local maximum needs before it counts as a note at all.
+/// The [`prominence`] a local maximum needs to count as a note at all (1.5 =
+/// 3.5 dB over its neighbourhood).
 ///
-/// **This constant, not the ranking, is what sparsifies a real track.** The
-/// local-maximum test leaves 29.02 candidates in an average frame of a pop
-/// master at 96 bands, so at `--max-voices 32` or `48` the top-N truncation
-/// never fires and the rank key -- whatever it is -- selects nothing. Every
-/// scheme measured (magnitude, pure prominence, three prominence/magnitude
-/// blends) produced byte-identical output at `--max-voices 32` for exactly that
-/// reason. A render at 32 voices was therefore "every local maximum", i.e. 29
-/// sine oscillators sounding at once, which is the wall this module exists to
-/// prevent.
-///
-/// 1.5 is a band standing 3.5 dB above the mean of its neighbourhood. Measured
-/// on the same track:
-///
-/// | gate | candidates/frame | frame power | mean prominence | HF voices/frame | silent frames |
-/// |------|------------------|-------------|-----------------|-----------------|---------------|
-/// | none | 29.02            | 54.1%       | 1.82            | 8.18            | 0             |
-/// | 1.3  | 16.36            | 45.2%       | 2.12            | 5.22            | 0             |
-/// | 1.5  | 12.20            | 38.6%       | 2.37            | 3.67            | 0             |
-/// | 2.0  |  6.30            | 28.7%       | 2.98            | 1.66            | 0.607%        |
-///
-/// At 1.5 the pool drops 58% while frame power drops 29%, so what leaves is
-/// worth less per voice than what stays (2.27% -> 3.16% of frame power each).
-/// "HF voices" is the count above 979 Hz, which is the reported "random high
-/// pitched sounds": broadband cymbal and sibilance content has local maxima
-/// like anything else, and rendering 8 of them per frame as pure sines is what
-/// they sound like. 1.5 more than halves that.
-///
-/// 2.0 is the next step and is rejected: it starts leaving frames that have
-/// real energy with NO voice at all (0.607% of sounding frames), which is
-/// audible as chopping.
-///
-/// # It is a flag, and it has to be
-///
-/// This constant is now only the DEFAULT of [`AudioOptions::peak_gate`]. It was
-/// a fixed constant for one release and that was a mistake: **the gate, not
-/// `--max-voices`, is what limits a dense frame**, so above the number of
-/// candidates it leaves, raising `--max-voices` does nothing at all. Measured
-/// on a solo piano master at `--window 16384`, renders at `--max-voices` 24,
-/// 32, 48 and 64 came back 311925 / 311919 / 311917 / 311913 bytes -- twelve
-/// bytes apart across a 40-voice range, i.e. the same render four times. A
-/// listener asking for more voices got none, with nothing anywhere to say so.
-///
-/// Lowering the gate is what unlocks the range; `--peak-gate 1.0` disables it
-/// entirely (every local maximum is a candidate) and restores the pre-gate
-/// "wall of sound" behaviour on demand.
+/// This gate, not `--max-voices`, is what limits a dense frame -- above the
+/// number of candidates it leaves (roughly a dozen on a real track), raising
+/// `--max-voices` does nothing. `--peak-gate 1.0` disables it entirely (every
+/// local maximum is a candidate), restoring the pre-gate wall-of-sound
+/// behaviour on demand. This constant is only the default of
+/// [`AudioOptions::peak_gate`]; it was a fixed constant for one release and
+/// that silently capped every render regardless of `--max-voices`.
 pub const DEFAULT_PEAK_GATE: f32 = 1.5;
 
-/// The exponent on a candidate's OWN magnitude in the rank key
-/// `prominence * magnitude^this`.
+/// The exponent on a candidate's own magnitude in the rank key
+/// `prominence * magnitude^this`. A pure prominence rank (exponent 0) has no
+/// level term, so nothing stops it promoting a quiet-but-pointy ripple over a
+/// loud note; a pure magnitude rank (1) loses most of the prominence gain.
+/// 0.5 is the smallest exponent measured to zero out quiet-band promotion
+/// while keeping most of the prominence benefit, and it also beats plain
+/// magnitude on run-to-run selection stability.
 ///
-/// A pure prominence rank (exponent 0) has no level term at all, so nothing
-/// stops it promoting a quiet-but-pointy ripple over a loud note. Measured at
-/// `--max-voices 8`, where the truncation actually binds:
-///
-/// | rank key           | frame power | mean prominence | selected >40 dB down |
-/// |--------------------|-------------|-----------------|----------------------|
-/// | magnitude (before) | 40.0%       | 2.36            | 0.00%                |
-/// | prominence         | 32.4%       | 2.63            | 0.26%                |
-/// | prom * mag^0.25    | 35.3%       | 2.62            | 0.02%                |
-/// | prom * mag^0.5     | 37.1%       | 2.60            | 0.00%                |
-/// | prom * mag^1       | 39.0%       | 2.55            | 0.00%                |
-///
-/// 0.5 keeps 89% of the prominence gain a pure rank buys (2.36 -> 2.60 of
-/// 2.36 -> 2.63) for 38% of its cost in frame power (7.6 points -> 2.9), and it
-/// is the smallest exponent that puts the quiet-band promotion back to zero.
-/// It also beats plain magnitude on run stability (82.4% vs 81.1% of selected
-/// bands persisting to the next frame).
-const RANK_MAGNITUDE_EXP: f32 = 0.5;
+/// `pub(crate)`: [`crate::audio::voices`] ranks its own candidate peaks by
+/// the same key, over a different neighbourhood, and reuses this constant
+/// rather than a second literal.
+pub(crate) const RANK_MAGNITUDE_EXP: f32 = 0.5;
 
 /// Ceiling on a reported [`prominence`], so that a peak standing in perfect
-/// silence -- neighbourhood mean exactly 0, which is a real case on synthetic
-/// signals and on digital fades -- stays a finite, ORDERABLE number. Two such
-/// peaks must still be ranked against each other by their magnitudes rather
-/// than tying at infinity.
+/// silence -- neighbourhood mean exactly 0, a real case on synthetic signals
+/// and digital fades -- stays a finite, orderable number rather than tying
+/// at infinity against another such peak.
 const MAX_PROMINENCE: f32 = 1e6;
 
-/// How sharply the band at frequency-axis position `i` stands above its local
-/// neighbourhood: its magnitude divided by the MEAN of the
-/// [`PROMINENCE_WIDTH`] bands either side of it, itself excluded.
+/// How sharply the band at frequency-axis position `i` stands above its
+/// local neighbourhood: its magnitude divided by the mean of the
+/// [`PROMINENCE_WIDTH`] bands either side of it, itself excluded. Separates a
+/// narrow, high-contrast note from a broad, flat lump (bass rumble, reverb
+/// tails, cymbal/sibilance hiss), which magnitude alone cannot.
 ///
-/// This is the measure that separates a note from a lump. A real musical
-/// partial is a narrow, high-contrast spike; bass rumble, reverb tails and the
-/// broadband hiss of cymbals and sibilance are broad and flat, and they carry
-/// local maxima that are indistinguishable from notes by magnitude alone.
-///
-/// Indexing is by AXIS POSITION, not by storage index: with noise bands present
-/// the two differ, and a neighbourhood taken in storage order would compare a
+/// Indexed by axis position, not storage index: with noise bands present the
+/// two differ, and a neighbourhood taken in storage order would compare a
 /// 40 Hz band against a cymbal wash. See [`frequency_axis`].
 fn prominence(frame: &[f32], axis: &[usize], i: usize) -> f32 {
     let lo = i.saturating_sub(PROMINENCE_WIDTH);
@@ -519,18 +389,14 @@ fn prominence(frame: &[f32], axis: &[usize], i: usize) -> f32 {
     ((frame[axis[i]] as f64 / mean) as f32).min(MAX_PROMINENCE)
 }
 
-/// Band indices in FREQUENCY order, which is not storage order.
+/// Band indices in frequency order, which is not storage order.
 ///
-/// `BandPlan` stores the tonal bands in pitch order and then appends white and
-/// pink. But those two are not off to one side of the spectrum -- `fold` sends
-/// everything ABOVE the top tonal band's edge to white and everything BELOW
-/// the bottom one's to pink, so in frequency they are the two ends of the same
-/// axis: `pink < tonal[0] .. tonal[n-1] < white`.
-///
-/// Ordering them that way is what lets [`select_peaks`] treat all bands
-/// alike. It also all but retires the endpoint question: with the default two
-/// noise bands the tonal ends have neighbours on both sides, and only pink and
-/// white are true endpoints.
+/// `BandPlan` stores the tonal bands in pitch order and then appends white
+/// and pink, but `fold` sends everything above the top tonal band's edge to
+/// white and everything below the bottom one's to pink, so in frequency they
+/// are the two ends of the same axis: `pink < tonal[0] .. tonal[n-1] < white`.
+/// This ordering is what lets [`select_peaks`] treat all bands alike; with
+/// the default two noise bands, only pink and white are true axis endpoints.
 fn frequency_axis(plan: &BandPlan) -> Vec<usize> {
     let mut axis = Vec::with_capacity(plan.len());
     axis.extend(plan.kinds.iter().position(|k| *k == BandKind::PinkNoise));
@@ -550,98 +416,14 @@ fn frequency_axis(plan: &BandPlan) -> Vec<usize> {
 /// other band. `sounding` carries the previous frame's selection in and the
 /// new one out, and must be `frame.len()` long.
 ///
-/// # Why a filterbank has to be sparsified at all
-///
-/// A band bank gives every band whatever energy falls in its slot, so noise
-/// floor, reverb tails, cymbal wash and the skirts of every real note all get
-/// a speaker. Measured on a pop master at 96 bands, **94.40 of 96 bands were
-/// non-zero in an average frame**. Ninety-four sine oscillators 0.85 semitones
-/// apart sounding at once is not a chord, it is broadband noise, and the
-/// previous fix -- which corrected a real 24 dB loudness deficit -- only made
-/// that noise louder. Music is sparse; the render has to be too.
-///
-/// # Step 1: local maxima, not just "the loud ones"
-///
-/// A band qualifies only if it is strictly greater than both its neighbours
-/// **on the frequency axis** ([`frequency_axis`]). Without this, one strong
-/// note lights its own band and the two either side of it and burns three
-/// voice slots on one note. The test is cheap and does real work: it cuts the
-/// average frame from 94.40 candidates to **29.28**.
-///
-/// It is not, however, enough on its own -- 29 simultaneous oscillators is
-/// still a wall. Top-N below is what actually sparsifies; the local-maximum
-/// test is what makes the N slots land on N DIFFERENT notes. The two together
-/// capture less raw energy than top-N alone at the same N (49.9% vs 57.9% of
-/// frame power at N=12) and that gap is precisely the skirt energy belonging
-/// to notes already selected -- paying for it twice is what the test prevents.
-///
-/// ## Endpoints
-///
-/// A band at either end of the axis has one neighbour, and qualifies if it
-/// beats that one. It is NOT silently dropped: an axis endpoint is the single
-/// loudest peak in the frame 5.5% of the time (a bass drop, a cymbal wash),
-/// and excluding endpoints costs 5.7% of the captured power at N=12 (0.4986 ->
-/// 0.4699) while barely sparsifying anything (29.28 candidates -> 27.64). It
-/// buys nothing and silences the ends of the spectrum.
-///
-/// # Step 2: the prominence gate -- which candidates are NOTES
-///
-/// A local maximum is not yet a note. Broadband content -- cymbal wash,
-/// sibilance, room tone, bass rumble -- has local maxima everywhere, and by
-/// magnitude alone they are indistinguishable from a real partial. What
-/// separates them is CONTRAST: see [`prominence`], and [`MIN_PROMINENCE`] for
-/// the measurements that set the threshold.
-///
-/// **This step, not the ranking, is what sparsifies a real track**, and it is
-/// the step whose absence made every voice count from 24 to 48 sound alike. The
-/// local-maximum test leaves 29.02 candidates in an average frame, so a top-N
-/// truncation at N=32 or N=48 never fires at all.
-///
-/// # Step 3: the top N by prominence * magnitude^k
-///
-/// Ranking is by [`prominence`] scaled by the band's own magnitude to the
-/// [`RANK_MAGNITUDE_EXP`] power -- the measurements that chose that blend over
-/// both a pure magnitude rank and a pure prominence rank are on the constant.
-///
-/// **Prominence decides WHICH bands sound; it never decides how loud they
-/// are.** The volume written is always the band's own magnitude, untouched, so
-/// the track's dynamics survive selection intact.
-///
-/// Captured share of each frame's power, averaged over a 3m57s pop master at
-/// 96 bands, under the ORIGINAL magnitude-ranked, ungated scheme:
-///
-/// | N  | share | vs. N=6 |
-/// |----|-------|---------|
-/// | 6  | 38.6% | --       |
-/// | 8  | 43.3% | +0.50 dB|
-/// | 12 | 49.9% | +1.11 dB|
-/// | 16 | 54.0% | +1.45 dB|
-/// | 24 | 58.4% | +1.79 dB|
-/// | all local maxima | 59.6% | +1.88 dB |
-///
-/// The knee is at 12, which is the default. Note what the last row means now
-/// that it has been measured properly: "all local maxima" is only 29 bands, so
-/// **`--max-voices` above about 29 is inert** -- the gate, not N, is what limits
-/// a dense frame there.
-///
-/// # The noise bands compete; they are not exempt
-///
-/// White and pink are ranked by exactly the same rule as every tonal band. The
-/// alternative -- letting them always through -- was measured and rejected: they
-/// are non-zero in 99.4% of frames, so exempting them adds **1.99 permanent
-/// voices**, a noise bed under the entire render, which is half of the
-/// complaint this function exists to answer. Under competition at N=12 white
-/// sounds in 69.0% of frames and pink in 18.6%: still often, but earned, and
-/// each time at the cost of a tonal slot rather than on top of one. Excluding
-/// them instead would silence cymbals, sibilance and sub-bass outright, since
-/// no sine band covers that content.
-///
-/// # Pitch is never touched
-///
-/// Selection only decides which bands have a non-zero volume. Band pitches are
-/// baked at build time and never written, so a band fading in and out carries
-/// no retrigger risk -- `VolumeMultiplier` was verified in game to ramp a
-/// running voice rather than restart it.
+/// A candidate is a local maximum on the frequency axis ([`frequency_axis`])
+/// that clears [`prominence`]'s gate; rank is
+/// `prominence * magnitude^RANK_MAGNITUDE_EXP` with a [`VOICE_HYSTERESIS`]
+/// bias for incumbents. Noise bands compete equally rather than being
+/// exempt. `max_voices == 0` disables selection. The volume written is
+/// always the band's own magnitude, never the rank key, so dynamics survive
+/// selection intact; pitches are never touched here, only which bands have
+/// non-zero volume.
 fn select_peaks(
     frame: &mut [f32],
     axis: &[usize],
@@ -676,27 +458,20 @@ fn select_peaks(
         if !(over_lower && over_upper) {
             continue;
         }
-        // A local maximum on a broad, flat lump is not a note. See
-        // `DEFAULT_PEAK_GATE`: this gate is what limits a dense frame once
-        // `max_voices` is above the ~29 local maxima a real track offers, and
-        // it is `--peak-gate` precisely because of that.
+        // A local maximum on a broad, flat lump is not a note; see `DEFAULT_PEAK_GATE`.
         let p = prominence(frame, axis, i);
         if p >= peak_gate {
             peaks.push((b, p));
         }
     }
 
-    // Rank by prominence scaled by the band's own magnitude, then keep the top
-    // `max_voices`.
-    //
-    // The incumbent bonus is applied INSIDE the magnitude factor, not to the
-    // finished key. `VOICE_HYSTERESIS` is a measured amplitude ratio (1.5x,
-    // 3.5 dB) and multiplying a key that already carries `magnitude^0.5` by it
-    // would silently demand 1.5^(1/0.5) = 2.25x, i.e. 7 dB, of a challenger --
-    // doubling the constant's documented meaning without changing its value.
-    //
-    // Either way it biases RANK ONLY: no volume is ever scaled by it, and the
-    // value written for a band is always its own magnitude.
+    // Rank by prominence scaled by the band's own magnitude, then keep the
+    // top `max_voices`. The incumbent bonus is applied inside the magnitude
+    // factor, not to the finished key -- multiplying a key that already
+    // carries `magnitude^0.5` by VOICE_HYSTERESIS would silently demand
+    // 1.5^(1/0.5) = 2.25x of a challenger instead of the documented 1.5x.
+    // Biases rank only; the value written for a band is always its own
+    // magnitude.
     let key = |b: usize, p: f32| {
         let mag = if sounding[b] { frame[b] * VOICE_HYSTERESIS } else { frame[b] };
         p * mag.powf(RANK_MAGNITUDE_EXP)
@@ -718,32 +493,19 @@ fn select_peaks(
 
 /// Reject a `--subdiv` that does not put every band on a real semitone.
 ///
-/// ONLY multiples of 12 do, and the failure of anything else is musical
-/// rather than obvious -- so it is an error, not a warning.
-///
-/// A subdivision of `s` spaces bands `12/s` semitones apart, so a band lands
-/// on a semitone only when `12/s` divides 1, i.e. when `s` is a multiple of
-/// 12. Listened to in game on solo piano, one binary, only this flag
-/// varying: 12 "was good"; 14 (0.857 semitones/step, no step on any note,
-/// worst error 43 cents) "sharp/out of tune"; 18 (0.667, only the even
-/// semitones) "also out of tune, flat??"; 24 (0.5, every note hit by every
-/// second band) "okay, sounded a little weird". The sign of the error even
-/// follows from the step size, which is why the two wrong ones were heard as
-/// wrong in opposite directions.
-///
-/// This is also, retroactively, the original "sounds off key": the geometric
-/// grid this bank replaced spaced bands 0.848 semitones apart, i.e. an
-/// effective subdivision of 14.15 -- the same defect as `--subdiv 14`.
-///
-/// Its own function, rather than four lines inside [`analyze`], because the
-/// GUI has to refuse the same value in its own widget and its cost readout
-/// has to refuse it before it can count anything -- and a second copy of a
-/// rule this expensive to learn is how a front end ends up accepting what the
-/// renderer rejects.
+/// Only multiples of 12 do (subdiv `s` spaces bands `12/s` semitones apart,
+/// which lands on a semitone only when `s` is a multiple of 12); the failure
+/// is musical rather than obvious, so it is an error, not a warning. Its own
+/// function rather than inline in [`analyze`] because the GUI and the cost
+/// readout must refuse the same value.
 pub fn check_subdiv(subdiv: u32) -> Result<(), String> {
     if subdiv == 0 || subdiv % 12 != 0 {
         return Err(format!(
-            "--subdiv must be a multiple of 12, got {}: only then does every band land on a              real semitone. {} bands per octave spaces them {:.3} semitones apart, so the              whole render is pulled off pitch (and audibly so -- 14 was heard as sharp, 18              as flat). Use 12 (one per semitone, preferred), 24 (quarter-tones, for a source              not tuned to A440) or 36",
+            "--subdiv must be a multiple of 12, got {}: only then does every band land on a \
+             real semitone. {} bands per octave spaces them {:.3} semitones apart, so the \
+             whole render is pulled off pitch (and audibly so -- 14 was heard as sharp, 18 \
+             as flat). Use 12 (one per semitone, preferred), 24 (quarter-tones, for a source \
+             not tuned to A440) or 36",
             subdiv,
             subdiv,
             12.0 / subdiv.max(1) as f32,
@@ -755,7 +517,7 @@ pub fn check_subdiv(subdiv: u32) -> Result<(), String> {
 /// The [`BandPlan`] a set of options asks for: the one [`analyze`] builds, and
 /// therefore the one anything estimating a bank-mode render must count.
 ///
-/// `--bands` selects the SPAN of the equal-tempered grid; absent, the span is
+/// `--bands` selects the span of the equal-tempered grid; absent, the span is
 /// everything the emitter's pitch range holds at `--subdiv`. See
 /// [`AudioOptions::bands`].
 pub fn band_plan(opts: &AudioOptions) -> Result<BandPlan, String> {
@@ -766,111 +528,72 @@ pub fn band_plan(opts: &AudioOptions) -> Result<BandPlan, String> {
     }
 }
 
-/// Decode, transform, fold, **select the sounding bands**, and normalise in
-/// one streaming pass.
+/// Per-frame normalisation scale: the loudest frame of `agc_mix` reaches
+/// exactly `gain`, and `leveling` (0 = off, 1 = full per-frame AGC) pulls
+/// every other frame toward it, capped at [`MAX_LEVELING_BOOST`]. Shared by
+/// both render paths -- [`analyze`] and
+/// [`crate::audio::voices::analyze_voices`] -- so a fix to this arithmetic
+/// cannot land in one and not the other.
 ///
-/// # Selection comes first
+/// Bank mode ([`analyze`]) measures its AGC reference and the quantity that
+/// must never exceed `gain` on the very same array, so it calls this with
+/// `ceiling: None`: the algebra alone guarantees `agc_mix[f] * scale[f] <=
+/// gain` for every frame (see
+/// `tests::the_incoherent_mix_never_exceeds_full_scale`), and no extra clamp
+/// is needed -- or applied; passing `ceiling: None` skips that branch
+/// entirely rather than computing a clamp proven to never bind.
 ///
-/// [`select_peaks`] runs on each folded frame before anything measures it.
-/// That ordering is deliberate: the normaliser's track peak, each frame's own
-/// peak, and the `floor_db` comparison must all be taken over the bands that
-/// will actually sound. A band that lost the top-N competition contributing to
-/// the scale, or to the floor the winners are measured against, would let
-/// discarded energy quietly change the level of what is kept.
+/// Voice mode ([`crate::audio::voices::analyze_voices`]) cannot make that
+/// guarantee: its AGC reference (`level_mix`, the level follower with no
+/// release ramp) and its actual written output (`out_mix`, the level through
+/// the ramp) are different arrays, so the boost `level_mix` earns can ask for
+/// more than `out_mix` has headroom for -- measured at 2.413x full scale
+/// before this was clamped. It calls this with `ceiling: Some((out_mix,
+/// mix_peak))`, which caps `scale[f]` at `gain / out_mix[f]` on top of the
+/// `agc_mix`-referenced boost.
+pub(crate) fn leveling_scale(
+    agc_mix: &[f64],
+    agc_peak: f64,
+    gain: f32,
+    leveling: f32,
+    ceiling: Option<(&[f64], f64)>,
+) -> Vec<f32> {
+    let ceiling_peak = ceiling.map_or(agc_peak, |(_, peak)| peak);
+    let base = if ceiling_peak > 0.0 { gain / ceiling_peak as f32 } else { 0.0 };
+    (0..agc_mix.len())
+        .map(|f| {
+            let levelled = if leveling <= 0.0 || agc_mix[f] <= 0.0 {
+                base
+            } else {
+                base * ((agc_peak / agc_mix[f]) as f32).powf(leveling).min(MAX_LEVELING_BOOST)
+            };
+            match ceiling {
+                Some((mix, _)) if mix[f] > 0.0 => levelled.min(gain / mix[f] as f32),
+                _ => levelled,
+            }
+        })
+        .collect()
+}
+
+/// Decode, transform, fold, select the sounding bands, and normalise in one
+/// streaming pass.
 ///
-/// # Normalisation: the loudest per-frame INCOHERENT SUM
-///
-/// One global scale puts the largest per-frame `sqrt(sum of squares)` across
-/// the bank at exactly `gain` (then clamped to 1.0). With `--leveling 0` that
-/// is the ONLY scale applied, so every level relationship in the source
-/// survives verbatim into the volumes. The shipped default is full leveling,
-/// which adds a per-frame scale on top -- referenced to the same incoherent
-/// mix, so it moves frames toward that ceiling and never through it. See
-/// "# Leveling" below.
-///
-/// `sqrt(sum of squares)` is the physically correct peak for a bank of
-/// UNCORRELATED sinusoids, which is what the emitters are: N bands at
-/// unrelated frequencies neither add coherently (the plain sum) nor stay at
-/// the height of the tallest (the single-band max). It sits between the two
-/// and it is the number the game's mixer actually sees.
-///
-/// Both alternatives were shipped and both were wrong, in opposite directions:
-///
-/// * **The per-frame SUM of amplitudes.** Chosen to guarantee the bank could
-///   never add past full scale. It costs a factor of `sum-peak /
-///   max-band-peak` -- measured at 8.9x (32 bands) and 16.2x (96 bands) -- which
-///   put the loudest instant of a whole track at 0.112 (-19 dB) and 0.062
-///   (-24 dB). Inaudible in game, and reported as beeping rather than music.
-/// * **The loudest single band.** The correction for the above, and an
-///   overshoot: with the loudest band pinned to 1.0 the incoherent mix reaches
-///   **1.575x** full scale at the loudest frame (measured, 96 bands,
-///   `--max-voices 32`, `--window 16384`). That is the distortion reported at
-///   `--gain 1.0`, and it is why `--gain 0.5` was needed to clean it up -- which
-///   then gave away 6 dB everywhere else, so the same render was both distorted
-///   and too quiet.
-///
-/// Targeting the incoherent sum lands the peak mix at exactly 1.000 and makes
-/// `--gain 1.0` both clean and as loud as the medium allows. An individual
-/// band is then no longer pinned to full scale -- six equal tones sit at
-/// `1/sqrt(6)` each -- which is correct: they are six voices sharing one output.
-///
-/// **And the leveling boost is referenced to the same quantity**, which is the
-/// only reason the bound above survives the shipped default. It did not
-/// originally: the boost divided by the frame's loudest single BAND while the
-/// scale targeted the frame MIX, so a frame with six bands sounding was handed
-/// the boost a one-band frame had earned and the mix came out
-/// `sqrt(N_this_frame / N_reference_frame)` too high -- **measured 2.447x full
-/// scale at `--leveling 1.0`, the default**, against the 1.575x above that a
-/// listener had already reported as distortion. Pinned by
-/// `tests::no_frame_exceeds_full_scale_at_the_shipped_leveling_default`.
-///
-/// The sum is taken over the SELECTED, PRE-FLOOR magnitudes. Pre-floor so that
-/// `floor_db` cannot move the scale around under the render (the property
-/// [`the_floor_zeroes_exactly_what_is_below_it_in_amplitude_db`] pins); the
-/// bands it removes are 60 dB down and contribute under 0.001% of the power, so
-/// nothing measurable is bought by the alternative.
-///
-/// [`the_floor_zeroes_exactly_what_is_below_it_in_amplitude_db`]: self
-///
-/// # The floor is relative to the frame
-///
-/// `floor_db` zeroes bands more than that many dB below the loudest band **in
-/// the same frame**, not below the track peak. An absolute floor is measured
-/// against a scale that one loud transient sets for the whole track, so it
-/// eats a fixed absolute amount out of every frame and takes proportionally
-/// more of a quiet one -- in the limit it silences a quiet passage outright.
-/// A frame-relative floor removes only what is masked by something louder the
-/// listener is hearing at the same moment, so a quiet passage keeps exactly as
-/// much detail as a loud one. Measured on the same track, the switch drops the
-/// fraction of exactly-zero values from 1.86% to 0.62% (32 bands) and 3.29% to
-/// 1.67% (96 bands), all of it recovered from the quiet frames.
-///
-/// Digital silence still reads exactly zero: a frame whose peak is 0 has a
-/// floor of 0, and every band in it is already 0.
-///
-/// # Leveling
-///
-/// `leveling` interpolates toward per-frame automatic gain control: the frame's
-/// scale is multiplied by `(loudest frame mix / this frame's mix) ^ leveling`,
-/// capped at [`MAX_LEVELING_BOOST`]. At 0.0 nothing happens and the track keeps
-/// its dynamics; at 1.0 -- **the shipped default**, chosen by ear over 0.5 and
-/// over off on every source tried -- every frame is dragged to full scale and
-/// the music is flattened into a wall. It is a knob rather than a boolean so
-/// the useful middle (0.3 or so lifts the quietest 10% of frames from 0.19 to
-/// 0.32 while clamping nothing) is reachable.
-///
-/// The ratio is taken between MIXES, not between the frames' loudest bands, and
-/// that is what keeps full leveling inside full scale: `(mix_peak / mix) ^ l <=
-/// mix_peak / mix` for every `l` in 0..=1, so `mix * scale <= gain` falls out
-/// algebraically at every setting of the knob. It costs nothing musically -- a
-/// frame is still lifted all the way to the ceiling at 1.0, which is what full
-/// AGC means -- and it is a correction to the reference, not an attenuation.
+/// Global scale puts the loudest per-frame incoherent sum `sqrt(sum of
+/// squares)` at `gain` -- the correct peak for uncorrelated sines, which is
+/// what the emitters are. `floor_db` is frame-relative (measured against the
+/// same frame's loudest band, not the track peak); leveling is a per-frame
+/// AGC multiplier on top, referenced to the same mix so it never pushes a
+/// frame past `gain`. Selection ([`select_peaks`]) runs before either is
+/// measured, so a band that lost the voice competition cannot change the
+/// scale or the floor for the bands that beat it. See
+/// `tests::no_frame_exceeds_full_scale_at_the_shipped_leveling_default` for
+/// the regression this bound guards.
 pub fn analyze(
     source: &dyn AudioSource,
     opts: &AudioOptions,
     progress: &mut dyn Progress,
 ) -> Result<VoiceTrack, String> {
-    // `!is_finite()` first: NaN fails EVERY comparison, so a bare
+    // `!is_finite()` first: NaN fails every comparison, so a bare
     // `opts.fps <= 0.0` lets `--audio-fps nan` straight through.
     if !opts.fps.is_finite() || opts.fps <= 0.0 {
         return Err(format!("--audio-fps must be a positive finite number, got {}", opts.fps));
@@ -879,8 +602,8 @@ pub fn analyze(
         return Err("--max-frames must be at least 1".to_string());
     }
     // Same NaN-first reasoning as `fps`, and it matters more here: `f32::min`
-    // IGNORES a NaN operand, so a NaN scale would sail through the 1.0 clamp
-    // as 1.0 and write EVERY speaker at full volume for the whole track.
+    // ignores a NaN operand, so a NaN scale would sail through the 1.0 clamp
+    // as 1.0 and write every speaker at full volume for the whole track.
     if !opts.gain.is_finite() || opts.gain < 0.0 {
         return Err(format!("--gain must be a non-negative finite number, got {}", opts.gain));
     }
@@ -905,11 +628,8 @@ pub fn analyze(
             ));
         }
     }
-    // A prominence is a magnitude divided by a mean magnitude, so it is never
-    // below 0 and a gate below 1.0 admits every local maximum exactly as 1.0
-    // does -- but silently, which invites "--peak-gate 0.5 must be half as
-    // strict as 1.0" when it is the same thing. NaN first, as everywhere else
-    // here: it fails every comparison.
+    // A gate below 1.0 admits every local maximum exactly as 1.0 does, but
+    // silently -- reject it by name rather than let it pass as a stricter setting.
     if !opts.peak_gate.is_finite() || opts.peak_gate < 1.0 {
         return Err(format!(
             "--peak-gate must be at least 1.0 (a peak's magnitude as a multiple of its \
@@ -923,26 +643,17 @@ pub fn analyze(
     let hop = hop_for(info.sample_rate, opts.fps)?;
 
     // `frame_count_for` takes window and hop, not fps, so the hint matches
-    // what `StftStream` actually emits -- this is the progress denominator.
-    //
-    // `Exact` rather than `Estimated` because `frame_count_for` is the very
-    // recurrence `StftStream` steps: given a correct duration it IS the
-    // emitted count, so the only slack is whatever the container's own
-    // duration carries. What this DOES change is the `None` arm -- a source
-    // that cannot report a duration used to get a bare, totalless spinner that
-    // was indistinguishable from a hung one, and now says so. (And a duration
-    // that turns out short cannot overflow the bar either -- see
-    // `FrameTotal::position`.)
+    // what `StftStream` actually emits -- it is the exact recurrence the
+    // stream steps, not an estimate. A source with no duration hint (`None`)
+    // gets a totalless spinner rather than a wrong number; see `FrameTotal::position`.
     let hint = info
         .duration_hint
         .map(|d| frame_count_for(d, info.sample_rate, opts.window, hop).min(opts.max_frames));
     FrameTotal::new(hint, None).begin(progress, "analyzing audio");
 
     let mut raw: Vec<Vec<f32>> = vec![Vec::new(); plan.len()];
-    // Selection is per frame and reads across bands, so it happens HERE, on
-    // the frame-major `folded` vector, before it is scattered into the
-    // band-major store. Doing it afterwards would mean gathering a column out
-    // of `plan.len()` separate Vecs for every one of millions of frames.
+    // Selection reads across bands, so it runs here on the frame-major
+    // `folded` vector, before it is scattered into the band-major store.
     let axis = frequency_axis(&plan);
     let mut sounding = vec![false; plan.len()];
     let collected: Result<usize, String> = (|| {
@@ -951,9 +662,7 @@ pub fn analyze(
         while n < opts.max_frames {
             let Some(spectrum) = stft.next_spectrum()? else { break };
             let mut folded = plan.fold(&spectrum, info.sample_rate, opts.window);
-            // Before the peaks are found, so the normaliser sees only what
-            // will actually sound: an unselected band must not set the scale
-            // or the floor for the bands that beat it.
+            // Before anything measures the frame; see the doc above.
             select_peaks(
                 &mut folded,
                 &axis,
@@ -983,26 +692,19 @@ pub fn analyze(
         );
     }
 
-    // The envelope, per band, over the whole track -- BEFORE anything measures
-    // the result. It changes every level that will be written, so the
-    // normaliser's track peak, each frame's own peak and the floor comparison
-    // must all see the smoothed values or the render is normalised against
-    // levels nothing plays. Band-major storage makes this a walk down each row.
+    // The envelope, per band, over the whole track -- before anything
+    // measures the result, so normalisation sees the smoothed values rather
+    // than levels nothing plays.
     let envelope = Envelope::new(opts.attack_ms, opts.release_ms, opts.fps);
     for band in raw.iter_mut() {
         envelope.apply(band);
     }
 
     // Three statistics in one pass over the band-major store, so no
-    // frame-major copy is ever materialised:
-    //
-    // * `frame_peak[f]` -- the loudest band within each frame. What the floor
-    //   is measured against.
-    // * `frame_mix[f]` -- that frame's `sqrt(sum of squares)`, i.e. what the
-    //   whole bank sums to at that instant. What leveling divides by.
-    // * `mix_peak` -- the largest `frame_mix`. THE NORMALISER: see this
-    //   function's doc for why it is the incoherent sum and not the loudest
-    //   single band or the plain sum.
+    // frame-major copy is ever materialised: `frame_peak[f]` (what the floor
+    // is measured against), `frame_mix[f]` (that frame's incoherent sum, what
+    // leveling divides by), and `mix_peak` (the largest `frame_mix` -- the
+    // normaliser; see the function doc).
     let mut mix_peak = 0.0f64;
     let mut frame_peak = vec![0.0f32; frame_count];
     let mut frame_mix = vec![0.0f64; frame_count];
@@ -1026,18 +728,10 @@ pub fn analyze(
     }
 
     let floor_ratio = 10f32.powf(opts.floor_db / 20.0);
-    // The loudest incoherent mix in the track lands on exactly `gain`.
-    let base = if mix_peak > 0.0 { opts.gain / mix_peak as f32 } else { 0.0 };
-    let scale: Vec<f32> = frame_mix
-        .iter()
-        .map(|&mix| {
-            if opts.leveling <= 0.0 || mix <= 0.0 {
-                base
-            } else {
-                base * ((mix_peak / mix) as f32).powf(opts.leveling).min(MAX_LEVELING_BOOST)
-            }
-        })
-        .collect();
+    // The loudest incoherent mix in the track lands on exactly `gain`. Shared
+    // with voice mode; see `leveling_scale`'s doc for why bank mode passes
+    // `ceiling: None`.
+    let scale = leveling_scale(&frame_mix, mix_peak, opts.gain, opts.leveling, None);
 
     let volumes: Vec<Vec<f64>> = raw
         .into_iter()
@@ -1073,28 +767,13 @@ mod tests {
 
     const SR: u32 = 48_000;
 
-    /// The baseline for every test below, and it deliberately differs from
-    /// `AudioOptions::default()` in exactly two ways.
-    ///
-    /// * **Two noise bands.** The shipping default is 0 -- every source tried
-    ///   in game sounded worse with them -- but these tests are about how the
-    ///   bank folds, ranks and normalises, and half of them are written against
-    ///   a frequency axis with both ends present. The DEFAULT has its own test;
-    ///   these have the mechanism.
-    /// * **No envelope.** `--attack`/`--release` shape how a level MOVES
-    ///   between frames, which is a separate mechanism with its own tests
-    ///   below. Leaving it on here would put a release tail into every
-    ///   measurement of selection, of the floor and of the dynamics: a 20 dB
-    ///   step down takes ~10 frames to clear at the default 150 ms, so a test
-    ///   asserting a quiet passage stays quiet would be measuring the loud
-    ///   passage's tail instead.
-    ///
-    /// **The `leveling: 0.0` here is a third difference and it is a trap.** It
-    /// is right for the mechanism tests -- an AGC on top of them would be a
-    /// second variable -- but the normalisation GUARDS used to inherit it too,
-    /// which meant the suite tested every value of the knob except the 1.0 that
-    /// ships, and a 2.447x overshoot lived under them. Anything asserting a
-    /// bound on the output must set `leveling` explicitly: see
+    /// The baseline for every test below, differing from
+    /// `AudioOptions::default()` in three ways: two noise bands (exercises
+    /// both ends of the frequency axis; the default has its own test), no
+    /// envelope (attack/release have their own tests below and would put a
+    /// release tail into every other measurement), and `leveling: 0.0`. The
+    /// last is a trap: anything asserting a bound on the output must set
+    /// `leveling` explicitly or it silently skips the 1.0 that ships -- see
     /// [`the_incoherent_mix_never_exceeds_full_scale`] and
     /// [`no_frame_exceeds_full_scale_at_the_shipped_leveling_default`].
     fn opts() -> AudioOptions {
@@ -1162,16 +841,11 @@ mod tests {
         }
     }
 
-    /// Normalisation must make the loudest moment reach full scale,
-    /// otherwise every render comes out needlessly quiet.
-    ///
-    /// A single sine cannot check this: all the energy is in one band, so the
-    /// frame sum and the frame max are the same number and every candidate
-    /// normaliser agrees. The interesting case is energy SPREAD across bands,
-    /// which is what music is, and it must be checked at more than one band
-    /// count because the old sum normaliser's error grew with the count.
-    /// See [`the_loudest_value_in_a_track_reaches_full_scale`], which is the
-    /// version with teeth; this one stays as the single-tone smoke test.
+    /// Normalisation must make the loudest moment reach full scale. A single
+    /// sine cannot fully check this since every candidate normaliser agrees
+    /// when all the energy is in one band; see
+    /// [`the_loudest_incoherent_mix_in_a_track_reaches_exactly_full_scale`]
+    /// for the version with teeth, this one is the single-tone smoke test.
     #[test]
     fn normalisation_reaches_full_scale() {
         let t = analyze(&sine(1000.0, 1.0), &opts(), &mut NoProgress).expect("analyze");
@@ -1235,11 +909,8 @@ mod tests {
         assert_eq!(t.frame_count, 10);
     }
 
-    // --- Tests added beyond the task brief. A mutation campaign proved each
-    // --- of these properties was completely unprotected, even though the
-    // --- module's own doc comments state every one of them. All the brief's
-    // --- signals are single constant-amplitude sines, which is exactly the
-    // --- one shape that cannot distinguish these mutations.
+    // Properties below need energy spread across multiple bands to test at
+    // all; single constant-amplitude sines cannot distinguish them.
 
     /// A loud second followed by a second at `quiet` times the amplitude, on
     /// a band wide enough to hold one FFT bin comfortably. Window 4096 / hop
@@ -1265,37 +936,52 @@ mod tests {
         (lo..=hi).flat_map(|f| t.volumes.iter().map(move |b| b[f])).fold(0.0f64, f64::max)
     }
 
-    /// Leveling is FULL by default, and the boost that makes that safe is
-    /// capped.
-    ///
-    /// It shipped opt-in first, on the reasoning that a track arriving with
-    /// dynamics should leave with them. Listening said otherwise on every
-    /// source tried -- piano, speech and a music box -- and the reasoning is
-    /// wrong for this medium: a bank of sine emitters has a fraction of a
-    /// master's usable range, so what a listener hears without leveling is not
-    /// the source's dynamics but a render that disappears for half its length.
-    ///
-    /// The cap is asserted alongside because it is what stops the default from
-    /// being an amplified noise floor between the notes.
+    /// Leveling is full by default, and the boost that makes that safe is
+    /// capped -- full beat 0.5 and off on every source tried in game.
     #[test]
     fn leveling_is_full_by_default_and_the_boost_is_capped() {
         assert_eq!(
             AudioOptions::default().leveling,
             1.0,
-            "per-frame leveling was measured better than 0.5 and better than off on              every source; the default follows the listening, not the theory"
+            "per-frame leveling was measured better than 0.5 and better than off on \
+             every source; the default follows the listening, not the theory"
         );
         assert!(
             MAX_LEVELING_BOOST > 1.0 && MAX_LEVELING_BOOST <= 20.0,
-            "full leveling divides by the frame's own peak, so the cap is the only thing              between a near-silent frame and a full-scale noise floor: {MAX_LEVELING_BOOST}"
+            "full leveling divides by the frame's own peak, so the cap is the only thing \
+             between a near-silent frame and a full-scale noise floor: {MAX_LEVELING_BOOST}"
         );
     }
 
-    /// Full leveling exists, is reachable, and does what it says: every frame
-    /// dragged to full scale. This is the automatic gain control that
-    /// [`a_quiet_passage_stays_quiet_relative_to_a_loud_one`] forbids by
-    /// default -- the pair is what makes "opt-in" mean something, since a test
-    /// that only forbids AGC is also passed by a build where the knob is
-    /// wired to nothing.
+    /// `leveling_scale`'s doc claims that a self-referential `ceiling` (the
+    /// same array and peak as `agc_mix`/`agc_peak`) is a bit-for-bit no-op,
+    /// and that `ceiling: None` matches that self-referential form exactly --
+    /// which is what makes it safe for bank mode ([`analyze`]) to skip the
+    /// clamp branch entirely while voice mode
+    /// (`voices::analyze_voices`) relies on the same branch with a genuinely
+    /// different `ceiling` array. Exercised directly here, against arbitrary
+    /// data, rather than only inferred from the two callers' own tests.
+    #[test]
+    fn leveling_scale_self_referential_ceiling_is_a_no_op() {
+        let mix = vec![0.0, 0.02, 0.5, 0.83, 1.0, 0.33, 0.0];
+        let peak = mix.iter().cloned().fold(0.0f64, f64::max);
+        for gain in [0.0f32, 0.3, 1.0, 2.5] {
+            for leveling in [0.0f32, 0.25, 0.6, 1.0] {
+                let without = leveling_scale(&mix, peak, gain, leveling, None);
+                let with = leveling_scale(&mix, peak, gain, leveling, Some((&mix, peak)));
+                assert_eq!(
+                    without, with,
+                    "a self-referential ceiling must be a bit-for-bit no-op \
+                     (gain {gain}, leveling {leveling})"
+                );
+            }
+        }
+    }
+
+    /// Full leveling does what it says: every frame dragged to full scale.
+    /// Pairs with [`a_quiet_passage_stays_quiet_relative_to_a_loud_one`],
+    /// which forbids this by default -- together they pin the knob rather
+    /// than just its absence.
     #[test]
     fn full_leveling_is_opt_in_and_flattens_the_dynamics() {
         let clip = loud_then_quiet(0.1);
@@ -1348,16 +1034,11 @@ mod tests {
         }
     }
 
-    /// **`--gain` is the level the normalisation lands ON, and until this test
-    /// nothing in the suite could tell.** Pinning `opts.gain` to a constant
-    /// anywhere in `analyze` broke no test: every other test either uses the
-    /// default 1.0 or measures a RATIO, both of which survive the flag being
-    /// wired to nothing.
-    ///
-    /// Asserted at both ends of `--leveling` because the two compose: the
-    /// global scale is `gain / mix_peak` and the per-frame boost multiplies it,
-    /// so a leveling that referenced the wrong quantity would show up here as a
-    /// mix that misses `gain` at 1.0 while hitting it at 0.
+    /// `--gain` is the level the normalisation lands on. Every other test
+    /// uses the default 1.0 or measures a ratio, so pinning `opts.gain` to a
+    /// constant anywhere in `analyze` would break nothing else. Asserted at
+    /// both ends of `--leveling` since the two compose: the global scale is
+    /// `gain / mix_peak` and the per-frame boost multiplies it.
     #[test]
     fn gain_is_the_level_the_loudest_mix_lands_on() {
         let clip = tones(&band_centres(6), &[1.0 / 6.0; 6], 1.0);
@@ -1375,7 +1056,7 @@ mod tests {
                 );
             }
         }
-        // ...and it scales the WHOLE render, not just its loudest instant: a
+        // ...and it scales the whole render, not just its loudest instant: a
         // scale that pinned only the peak would leave every quieter frame at
         // the wrong level and still pass above.
         let full = analyze(&clip, &opts(), &mut NoProgress).expect("analyze");
@@ -1400,10 +1081,9 @@ mod tests {
         );
     }
 
-    /// `--gain nan` must be an error rather than the LOUDEST possible render.
-    /// `f32::min` IGNORES a NaN operand, so a NaN scale walks through the 1.0
-    /// clamp as 1.0 and writes every speaker at full volume for the whole
-    /// track -- finite, in range, and deafening.
+    /// `--gain nan` must be an error rather than the loudest possible render:
+    /// `f32::min` ignores a NaN operand, so a NaN scale walks through the 1.0
+    /// clamp as 1.0 and writes every speaker at full volume.
     #[test]
     fn a_non_finite_or_negative_gain_is_an_error() {
         for bad in [f32::NAN, f32::INFINITY, -1.0] {
@@ -1443,23 +1123,12 @@ mod tests {
         t.volumes.iter().map(|b| b[f]).sum()
     }
 
-    /// The largest per-frame INCOHERENT SUM in a track must land on exactly
-    /// full scale, whatever the band count -- no lower (the 19-24 dB deficit
-    /// this test was written to catch) and no higher (the 1.575x overshoot that
-    /// replaced it, heard as distortion at `--gain 1.0`).
-    ///
-    /// Six equal tones is the shape that separates all three normalisers. Each
-    /// band lands at:
-    ///
-    /// | normaliser                | per band | peak mix |
-    /// |---------------------------|----------|----------|
-    /// | per-frame SUM (original)  | 0.167    | 0.408    |
-    /// | loudest single band       | 1.0      | 2.449    |
-    /// | incoherent sum (current)  | 0.408    | 1.0      |
-    ///
-    /// so a check on the mix peak alone would be passed by a build that scaled
-    /// everything by a constant, and a check on the per-band value alone was
-    /// what let the overshoot ship. Both are asserted.
+    /// The largest per-frame incoherent sum in a track must land on exactly
+    /// full scale, whatever the band count -- no lower (a per-frame-sum
+    /// normaliser undershoots) and no higher (a loudest-single-band
+    /// normaliser overshoots, heard as distortion at `--gain 1.0`). Six equal
+    /// tones separates all three; both the mix peak and the per-band value
+    /// are asserted since either alone is satisfiable by the wrong scheme.
     #[test]
     fn the_loudest_incoherent_mix_in_a_track_reaches_exactly_full_scale() {
         let freqs = band_centres(6);
@@ -1480,7 +1149,7 @@ mod tests {
                  SUM of all bands costs, above 1 is the overshoot that normalising by the \
                  loudest single band causes, and both were shipped"
             );
-            // ...and the individual bands really are SHARING that mix, rather
+            // ...and the individual bands really are sharing that mix, rather
             // than one of them holding it alone. Only checked where the six
             // tones land in six distinct bands: at 8 bands the bank is 6 tonal
             // bands spanning 370..494 Hz, so most of the tones fold onto a
@@ -1500,22 +1169,12 @@ mod tests {
         }
     }
 
-    /// **The property that makes `--gain 1.0` usable.** No frame's incoherent
-    /// mix may exceed full scale, on a signal with energy spread across many
-    /// bands at once.
-    ///
-    /// The previous normaliser pinned the loudest single BAND to 1.0, which let
-    /// the mix of everything sounding beside it reach a measured 1.575x on a
-    /// real track -- the reported distortion. Nothing asserted a bound on the
-    /// mix, so it shipped.
-    ///
-    /// **Swept over `leveling`, and that sweep is not decoration.** This guard
-    /// used to run through [`opts`] alone, which pins `leveling` to 0 -- so it
-    /// tested every value of the knob except the one that ships, and a second
-    /// overshoot (2.447x, [`no_frame_exceeds_full_scale_at_the_shipped_leveling_default`])
-    /// shipped underneath it for exactly that reason. The default is included
-    /// explicitly rather than spelled as a literal so the sweep follows the
-    /// default if it ever moves again.
+    /// The property that makes `--gain 1.0` usable: no frame's incoherent mix
+    /// may exceed full scale, on a signal spread across many bands at once.
+    /// Swept over `leveling` including the live default rather than a
+    /// literal 0/1, since [`opts`] alone pins `leveling` to 0 and would miss
+    /// the overshoot [`no_frame_exceeds_full_scale_at_the_shipped_leveling_default`]
+    /// catches.
     #[test]
     fn the_incoherent_mix_never_exceeds_full_scale() {
         let freqs = band_centres(6);
@@ -1538,14 +1197,10 @@ mod tests {
         }
     }
 
-    /// A loud passage carried by ONE partial, then a quieter, denser one.
-    ///
-    /// The shape that separates a per-frame scale referenced to the frame's
-    /// loudest BAND from one referenced to the frame's own MIX: the two frames
-    /// have the same loudest band relative to the track (so the first scheme
-    /// hands the second passage the full `peak/frame_peak` boost) but wildly
-    /// different band counts (so that boost multiplies an incoherent sum of six
-    /// where the reference frame summed one).
+    /// A loud passage carried by one partial, then a quieter, denser one.
+    /// Separates a per-frame scale referenced to the frame's loudest band
+    /// from one referenced to the frame's own mix: the two frames share a
+    /// loudest-band ratio but wildly different band counts.
     fn one_partial_then_six(loud: f32, quiet: f32) -> SampleClip {
         // A4, C#5, E5, A5, C#6, E6 -- an A major triad over two octaves, so
         // every tone lands in a band of its own at the default subdivision.
@@ -1575,26 +1230,15 @@ mod tests {
             .fold((0.0, 0), |a, b| if b.0 > a.0 { b } else { a })
     }
 
-    /// **The regression test for the leveling overshoot, on the SHIPPED
-    /// defaults and nothing else.**
-    ///
-    /// Everything above runs through [`opts`], which pins `leveling` to 0 for
-    /// reasons that are good for the mechanism tests and fatal for this one:
-    /// with the knob at 0 the per-frame scale is the global scale and the bound
-    /// is trivial. At the shipped `leveling: 1.0` it was not: measured **2.447x**
-    /// full scale on this fixture, against the 1.575x the incoherent-sum
-    /// normaliser was written to remove and which a listener reported as
-    /// distortion. The owner independently described a real render as "super
-    /// crunchy"; this is that.
-    ///
-    /// The cause was that the two decisions referenced different quantities.
-    /// The global scale targets the loudest per-frame incoherent MIX; the
-    /// leveling boost divided by the frame's loudest single BAND. A frame with
-    /// six bands sounding therefore got the boost a one-band frame earned, and
-    /// the mix came out `sqrt(N_quiet / N_loud)` too high -- unbounded by
-    /// anything but [`MAX_LEVELING_BOOST`]. Referencing both to the frame's own
-    /// mix makes `mix[f] * scale[f] <= gain` algebraically true for every
-    /// `leveling` in 0..=1, which is what this asserts.
+    /// The regression test for the leveling overshoot, on the shipped
+    /// defaults. [`opts`] pins `leveling` to 0 for the mechanism tests, which
+    /// makes the bound trivial; at the shipped 1.0 it was not, because the
+    /// global scale targeted the frame's incoherent mix while the leveling
+    /// boost divided by the frame's loudest single band -- a frame with six
+    /// bands sounding got the boost a one-band frame earned, overshooting
+    /// full scale by an amount unbounded except by [`MAX_LEVELING_BOOST`].
+    /// Referencing both to the frame's own mix makes `mix[f] * scale[f] <=
+    /// gain` true for every `leveling` in 0..=1, which is what this asserts.
     #[test]
     fn no_frame_exceeds_full_scale_at_the_shipped_leveling_default() {
         let clip = one_partial_then_six(0.9, 0.09);
@@ -1623,11 +1267,9 @@ mod tests {
         }
     }
 
-    /// The other half of the pair: bounding the mix must not have been bought
-    /// by making full leveling quiet. Every frame that has any content at all
-    /// must still arrive AT full scale when the knob is at 1.0 -- that is what
-    /// "full automatic gain control" means, and it is the loudness the default
-    /// was chosen by ear for.
+    /// The other half of the pair: bounding the mix must not have come at the
+    /// cost of making full leveling quiet. Every frame with any content must
+    /// still arrive at full scale when the knob is at 1.0.
     #[test]
     fn full_leveling_still_takes_every_frame_all_the_way_to_full_scale() {
         let clip = one_partial_then_six(0.9, 0.09);
@@ -1648,14 +1290,10 @@ mod tests {
         );
     }
 
-    /// **Replaces `the_whole_bank_together_never_exceeds_full_scale`**, which
-    /// asserted the OLD contract: that the sum across every band never passed
-    /// 1.0. That guarantee is what made the render inaudible -- it costs a
-    /// factor of `frame-sum-peak / loudest-band`, measured at 8.9x (32 bands)
-    /// and 16.2x (96 bands) on a real track -- and it modelled the mix wrongly,
-    /// since bands at unrelated frequencies do not add coherently. The old
-    /// assertion is deliberately INVERTED here rather than deleted, so the
-    /// reversal is visible in the suite instead of being a silent absence.
+    /// Replaces an old assertion that the plain sum across every band never
+    /// passed 1.0 -- that contract is what made the render inaudible, since
+    /// bands at unrelated frequencies do not add coherently. Inverted here
+    /// rather than deleted so the reversal stays visible in the suite.
     #[test]
     fn many_bands_sounding_at_once_do_not_scale_the_bank_down() {
         let freqs = band_centres(6);
@@ -1675,10 +1313,9 @@ mod tests {
         assert!(peak <= 1.0, "no single speaker may exceed full scale, got {peak}");
     }
 
-    /// Normalisation is across the WHOLE TRACK, not per frame. A per-frame
-    /// scale is an automatic gain control: it drags every quiet passage up to
-    /// full scale and flattens the track's dynamics into a wall of noise,
-    /// with every value still finite, in range, and summing to 1.0.
+    /// Normalisation is across the whole track, not per frame. A per-frame
+    /// scale is an automatic gain control that drags every quiet passage up
+    /// to full scale, flattening the track's dynamics.
     #[test]
     fn a_quiet_passage_stays_quiet_relative_to_a_loud_one() {
         // `loud_then_quiet` puts the tone on a high band, whose width
@@ -1705,21 +1342,13 @@ mod tests {
         );
     }
 
-    /// The floor zeroes everything more than `floor_db` below THE LOUDEST
-    /// BAND IN THE SAME FRAME, and `floor_db` is an AMPLITUDE ratio:
-    /// `10^(dB/20)`, not `10^(dB/10)`.
-    ///
-    /// Digital silence cannot test this at all -- it normalises to zero before
-    /// the floor is ever consulted -- so the silence test passes with the floor
-    /// deleted outright, or with the exponent an octave wrong. Here a loud
-    /// 220 Hz tone carries a companion 80 dB below it: correct code zeroes the
-    /// companion, `10^(dB/10)` leaves it ringing.
-    ///
-    /// The reference changed from the TRACK peak to the FRAME peak when
-    /// normalisation stopped being a per-frame-sum scale; this signal is one
-    /// steady level throughout, so the two references coincide here and the
-    /// exponent and the zeroing are what is under test. The frame-vs-track
-    /// distinction is [`the_floor_is_measured_against_the_frame_not_the_track`].
+    /// The floor zeroes everything more than `floor_db` below the loudest
+    /// band in the same frame, and `floor_db` is an amplitude ratio
+    /// (`10^(dB/20)`, not `10^(dB/10)`). Digital silence cannot test this --
+    /// it normalises to zero before the floor is consulted -- so this uses a
+    /// steady 220 Hz tone with a companion 80 dB below it. The frame-vs-track
+    /// distinction is covered separately by
+    /// [`the_floor_is_measured_against_the_frame_not_the_track`].
     #[test]
     fn the_floor_zeroes_exactly_what_is_below_it_in_amplitude_db() {
         let n = SR as usize;
@@ -1742,7 +1371,7 @@ mod tests {
         let mut below = 0usize;
         let mut above = 0usize;
         for f in 0..unfloored.frame_count {
-            // Normalisation is one global scale, so the frame's peak VOLUME
+            // Normalisation is one global scale, so the frame's peak volume
             // is the frame's peak magnitude in the same units the values are
             // in -- the floor for this frame is that times the ratio.
             let peak = unfloored.volumes.iter().map(|b| b[f]).fold(0.0f64, f64::max);
@@ -1770,16 +1399,12 @@ mod tests {
     /// The floor is measured against the frame the listener is hearing, not
     /// against the whole track's peak.
     ///
-    /// One global scale is set by the loudest moment in the track, so an
-    /// ABSOLUTE floor eats a fixed amount out of every frame and takes
-    /// proportionally more of a quiet one -- quiet passages lose their detail
-    /// first and, far enough down, go silent entirely. That is what made a
-    /// render sound like beeps between the loud hits.
-    ///
-    /// Signal: a loud second, then a second 30 dB down, each carrying a
-    /// companion tone 40 dB below its own half. The quiet half's companion is
-    /// therefore 70 dB below the TRACK peak (an absolute -60 dB floor zeroes
-    /// it) but only 40 dB below its OWN frame (a relative floor keeps it).
+    /// An absolute floor eats a fixed amount out of every frame and takes
+    /// proportionally more of a quiet one. Signal: a loud second, then a
+    /// second 30 dB down, each carrying a companion tone 40 dB below its own
+    /// half. The quiet half's companion is 70 dB below the track peak (an
+    /// absolute -60 dB floor zeroes it) but only 40 dB below its own frame (a
+    /// relative floor keeps it).
     #[test]
     fn the_floor_is_measured_against_the_frame_not_the_track() {
         let c = band_centres(6);
@@ -1796,7 +1421,7 @@ mod tests {
         assert!(t.frame_count >= 58, "need both halves, got {}", t.frame_count);
 
         // Which band the companion landed in, found rather than assumed: it
-        // is whichever band is loudest in the LOUD half after excluding the
+        // is whichever band is loudest in the loud half after excluding the
         // main tone's own band and its neighbours.
         let peak_at = |f: usize| {
             (0..t.volumes.len()).max_by(|&a, &b| t.volumes[a][f].total_cmp(&t.volumes[b][f]))
@@ -1827,15 +1452,9 @@ mod tests {
 
     // ================= spectral peak selection =================
     //
-    // The defect these cover: a filterbank gives EVERY band whatever energy
-    // lands in its slot, so on a real pop master 94.40 of 96 bands were
-    // non-zero in an average frame. Ninety-four sine oscillators 0.85
-    // semitones apart, sounding at once, is broadband noise -- and the
-    // preceding loudness fix only made that noise louder. Nothing in the
-    // suite above asserts sparsity, so every one of these mutations shipped
-    // green: selection removed, top-N without the local-maximum test, the
-    // local-maximum test without top-N, N off by one, endpoints always or
-    // never selected, and the noise bands exempted from the competition.
+    // A filterbank gives every band whatever energy lands in its slot, so an
+    // unsparsified render is broadband noise rather than a chord. Nothing
+    // above this point asserts sparsity.
 
     /// `select_peaks` over a real plan's axis, on a hand-built frame.
     fn sel(plan: &BandPlan, frame: &mut [f32], n: usize, sounding: &mut [bool]) -> Vec<usize> {
@@ -1849,11 +1468,8 @@ mod tests {
             .collect()
     }
 
-    /// The axis is FREQUENCY order, not storage order. `fold` sends everything
-    /// above the bank to white and everything below it to pink, so the two
-    /// noise bands are the ends of the same axis the tonal bands sit on -- and
-    /// getting that wrong would make the local-maximum test compare a 40 Hz
-    /// band against a cymbal wash.
+    /// The axis is frequency order, not storage order; getting it wrong would
+    /// make the local-maximum test compare a 40 Hz band against a cymbal wash.
     #[test]
     fn the_frequency_axis_runs_pink_then_tonal_then_white() {
         let p = BandPlan::new(32, 2).expect("plan");
@@ -1867,7 +1483,7 @@ mod tests {
         assert_eq!(frequency_axis(&p0), (0..8).collect::<Vec<_>>());
     }
 
-    /// One strong note must cost ONE voice, not three. Its skirt lights the
+    /// One strong note must cost one voice, not three. Its skirt lights the
     /// bands either side of it, and a plain top-N spends slots on them.
     #[test]
     fn a_hump_selects_only_its_apex() {
@@ -1923,9 +1539,8 @@ mod tests {
     }
 
     /// An axis endpoint has one neighbour and qualifies by beating it. Not
-    /// dropped: measured on a real track, an endpoint is the single loudest
-    /// peak in the frame 5.5% of the time -- that is a bass drop or a cymbal
-    /// wash, and it IS the music at that moment.
+    /// dropped: on a real track an endpoint is sometimes the single loudest
+    /// peak in the frame (a bass drop or a cymbal wash).
     #[test]
     fn an_axis_endpoint_qualifies_against_its_one_neighbour() {
         let p = BandPlan::new(32, 2).expect("plan");
@@ -1942,9 +1557,9 @@ mod tests {
     }
 
     /// The other half of the endpoint rule: an endpoint is not selected just
-    /// for BEING an endpoint. This is the mutation where the two noise bands
-    /// pass the local-maximum test unconditionally, which is a permanent
-    /// noise bed by another route.
+    /// for being one. Covers the mutation where the two noise bands pass the
+    /// local-maximum test unconditionally, a permanent noise bed by another
+    /// route.
     #[test]
     fn an_endpoint_that_loses_to_its_neighbour_is_not_a_peak() {
         let p = BandPlan::new(32, 2).expect("plan");
@@ -1997,12 +1612,9 @@ mod tests {
     }
 
     /// A band already sounding must be beaten by [`VOICE_HYSTERESIS`], not
-    /// merely equalled, before it loses its slot. At 30 fps a slot that
-    /// changes hands every frame is a 33 ms chirp; measured on a real track,
-    /// this bias cuts the share of one-frame "on" runs from 16.8% to 8.1%.
-    ///
-    /// It biases RANK only. The volume written is the band's own magnitude,
-    /// never a boosted one.
+    /// merely equalled, before it loses its slot -- at 30 fps a slot that
+    /// changes hands every frame is a 33 ms chirp. Biases rank only; the
+    /// volume written is the band's own magnitude, never a boosted one.
     #[test]
     fn an_incumbent_band_keeps_its_slot_until_it_is_clearly_beaten() {
         let p = BandPlan::new(32, 2).expect("plan");
@@ -2024,10 +1636,8 @@ mod tests {
             vec![a],
             "a challenger within {VOICE_HYSTERESIS}x must not take the slot"
         );
-        // **The bonus biases RANK ONLY.** Applying it to the value instead
-        // would write every sustained band {VOICE_HYSTERESIS}x (3.5 dB) louder
-        // than it is, which is inaudible as a bug and wrong in every frame --
-        // a mutation campaign found this the one hole in the tests above.
+        // The bonus biases rank only; applying it to the value instead would
+        // write every sustained band VOICE_HYSTERESIS louder than it is.
         assert_eq!(
             f2[a], 10.0,
             "the incumbent's VOLUME must be its own magnitude, not the boosted rank key"
@@ -2039,7 +1649,7 @@ mod tests {
         f3[a] = 10.0;
         f3[b] = 20.0;
         assert_eq!(sel(&p, &mut f3, 1, &mut sounding), vec![b], "a clear winner takes the slot");
-        // The kept band's VOLUME is its own, never the boosted rank key.
+        // The kept band's volume is its own, never the boosted rank key.
         assert_eq!(f3[b], 20.0);
     }
 
@@ -2068,18 +1678,10 @@ mod tests {
         tones(&freqs, &vec![1.0 / n as f32; n], secs)
     }
 
-    /// **The headline property, and the entire point of this change.** The
-    /// number of bands sounding at once must be about `--max-voices`, whatever
-    /// the source throws at the bank.
-    ///
-    /// Nothing in this suite asserted it before. Measured on a real pop master
-    /// at 96 bands, 94.40 of 96 bands were non-zero in an average frame, and
-    /// every test above passed on that render -- they check levels, ranges and
-    /// dynamics, none of which notice that the output is a wall of sound.
-    ///
-    /// The signal is 24 simultaneous tones: more than any N under test, so the
-    /// limit is what decides the answer rather than the source running out of
-    /// content.
+    /// The headline property: the number of bands sounding at once must be
+    /// about `--max-voices`, whatever the source throws at the bank. The
+    /// signal is 24 simultaneous tones, more than any N under test, so the
+    /// limit decides the answer rather than the source running out of content.
     #[test]
     fn the_mean_number_of_sounding_bands_tracks_max_voices() {
         let clip = spread_tones(81, 24, 3, 1.0);
@@ -2097,10 +1699,9 @@ mod tests {
         }
     }
 
-    /// The other half of the headline: with selection OFF the same signal
-    /// lights most of the bank. Without this, a build where selection is
-    /// deleted outright and `max_voices` ignored fails the test above only
-    /// because it happens to be dense -- this pins the contrast to the flag.
+    /// The other half of the headline: with selection off the same signal
+    /// lights most of the bank, pinning the contrast to the flag rather than
+    /// to the signal happening to be dense.
     #[test]
     fn selection_is_what_makes_the_bank_sparse() {
         let clip = spread_tones(81, 24, 3, 1.0);
@@ -2164,24 +1765,12 @@ mod tests {
         )
     }
 
-    /// **The regression this flag exists for.**
-    ///
-    /// `--max-voices` is an UPPER bound; the prominence gate is what decides
-    /// how many candidates there are to bound. On dense material the gate binds
-    /// first, so above it `--max-voices` does nothing whatsoever -- measured in
-    /// the field as four renders of a piano master at 24, 32, 48 and 64 voices
-    /// coming back 311925 / 311919 / 311917 / 311913 bytes. Twelve bytes apart
-    /// across a 40-voice range: the same render, four times, with no error and
-    /// nothing to see.
-    ///
-    /// Both halves are asserted, because either alone is satisfiable by an
-    /// implementation that ignores one of the two flags:
-    ///
-    /// * at the default gate, raising `--max-voices` far past the candidate
-    ///   count must change (almost) nothing -- the bug, pinned so it cannot be
-    ///   "fixed" by making `--max-voices` bind where it should not;
-    /// * lowering the gate at that same `--max-voices` must sound audibly more
-    ///   bands -- the escape hatch actually working.
+    /// The regression this flag exists for; see [`DEFAULT_PEAK_GATE`]. Both
+    /// halves are asserted since either alone is satisfiable by an
+    /// implementation that ignores one of the two flags: at the default gate,
+    /// raising `--max-voices` past the candidate count must change almost
+    /// nothing, and lowering the gate at that same `--max-voices` must sound
+    /// substantially more bands.
     #[test]
     fn the_peak_gate_and_not_max_voices_is_what_limits_a_dense_frame() {
         let clip = noise(1.0);
@@ -2251,9 +1840,9 @@ mod tests {
     // -- the envelope --------------------------------------------------------
 
     /// Mean length, in frames, of a run of one band being continuously
-    /// non-zero. **The beeping metric**: a band that switches on for one or two
-    /// frames and off again is a 33-66 ms blip, which is heard as a beep rather
-    /// than as a note.
+    /// non-zero. The beeping metric: a band that switches on for one or two
+    /// frames and off again is a 33-66 ms blip, heard as a beep rather than a
+    /// note.
     fn mean_run(t: &VoiceTrack) -> f64 {
         let mut runs = Vec::new();
         for band in &t.volumes {
@@ -2276,15 +1865,10 @@ mod tests {
         runs.iter().sum::<usize>() as f64 / runs.len() as f64
     }
 
-    /// **The fix for "a lot of random beep pitch sounds".**
-    ///
-    /// Broadband noise makes the band selection churn: a band wins a slot for a
-    /// frame or two and loses it, which without an envelope is an abrupt blip.
-    /// The release must turn those into short notes with tails, and the metric
-    /// that says so is the mean run of consecutive non-zero frames.
-    ///
-    /// Asserted as a RATIO between two runs of the same analysis, so it cannot
-    /// be satisfied by a source that happens to be sustained anyway.
+    /// Broadband noise makes the band selection churn: a band wins a slot for
+    /// a frame or two and loses it, which without an envelope is an abrupt
+    /// blip. Asserted as a ratio between two runs of the same analysis, so it
+    /// cannot be satisfied by a source that happens to be sustained anyway.
     #[test]
     fn the_release_envelope_lengthens_the_runs_that_sound_like_beeps() {
         let clip = noise(2.0);
@@ -2332,14 +1916,11 @@ mod tests {
         );
     }
 
-    /// A note ENDING and a level FALLING are two different times, and voice
-    /// mode used to take both from `--release`.
-    ///
-    /// 150 ms is a reasonable one-pole time constant for a band that never
-    /// stops existing, and a disastrous note-off for a spoken phoneme 50-100 ms
-    /// long -- measured at 52.7% of all sounding voice-frames on speech being a
-    /// voice playing a note the source had already stopped playing. The default
-    /// note-off must fit inside a phoneme, and it must be a SEPARATE number.
+    /// A note ending and a level falling are two different times; voice mode
+    /// used to take both from `--release`, a time constant reasonable for a
+    /// band that never stops existing but disastrous as a note-off for a
+    /// 50-100 ms spoken phoneme. The default note-off must fit inside one and
+    /// must be its own number.
     #[test]
     fn the_voice_release_is_its_own_default_and_fits_inside_a_phoneme() {
         let d = AudioOptions::default();
@@ -2425,12 +2006,7 @@ mod tests {
 
     // -- the grid has to be a musical one ------------------------------------
 
-    /// **Only multiples of 12 put bands on real notes**, and every other value
-    /// was heard in game as out of tune -- 14 as sharp, 18 as flat, from a
-    /// controlled sweep on solo piano with one binary and only this flag
-    /// varying. There is no source for which 14 is what someone wants, and the
-    /// failure is musical rather than obvious, so it is an error and not a
-    /// warning.
+    /// See [`check_subdiv`]: only multiples of 12 put bands on real notes.
     #[test]
     fn a_subdivision_that_is_not_a_multiple_of_twelve_is_an_error() {
         let clip = tones(&[440.0], &[1.0], 0.5);
@@ -2453,8 +2029,8 @@ mod tests {
         }
     }
 
-    /// Noise bands are OFF by default: reported worse on every source tried in
-    /// game -- speech, solo piano and a full pop mix alike.
+    /// Noise bands are off by default: reported worse on every source tried
+    /// in game.
     #[test]
     fn noise_bands_are_off_by_default() {
         assert_eq!(AudioOptions::default().noise_bands, 0);
@@ -2525,21 +2101,10 @@ mod tests {
         );
     }
 
-    /// [`prominence`] is the ratio to the MEAN of a neighbourhood of exactly
-    /// [`PROMINENCE_WIDTH`] bands either side, and the width is load-bearing:
-    /// too narrow and a note's own leakage skirt becomes its neighbourhood,
-    /// too wide and the next note in the chord does.
-    ///
-    /// The frame is built so the answer names the width. Distances 1 and 2
-    /// carry 2.0, distance 3 carries 0.5 and distance 4 carries 8.0, so the
-    /// mean -- and therefore the prominence -- is different for every width in
-    /// the plausible range:
-    ///
-    /// | half-width | neighbourhood mean | prominence of a 3.0 peak |
-    /// |------------|--------------------|--------------------------|
-    /// | 2          | 8/4   = 2.0        | 1.50                     |
-    /// | **3**      | 9/6   = 1.5        | **2.00**                 |
-    /// | 4          | 25/8  = 3.125      | 0.96                     |
+    /// [`prominence`] is the ratio to the mean of a neighbourhood of exactly
+    /// [`PROMINENCE_WIDTH`] bands either side. The frame is built so the mean,
+    /// and therefore the prominence, differs at every half-width in the
+    /// plausible range, so the answer names the width that was actually used.
     #[test]
     fn prominence_is_the_ratio_to_the_mean_of_a_fixed_width_neighbourhood() {
         let p = BandPlan::new(32, 0).expect("plan");
@@ -2564,9 +2129,8 @@ mod tests {
     }
 
     /// A peak standing in perfect silence has nothing to be measured against.
-    /// It must come back finite and ORDERABLE rather than infinite or NaN, so
-    /// that two such peaks are still ranked against each other by magnitude --
-    /// which is the whole of a synthetic test signal, and every digital fade.
+    /// It must come back finite and orderable rather than infinite or NaN, so
+    /// two such peaks are still ranked against each other by magnitude.
     #[test]
     fn a_peak_in_silence_has_a_finite_maximal_prominence() {
         let p = BandPlan::new(32, 0).expect("plan");
@@ -2578,15 +2142,10 @@ mod tests {
         assert_eq!(got, MAX_PROMINENCE);
     }
 
-    /// **The headline behavioural change.** A quiet, NARROW spike must outrank
-    /// a louder, BROADER one.
-    ///
-    /// Band 8 is a 10.0 sitting on a plateau of 6.0 -- the loudest thing in the
-    /// frame, and under the previous magnitude rank it took the slot every
-    /// time. Band 20 is a 6.0 standing over a floor of 1.0: quieter, but six
-    /// times its surroundings instead of 1.67 times. That is the difference
-    /// between a note and a ripple on a lump of bass rumble or cymbal wash, and
-    /// it is invisible to a magnitude rank.
+    /// A quiet, narrow spike must outrank a louder, broader one. Band 8 is
+    /// the loudest thing in the frame but only 1.67x its plateau; band 20 is
+    /// quieter but 6x its own floor -- the difference between a note and a
+    /// ripple on a lump, invisible to a magnitude rank.
     #[test]
     fn a_narrow_spike_outranks_a_louder_broad_lump() {
         let p = BandPlan::new(32, 0).expect("plan");
@@ -2610,10 +2169,7 @@ mod tests {
              the louder apex that stands 1.67x over its own -- ranking by raw magnitude picks \
              band 8 here, which is how a bank spends its slots on rumble and hiss"
         );
-        // **Prominence decides WHICH band sounds, never HOW LOUD it is.** The
-        // volume written is the band's own magnitude; scaling it by the rank
-        // key would make every selected band 6x louder than it is and destroy
-        // the dynamics the rest of this module works to preserve.
+        // Prominence decides which band sounds, never how loud it is.
         assert_eq!(
             f[20], 6.0,
             "the selected band's volume must be its own magnitude, not its prominence or its \
@@ -2621,15 +2177,9 @@ mod tests {
         );
     }
 
-    /// The prominence GATE: a local maximum that is not prominent enough is not
-    /// a note, and must stay silent even when voice slots are going spare.
-    ///
-    /// This is the step that actually sparsifies a real track. Measured on a
-    /// pop master at 96 bands, the local-maximum test alone leaves 29.02
-    /// candidates per frame, so at `--max-voices 32` or `48` the top-N
-    /// truncation never fires and EVERY local maximum sounds -- 29 sine
-    /// oscillators at once. Every ranking scheme produced identical output
-    /// there; only the gate changes anything.
+    /// The prominence gate: a local maximum that is not prominent enough is
+    /// not a note, and must stay silent even when voice slots are going
+    /// spare. See [`DEFAULT_PEAK_GATE`].
     #[test]
     fn a_local_maximum_that_is_not_prominent_enough_is_not_a_note() {
         let p = BandPlan::new(32, 0).expect("plan");
@@ -2687,23 +2237,13 @@ mod tests {
         );
     }
 
-    /// **Equal-amplitude tones spread across the bank must win voices across
-    /// the bank.** The property the whole selection scheme exists to hold, and
-    /// nothing asserted it before.
-    ///
-    /// Music's energy is concentrated at the low end, so a selector that ranks
-    /// by anything correlated with raw level can spend every slot down there
-    /// and leave the melody and the vocal without a voice -- "muffled". The
-    /// signal here removes that excuse entirely: every tone carries the same
-    /// amplitude, so a fair selector must spread its slots over the whole
-    /// range, and any concentration is the selector's own bias.
-    ///
-    /// Tones are placed from band 12 up. Below that a band is narrower than the
-    /// FFT's own bin spacing (at 96 bands over 44..4400 Hz, band 8 is 3.3 Hz
-    /// wide against a 2.9 Hz bin and an 11.7 Hz Hann main lobe), so a low tone
-    /// smears across several bands whatever the selector does -- a measurement
-    /// artefact of the bank's geometry, not a selection bias, and it would make
-    /// this test lie about which one it caught.
+    /// Equal-amplitude tones spread across the bank must win voices across
+    /// the bank: a selector that ranks by anything correlated with raw level
+    /// can spend every slot on music's low end and leave the melody muffled.
+    /// Tones are placed from band 12 up because below that a band is
+    /// narrower than the FFT's own bin spacing, so a low tone smears across
+    /// several bands regardless of the selector -- a geometry artefact, not a
+    /// selection bias.
     #[test]
     fn equal_tones_across_the_range_are_not_selected_only_from_the_low_bands() {
         const BANDS: usize = 79;
@@ -2771,6 +2311,54 @@ mod tests {
         let mut sounding = vec![true; 32];
         assert!(sel(&p, &mut f, 12, &mut sounding).is_empty());
         assert!(sounding.iter().all(|s| !s), "nothing may be left marked as sounding");
+    }
+
+    /// Every wave maps to its own `BA_Synth_Basic_*` asset, by the exact name
+    /// the game resolves. A swapped or misspelled arm here is a silent dud save
+    /// in game with nothing to see at build time (`audio_descriptor_value` only
+    /// checks the type, not that the right wave was chosen), so the mapping is
+    /// pinned by string.
+    #[test]
+    fn every_wave_maps_to_its_own_basic_synth_asset() {
+        assert_eq!(SynthWave::Sine.asset().as_ref(), "BA_Synth_Basic_Sine");
+        assert_eq!(SynthWave::Square.asset().as_ref(), "BA_Synth_Basic_Square");
+        assert_eq!(SynthWave::Triangle.asset().as_ref(), "BA_Synth_Basic_Triangle");
+        assert_eq!(SynthWave::Sawtooth.asset().as_ref(), "BA_Synth_Basic_Sawtooth");
+        // Four waves, four distinct assets -- no two share one.
+        let mut names: Vec<String> =
+            SynthWave::ALL.iter().map(|w| w.asset().as_ref().to_string()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 4, "each wave must map to a distinct asset");
+    }
+
+    /// The default is Sine, so an unchanged render is identical to the
+    /// pre-flag one, and `ALL[0]` is that default (the selector opens on it).
+    #[test]
+    fn sine_is_the_default_and_first() {
+        assert_eq!(SynthWave::default(), SynthWave::Sine);
+        assert_eq!(SynthWave::ALL[0], SynthWave::Sine);
+        assert_eq!(AudioOptions::default().tonal_synth, SynthWave::Sine);
+    }
+
+    /// The flag spelling and the parser are inverses, or the CLI and a UI
+    /// offering the same four choices can drift apart.
+    #[test]
+    fn every_wave_round_trips_through_its_flag() {
+        for w in SynthWave::ALL {
+            assert_eq!(SynthWave::parse(w.flag()), Ok(w));
+        }
+    }
+
+    /// An unknown value is refused by name, and the error carries the flag and
+    /// all four valid spellings -- the same words wherever `--synth` is reached.
+    #[test]
+    fn an_unknown_wave_names_the_flag_and_every_valid_spelling() {
+        let err = SynthWave::parse("sawblade").expect_err("not a wave");
+        assert!(err.contains("--synth"), "{err}");
+        for word in ["sine", "square", "triangle", "sawtooth"] {
+            assert!(err.contains(word), "error must list {word}: {err}");
+        }
     }
 }
 

@@ -1,41 +1,13 @@
 //! The Audio2Brick pane: pick a song (or a video to pull a track out of),
 //! tune the analysis, and generate a swarm of wired, pitched speaker bricks.
-//!
-//! Follows [`crate::gui::video::VideoApp`]'s shape throughout -- option state
-//! on a struct, `poll_promise` for async picking, a background render thread
-//! reporting through an `mpsc` channel, a cancel flag, and
-//! [`deliver_world_unless_cancelled`] for output -- because the two panes have
-//! the same job and a second set of idioms would only be a second set of bugs.
-//!
-//! # One options struct, not a pile of fields
-//!
-//! Unlike the video pane, which keeps its settings as loose fields and
-//! assembles an `AnimOptions` in `anim_opts()`, this pane stores an
-//! [`AudioOptions`] **directly** and binds its widgets to that struct's own
-//! fields. [`AudioApp::audio_opts`] is then almost a copy, which is the point:
-//! the readout and the render read one value, and a control that updates the
-//! UI but never reaches the pipeline is not expressible. The audio pipeline
-//! has one options struct with no sub-structs and no per-mode variants, so
-//! there is nothing here to assemble.
-//!
-//! # Two meanings for one flag
-//!
-//! `--max-voices` is an upper bound on how many bands may sound at once in
-//! bank mode, and the NUMBER OF SPEAKERS BUILT in voice mode. Same field, two
-//! meanings, and 0 is a documented escape hatch in one and an error in the
-//! other. The label, the tooltip and the legal range all follow
-//! [`AudioApp::mode`] for exactly that reason -- see
-//! [`AudioApp::max_voices_label`].
-//!
-//! # No drag-and-drop
-//!
-//! Deliberately absent. Drag-and-drop is reported not to work in this app at
-//! all, on any pane, and it needs its own investigation (Windows UIPI, the
-//! one-frame lifetime of `dropped_files`, and the native/web `path`-vs-`bytes`
-//! split are the suspects). Adding a fourth non-working copy of it here would
-//! be four things to fix instead of one.
+//! Follows [`crate::gui::video::VideoApp`]'s shape (option state, `poll_promise`
+//! picking, background render thread over an `mpsc` channel, cancel flag,
+//! [`deliver_world_unless_cancelled`]), but stores an [`AudioOptions`] directly
+//! and binds widgets to its own fields, rather than assembling one from loose
+//! fields like the video pane does. `--max-voices` means two different things
+//! depending on [`AudioApp::mode`]; see [`AudioApp::max_voices_label`].
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::{
     audio::{
@@ -45,13 +17,14 @@ use crate::{
         presets::AudioPreset,
         source::AudioInfo,
         speakers::{build_speaker_world, build_voice_world},
-        track::{AudioOptions, analyze},
+        track::{AudioOptions, SynthWave, analyze},
         voices::analyze_voices,
     },
     gui::{
         SharedOptions,
         util::{
-            bound_pane_width, deliver_world_unless_cancelled, draw_out_file_warnings, note,
+            ChannelProgress as UtilChannelProgress, RenderMsg, bound_pane_width,
+            deliver_world_unless_cancelled, draw_out_file_warnings, draw_progress_bar, note,
             refuse_bad_out_file, section, settings_grid,
         },
     },
@@ -72,7 +45,7 @@ use poll_promise::Promise;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{
     audio::backend::open_audio_ensuring,
-    gui::util::pick_audio_path,
+    gui::util::{FfmpegModal, draw_cancel_button, pick_audio_path},
     video::ffmpeg::{ensure_ffmpeg, ffmpeg_available},
 };
 
@@ -128,61 +101,26 @@ const MAX_SPEAKERS: usize = 128;
 
 /// What the render thread tells the UI about its progress.
 ///
-/// No `Preview` variant, unlike the video pane's: `Progress::frame` is for
-/// showing the picture being built, and an audio render has no picture. The
-/// analysis is the only phase that reports at all, which is also the only
-/// phase that can be cancelled.
-#[derive(Clone, Debug)]
-enum ProgressMsg {
-    Begin { label: String, total: Option<u64> },
-    Tick(u64),
-    Finish,
-}
+/// `Extra` is `Infallible`, unlike the video pane's (which carries a
+/// `Preview` frame): `Progress::frame` is for showing the picture being
+/// built, and an audio render has no picture. The analysis is the only phase
+/// that reports at all, which is also the only phase that can be cancelled.
+/// See [`crate::gui::util::RenderMsg`] for the shared Begin/Tick/Finish core.
+type ProgressMsg = RenderMsg<std::convert::Infallible>;
 
-/// Reports progress from the render thread to the UI over a channel.
+/// Reports progress from the render thread to the UI over a channel. This
+/// pane needs nothing beyond the shared core (see [`ProgressMsg`]'s doc), so
+/// it uses [`crate::gui::util::ChannelProgress`] directly rather than
+/// wrapping it -- contrast the video pane's `ChannelProgress`, which adds
+/// throttled frame-preview reporting on top.
 ///
-/// Send failures are ignored on purpose: a closed channel means the UI went
-/// away, which must never abort a render that is otherwise fine.
-struct ChannelProgress {
-    tx: std::sync::mpsc::Sender<ProgressMsg>,
-    /// Set by the UI thread's Cancel button, read once per analysis frame by
-    /// `is_cancelled`.
-    cancel: Arc<AtomicBool>,
-}
-
-impl ChannelProgress {
-    fn new(tx: std::sync::mpsc::Sender<ProgressMsg>, cancel: Arc<AtomicBool>) -> Self {
-        Self { tx, cancel }
-    }
-}
-
-impl Progress for ChannelProgress {
-    fn begin(&mut self, label: &str, total: Option<u64>) {
-        let _ = self
-            .tx
-            .send(ProgressMsg::Begin { label: label.to_string(), total });
-    }
-    fn tick(&mut self, n: u64) {
-        let _ = self.tx.send(ProgressMsg::Tick(n));
-    }
-    fn finish(&mut self) {
-        let _ = self.tx.send(ProgressMsg::Finish);
-    }
-
-    /// Backed by the same `Arc<AtomicBool>` the UI thread's Cancel button
-    /// sets. `Relaxed` is enough: a single flag with no other state it must
-    /// stay ordered with.
-    ///
-    /// **A cancelled audio analysis returns a SHORT TRACK, not an error** --
-    /// `analyze` breaks out of its frame loop and normalises what it has, the
-    /// same way `build_brick_world` returns a partial world. That is why
-    /// [`deliver_world_unless_cancelled`] has to ask again afterwards: the
-    /// build succeeds, and writing its save would hand the user a silently
-    /// truncated song.
-    fn is_cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
-    }
-}
+/// **A cancelled audio analysis returns a SHORT TRACK, not an error** --
+/// `analyze` breaks out of its frame loop and normalises what it has, the
+/// same way `build_brick_world` returns a partial world. That is why
+/// [`deliver_world_unless_cancelled`] has to ask again afterwards: the build
+/// succeeds, and writing its save would hand the user a silently truncated
+/// song.
+type ChannelProgress = UtilChannelProgress<std::convert::Infallible>;
 
 /// The picked audio source: a path, its display name, and whatever the
 /// decoder could tell us about it without decoding.
@@ -241,10 +179,11 @@ pub struct AudioApp {
     /// original language first and the dub second, so which one is "first" is
     /// a container-ordering accident. Honoured by the ffmpeg backend only.
     audio_track: usize,
+    /// The shared ffmpeg download-consent + download modal. Bundles what used
+    /// to be a pending-consent path and an in-flight download `Promise`; see
+    /// [`FfmpegModal`].
     #[cfg(not(target_arch = "wasm32"))]
-    pending_ffmpeg_consent: Option<std::path::PathBuf>,
-    #[cfg(not(target_arch = "wasm32"))]
-    pending_ffmpeg_download: Option<Promise<Result<(), String>>>,
+    modal: FfmpegModal,
 
     /// The in-flight render, if any. `Some` from the moment `generate` spawns
     /// the worker until `poll_generate` observes it is ready -- while `Some`,
@@ -293,9 +232,7 @@ impl Default for AudioApp {
             backend: AudioBackend::Auto,
             audio_track: 0,
             #[cfg(not(target_arch = "wasm32"))]
-            pending_ffmpeg_consent: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            pending_ffmpeg_download: None,
+            modal: FfmpegModal::default(),
             pending_generate: None,
             progress_rx: None,
             progress_label: String::new(),
@@ -543,28 +480,15 @@ impl AudioApp {
     fn poll_generate(&mut self) {
         if let Some(rx) = &self.progress_rx {
             while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    ProgressMsg::Begin { label, total } => {
-                        self.progress_label = label;
-                        self.progress_total = total;
-                        self.progress_pos = 0;
-                    }
-                    // A total that came from an ESTIMATE can be low; the
-                    // shared rule grows it to meet the position rather than
-                    // letting the bar draw past 100% and the readout say
-                    // "137/100". See `progress::reconcile_total`.
-                    // A total that came from an ESTIMATE can be low; the
-                    // shared rule grows it to meet the position rather than
-                    // letting the bar draw past 100% and the readout say
-                    // "137/100". See `progress::reconcile_total`.
-                    ProgressMsg::Tick(n) => {
-                        let (pos, total) =
-                            crate::progress::reconcile_total(self.progress_total, n);
-                        self.progress_pos = pos;
-                        self.progress_total = total;
-                    }
-                    ProgressMsg::Finish => {}
-                }
+                // `apply_core` is the shared Begin/Tick/Finish bookkeeping
+                // (see `crate::gui::util::RenderMsg`); the `Extra` it could
+                // hand back is `Infallible`, so there is never a payload
+                // left to handle here.
+                let _: Option<std::convert::Infallible> = msg.apply_core(
+                    &mut self.progress_label,
+                    &mut self.progress_pos,
+                    &mut self.progress_total,
+                );
             }
         }
 
@@ -586,44 +510,18 @@ impl AudioApp {
         }
     }
 
-    /// Poll the in-flight ffmpeg download. On resolution the consent modal
-    /// closes either way and the user presses Generate again to retry --
-    /// resuming automatically would mean stashing every render option across
-    /// the download for a one-click saving.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn poll_ffmpeg_download(&mut self, ctx: &egui::Context) {
-        let Some(promise) = self.pending_ffmpeg_download.take() else {
-            return;
-        };
-        match promise.try_take() {
-            Ok(result) => {
-                self.pending_ffmpeg_consent = None;
-                match result {
-                    Ok(()) => info!("ffmpeg installed -- click Generate again to continue"),
-                    Err(e) => error!("{e}"),
-                }
-            }
-            Err(promise) => {
-                self.pending_ffmpeg_download = Some(promise);
-                // Nothing else is waking the event loop while the download
-                // runs on its own thread.
-                ctx.request_repaint();
-            }
-        }
-    }
-
     /// Whether opening `path` with the selected backend needs a download the
     /// user has not consented to yet.
     ///
     /// Performs the SAME open `generate`'s worker will make, with
     /// [`ensure_ffmpeg`]'s role played by a closure that records the request
     /// and refuses. Running it here, synchronously on the UI thread, is what
-    /// lets `draw_ffmpeg_modal` ask the question before any background work
-    /// starts -- a modal needs the UI thread to answer it, and a worker thread
-    /// has none. The source this opens is dropped immediately: it exists only
-    /// to answer the question, and the worker opens its own via the identical
-    /// call. This does briefly block the UI thread on a real probe, the same
-    /// tradeoff the video pane documents.
+    /// lets the modal ask the question before any background work starts -- a
+    /// modal needs the UI thread to answer it, and a worker thread has none.
+    /// The source this opens is dropped immediately: it exists only to answer
+    /// the question, and the worker opens its own via the identical call. This
+    /// does briefly block the UI thread on a real probe, the same tradeoff the
+    /// video pane documents.
     #[cfg(not(target_arch = "wasm32"))]
     fn check_ffmpeg_consent(&self, path: &std::path::Path) -> FfmpegCheck {
         let mut needs_consent = false;
@@ -648,57 +546,6 @@ impl AudioApp {
                 error!("{e}");
                 FfmpegCheck::Failed
             }
-        }
-    }
-
-    /// Shown while `pending_ffmpeg_consent` is `Some`: a real modal, rather
-    /// than `DownloadConsent::Ask`'s stdin prompt, which a window has no
-    /// terminal for. Neither path ever silently downloads or silently hangs.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn draw_ffmpeg_modal(&mut self, ctx: &egui::Context) {
-        if self.pending_ffmpeg_consent.is_none() {
-            return;
-        }
-
-        if self.pending_ffmpeg_download.is_some() {
-            egui::Modal::new(egui::Id::new("audio_ffmpeg_download_modal")).show(ctx, |ui| {
-                ui.set_max_width(360.0);
-                ui.heading("Downloading ffmpeg...");
-                ui.add(egui::ProgressBar::new(0.0).animate(true));
-            });
-            return;
-        }
-
-        let mut download = false;
-        let mut cancel = false;
-        egui::Modal::new(egui::Id::new("audio_ffmpeg_consent_modal")).show(ctx, |ui| {
-            ui.set_max_width(420.0);
-            ui.heading("Download ffmpeg?");
-            ui.label(format!(
-                "This file needs the ffmpeg decode backend, and no ffmpeg install was found \
-                 on this machine. Download it now from {}?",
-                ffmpeg_sidecar::download::ffmpeg_download_url()
-                    .unwrap_or("the official ffmpeg build server")
-            ));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Download").clicked() {
-                    download = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
-        });
-
-        if download {
-            self.pending_ffmpeg_download = Some(Promise::spawn_thread("ffmpeg_download", || {
-                ensure_ffmpeg(DownloadConsent::Always)
-            }));
-        }
-        if cancel {
-            info!("ffmpeg download declined; the audio was not converted");
-            self.pending_ffmpeg_consent = None;
         }
     }
 
@@ -899,8 +746,17 @@ impl AudioApp {
             format!("inner {:.0}", self.opts.inner_radius),
             format!("max {:.0} units", self.opts.max_distance),
         ];
+        // Sine is the default, so only a NON-sine waveform earns a chip -- the
+        // same "only the difference is worth a word" idiom as the two below.
+        if self.opts.tonal_synth != SynthWave::default() {
+            chips.push(format!("{} wave", self.opts.tonal_synth.flag()));
+        }
         if self.opts.speakers_in_chip {
             chips.push("in chip".to_string());
+        }
+        // Buttons are ON by default, so only their ABSENCE earns a chip.
+        if !self.opts.control_buttons {
+            chips.push("no buttons".to_string());
         }
         chips
     }
@@ -909,29 +765,19 @@ impl AudioApp {
         let d = AudioOptions::default();
         self.opts.inner_radius != d.inner_radius
             || self.opts.max_distance != d.max_distance
+            || self.opts.tonal_synth != d.tonal_synth
             || self.opts.speakers_in_chip != d.speakers_in_chip
+            || self.opts.control_buttons != d.control_buttons
     }
 
-    /// **The most valuable control on this pane.**
+    /// Every number behind it came from a listening session, not analysis,
+    /// and several reverse what the measurements said -- see [`AudioPreset`].
+    /// Selecting one seeds five settings and leaves them all editable.
     ///
-    /// Every number behind it came out of a listening session rather than out
-    /// of the analysis, and several of them reverse what the measurements
-    /// said -- see [`AudioPreset`]. Selecting one seeds five settings at once
-    /// and leaves all five editable.
-    /// **Drawn OUTSIDE the settings grid, on purpose.**
-    ///
-    /// Its hint is a paragraph, and an `egui::Grid` cell is the one place in
-    /// this pane that cannot lay a paragraph out: the cell does not report the
-    /// height the wrapped text actually drew, so the next row is placed on top
-    /// of it (that was the "Preset overlaps Pitch-Per-Speaker" bug). In the
-    /// pane's own vertical layout a label wraps to the full width and reserves
-    /// exactly the height it used, which is what the intro paragraph above it
-    /// has always done.
-    ///
-    /// Being first also suits it: every number behind it came out of a
-    /// listening session rather than out of the analysis, and several of them
-    /// reverse what the measurements said -- see [`AudioPreset`]. Selecting one
-    /// seeds five settings at once and leaves all five editable.
+    /// Drawn outside the settings grid: a `Grid` cell doesn't report the
+    /// height of wrapped text, so the next row draws on top of it (the
+    /// "Preset overlaps Pitch-Per-Speaker" bug). The pane's own vertical
+    /// layout doesn't have that problem.
     fn draw_preset_block(&mut self, ui: &mut Ui) {
         let mut chosen = None;
         ui.horizontal(|ui| {
@@ -1242,6 +1088,26 @@ impl AudioApp {
     }
 
     fn draw_speaker_rows(&mut self, ui: &mut Ui) {
+        // The waveform is a baked emitter property, exactly like the two radii
+        // below (it is written next to them in `add_emitter`), so it lives in
+        // this section rather than under Analysis -- and it applies in BOTH
+        // modes, so it is not gated on the band grid. The four basic waves are
+        // the whole list, Sine first (the default the selector opens on).
+        ui.label("Waveform").on_hover_text(
+            "The synth the TONAL bands play through -- the four basic waves. Sine (the \
+             default) is the classic bank tone; square, triangle and sawtooth are brighter \
+             and buzzier. Applies to tonal bands in both modes; white/pink noise bands keep \
+             their own noise assets and are unaffected.",
+        );
+        egui::ComboBox::from_id_salt("audio_synth")
+            .selected_text(self.opts.tonal_synth.name())
+            .show_ui(ui, |ui| {
+                for w in SynthWave::ALL {
+                    ui.selectable_value(&mut self.opts.tonal_synth, w, w.name());
+                }
+            });
+        ui.end_row();
+
         ui.label("Placement").on_hover_text(
             "Where the speaker cluster goes. Beside the chip on the main grid (the \
              default), or IN the microchip's own inner grid, which makes the whole audio \
@@ -1251,6 +1117,15 @@ impl AudioApp {
              sound, and costs nothing (same speakers, gates and wires).",
         );
         ui.checkbox(&mut self.opts.speakers_in_chip, "In microchip");
+        ui.end_row();
+
+        ui.label("Controls").on_hover_text(
+            "Pre-generate three physical Pause/Restart/Resume buttons on the main grid, \
+             wired into the clock so the render is controllable out of the box. Off means \
+             you wire the clock's control pins yourself. Adds 9 bricks and 6 wires; no \
+             extra gate.",
+        );
+        ui.checkbox(&mut self.opts.control_buttons, "Control buttons");
         ui.end_row();
 
         ui.label("Inner Radius").on_hover_text(
@@ -1459,49 +1334,20 @@ impl AudioApp {
         // A render already in flight: no button at all, so a second click
         // cannot start a second one.
         if self.pending_generate.is_some() {
-            // egui only repaints on input by default; without this the bar
-            // would advance only when the user happened to move the mouse.
-            ui.ctx().request_repaint();
-            match self.progress_total {
-                Some(total) if total > 0 => {
-                    let frac = self.progress_pos as f32 / total as f32;
-                    ui.add(egui::ProgressBar::new(frac).text(format!(
-                        "{} {}/{}",
-                        self.progress_label, self.progress_pos, total
-                    )));
-                }
-                // Unknown total: an animated indeterminate bar, never a
-                // fabricated fraction that would reach 100% and keep going.
-                _ => {
-                    ui.add(
-                        egui::ProgressBar::new(0.0)
-                            .animate(true)
-                            .text(self.progress_label.clone()),
-                    );
-                }
-            }
+            draw_progress_bar(ui, &self.progress_label, self.progress_pos, self.progress_total);
             // Only the ANALYSIS polls the cancel flag; the world build and
             // the brz encode that follow it are not interruptible, so a
             // cancel late in a long render still has to finish the build
             // before it can decline to write it.
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(flag) = &self.cancel_flag {
-                ui.add_space(4.0);
-                let cancelling = flag.load(Ordering::Relaxed);
-                ui.add_enabled_ui(!cancelling, |ui| {
-                    if ui
-                        .add(Button::new(if cancelling { "Cancelling..." } else { "Cancel" }))
-                        .clicked()
-                    {
-                        flag.store(true, Ordering::Relaxed);
-                    }
-                });
+                draw_cancel_button(ui, flag);
             }
             return;
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        if self.pending_ffmpeg_consent.is_some() {
+        if self.modal.is_open() {
             ui.label("Waiting on the ffmpeg download prompt above...");
             return;
         }
@@ -1537,22 +1383,12 @@ impl AudioApp {
     }
 
     /// On click: open the source -> analyse -> build the speaker world ->
-    /// encode -> deliver.
-    ///
-    /// **This is the CLI's path, not a second one.** `open_audio_ensuring` ->
-    /// `analyze`/`analyze_voices` -> `build_speaker_world`/`build_voice_world`
-    /// is exactly what `main.rs`'s `--audio-mode` branch does, dispatched on
-    /// the same [`AudioMode`] and handed the same [`AudioOptions`] the cost
-    /// readout just described. Nothing here reimplements a step of it.
-    ///
-    /// The heavy work runs on a background thread on native, mirroring the
-    /// video pane: capture what a render needs out of `self`/`shared` up
-    /// front (all of it plain `Copy` data or one `PathBuf`), move it into a
-    /// `work` closure, spawn it, and hand back a `Promise` for
-    /// `poll_generate` to collect. `wasm32` has no usable `std::thread::spawn`
-    /// -- and no picker either, so this cannot actually be reached there.
-    ///
-    /// Every failure is logged through `log::error!`, never panicked.
+    /// encode -> deliver. Same path as `main.rs`'s `--audio-mode` branch,
+    /// dispatched on the same [`AudioMode`]/[`AudioOptions`] -- nothing here
+    /// reimplements a step of it. Runs on a background thread on native (the
+    /// captured state is all `Copy` or one `PathBuf`); `wasm32` has no
+    /// `std::thread::spawn` and no picker, so this path is unreachable there.
+    /// Every failure is logged via `log::error!`, never panicked.
     fn generate(&mut self, shared: &SharedOptions) {
         if self.pending_generate.is_some() {
             return error!("a render is already in progress");
@@ -1565,7 +1401,7 @@ impl AudioApp {
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        if self.pending_ffmpeg_consent.is_some() || self.pending_ffmpeg_download.is_some() {
+        if self.modal.is_open() {
             return error!("waiting on the ffmpeg download prompt");
         }
 
@@ -1582,7 +1418,7 @@ impl AudioApp {
         match self.check_ffmpeg_consent(&path) {
             FfmpegCheck::Ready => {}
             FfmpegCheck::NeedsConsent => {
-                self.pending_ffmpeg_consent = Some(path);
+                self.modal.request(path);
                 return;
             }
             // Already logged by `check_ffmpeg_consent`.
@@ -1696,9 +1532,6 @@ impl AudioApp {
                         opts.peak_gate,
                     );
                     if progress.is_cancelled() {
-                        // Fully qualified rather than imported: this file
-                        // names no other `brdb` type, so a one-off keeps the
-                        // import block untouched.
                         brdb::World::new()
                     } else {
                         build_speaker_world(&track, &opts)?
@@ -1740,9 +1573,20 @@ impl AudioApp {
         self.poll_picks();
         self.poll_generate();
         #[cfg(not(target_arch = "wasm32"))]
-        self.poll_ffmpeg_download(ui.ctx());
-        #[cfg(not(target_arch = "wasm32"))]
-        self.draw_ffmpeg_modal(ui.ctx());
+        {
+            self.modal.poll(ui.ctx());
+            // Reworded slightly from the video pane's prompt: this pane also
+            // accepts a plain audio file, so "This file" rather than "This
+            // video". The URL is the mirror ffmpeg-sidecar fetches from.
+            let prompt = format!(
+                "This file needs the ffmpeg decode backend, and no ffmpeg install was found \
+                 on this machine. Download it now from {}?",
+                ffmpeg_sidecar::download::ffmpeg_download_url()
+                    .unwrap_or("the official ffmpeg build server")
+            );
+            self.modal
+                .draw(ui.ctx(), "audio", &prompt, "the audio was not converted");
+        }
         self.draw_settings(ui, shared);
         self.draw_input(ui);
         ui.add_space(8.0);
@@ -1805,12 +1649,6 @@ mod tests {
         app
     }
 
-    /// **The pane must not draw a bar past 100%.** A total that came from an
-    /// estimate can be low, and the render then ticks past it -- which used to
-    /// leave `progress_pos > progress_total`, i.e. a fraction above 1 handed
-    /// to `egui::ProgressBar` and a readout saying "137/100". The length grows
-    /// to meet the position instead, so the count stays honest and the bar
-    /// simply sits at full.
     #[test]
     fn ticking_past_an_estimated_total_grows_it_rather_than_overflowing_the_bar() {
         let mut app = AudioApp::default();
@@ -1834,8 +1672,6 @@ mod tests {
         );
     }
 
-    /// A phase with no total at all stays totalless however far it ticks --
-    /// the indeterminate bar must never acquire a fabricated denominator.
     #[test]
     fn ticking_a_totalless_phase_never_invents_a_denominator() {
         let mut app = AudioApp::default();
@@ -1848,9 +1684,6 @@ mod tests {
         assert_eq!(app.progress_pos, 9_999);
     }
 
-    /// The two settings the brief calls out as right for EVERY source must be
-    /// the pane's defaults, with no preset selected at all -- not something a
-    /// user has to go and find.
     #[test]
     fn a_fresh_pane_starts_with_no_noise_bands_and_full_leveling() {
         let app = AudioApp::default();
@@ -1859,9 +1692,6 @@ mod tests {
         assert_eq!(app.audio_opts().leveling, 1.0);
     }
 
-    /// Selecting a preset must move the five settings it carries all the way
-    /// into the options the render is built from -- not just into some UI
-    /// mirror of them.
     #[test]
     fn selecting_a_preset_reaches_the_options_the_render_uses() {
         let mut app = AudioApp::default();
@@ -1879,8 +1709,6 @@ mod tests {
         );
     }
 
-    /// **A preset is a seed, not a lock.** Every control has to stay editable
-    /// afterwards, including the ones the preset just wrote.
     #[test]
     fn every_control_is_still_editable_after_a_preset_is_applied() {
         let mut app = AudioApp::default();
@@ -1905,9 +1733,6 @@ mod tests {
         assert_eq!(app.preset, AudioPreset::Tonal);
     }
 
-    /// Switching between presets must fully replace the previous one's
-    /// values, not leave a mix of the two -- a half-applied preset is a
-    /// combination nobody listened to.
     #[test]
     fn switching_presets_replaces_every_value_rather_than_merging_them() {
         let mut app = AudioApp::default();
@@ -1924,9 +1749,8 @@ mod tests {
         assert_eq!(app.audio_opts().bands, None, "chiptune wants the full span");
     }
 
-    /// The Bands checkbox's shadow value must survive a round trip through
-    /// "every band", so unticking and re-ticking does not silently reset a
-    /// tuned span.
+    // The Bands checkbox's shadow value must survive a round trip through
+    // "every band" without resetting a tuned span.
     #[test]
     fn the_band_limit_remembers_its_value_across_a_round_trip() {
         let mut app = AudioApp::default();
@@ -1940,9 +1764,7 @@ mod tests {
         assert_eq!(app.audio_opts().bands, Some(42));
     }
 
-    /// **The `--subdiv` rule.** Only multiples of 12 land on real semitones,
-    /// and the dropdown is what makes anything else unreachable -- so every
-    /// value it offers must be one the renderer accepts.
+    // Only multiples of 12 land on real semitones.
     #[test]
     fn every_subdiv_the_widget_offers_is_accepted_by_the_renderer() {
         for s in SUBDIVS {
@@ -1954,9 +1776,6 @@ mod tests {
         }
     }
 
-    /// And the other half of the same rule: a value off the grid, if one ever
-    /// reached the struct, must be refused by BOTH the readout and the
-    /// Generate path rather than silently rendering out of tune.
     #[test]
     fn a_subdiv_off_the_semitone_grid_is_refused_by_the_readout_and_the_button() {
         let mut app = AudioApp::default();
@@ -1970,10 +1789,8 @@ mod tests {
         );
     }
 
-    /// **The flag whose meaning changes with the mode.** 0 is the documented
-    /// "every band" escape hatch in bank mode and a save with no speakers in
-    /// voice mode, so switching modes with a 0 in the box has to be caught --
-    /// this is the exact transition a per-mode slider range alone would miss.
+    // 0 is the documented "every band" escape hatch in bank mode and a save
+    // with no speakers in voice mode.
     #[test]
     fn a_zero_speaker_count_is_legal_in_bank_mode_and_refused_after_switching_to_voice() {
         let mut app = AudioApp::default();
@@ -1988,8 +1805,6 @@ mod tests {
         assert_eq!(app.min_voices(), 1, "voice mode's slider must not offer 0");
     }
 
-    /// The same control, two names. A fixed label would mislead in one mode
-    /// or the other whichever wording it chose.
     #[test]
     fn the_speaker_control_is_labelled_for_the_mode_it_is_in() {
         let mut app = AudioApp::default();
@@ -2004,8 +1819,6 @@ mod tests {
         assert!(app.max_voices_hint().contains("NUMBER OF SPEAKERS BUILT"));
     }
 
-    /// The band-grid controls are inert in voice mode -- there is no grid --
-    /// so they must be hidden there rather than offered and ignored.
     #[test]
     fn the_band_grid_controls_are_shown_only_where_they_do_something() {
         let mut app = AudioApp::default();
@@ -2015,9 +1828,7 @@ mod tests {
         assert!(!app.shows_band_grid_controls());
     }
 
-    /// **The readout must describe the build that will happen.** Every
-    /// setting that changes the graph has to move it, through the one
-    /// `audio_opts()` both it and `generate` read.
+    // Both the readout and `generate` read the one `audio_opts()`.
     #[test]
     fn the_live_estimate_follows_every_setting_that_changes_the_build() {
         let mut app = with_source(60.0);
@@ -2046,9 +1857,6 @@ mod tests {
         assert_eq!(app.live_cost().unwrap().frames, 10);
     }
 
-    /// Voice mode writes a pitch AND a volume per speaker, so the readout has
-    /// to count two streams per speaker there. A readout that counted one
-    /// would be exactly half right and look entirely plausible.
     #[test]
     fn the_readout_counts_two_streams_per_speaker_in_voice_mode() {
         let mut app = with_source(30.0);
@@ -2060,9 +1868,7 @@ mod tests {
         assert_eq!(c.elements, 32 * c.frames);
     }
 
-    /// With no duration to work from, the readout still has exact numbers for
-    /// everything that does not depend on length -- and reports the
-    /// single-bank floor rather than inventing a frame count.
+    // Reports the single-bank floor rather than inventing a frame count.
     #[test]
     fn an_unprobed_source_still_costs_everything_that_does_not_depend_on_length() {
         let app = AudioApp::default();
@@ -2073,8 +1879,6 @@ mod tests {
         assert_eq!(c.frames, 0);
     }
 
-    /// A source whose container carries no duration is a real answer, not a
-    /// failure: the render measures the length itself.
     #[test]
     fn a_source_with_no_duration_hint_has_no_frame_estimate() {
         let mut app = AudioApp::default();
@@ -2087,9 +1891,6 @@ mod tests {
         assert!(app.live_cost().is_ok());
     }
 
-    /// `audio_opts` must clamp the frame cap exactly as the CLI's own
-    /// `audio_options` does -- the sentinel that re-enables an unbounded
-    /// analysis loop must not be reachable from a control here either.
     #[test]
     fn the_frame_cap_is_clamped_the_way_the_cli_clamps_it() {
         let mut app = AudioApp::default();
@@ -2099,8 +1900,6 @@ mod tests {
         assert_eq!(app.audio_opts().max_frames, 1, "0 frames is not a render");
     }
 
-    /// Every window the dropdown offers must actually be usable -- an option
-    /// the renderer would refuse is worse than one that was never offered.
     #[test]
     fn every_window_the_widget_offers_is_costable() {
         for w in WINDOW_SIZES {
@@ -2111,10 +1910,6 @@ mod tests {
         }
     }
 
-    /// Every band count a preset carries must be reachable on the slider, or
-    /// the preset could be selected but never restored by hand -- and the
-    /// slider's top must be a value that is legal at SOME subdivision, so the
-    /// range is wide rather than merely arbitrary.
     #[test]
     fn the_bands_slider_covers_every_preset_and_the_widest_legal_span() {
         for p in AudioPreset::ALL {
@@ -2136,9 +1931,8 @@ mod tests {
         );
     }
 
-    /// Gain above 1.0 only clamps, so the pane must not offer a range that
-    /// implies otherwise. Pinning the constant here rather than trusting the
-    /// widget literal, which no test can click.
+    // Gain above 1.0 only clamps; pinning the constant here since no test
+    // can click the widget itself.
     #[test]
     fn the_gain_default_sits_at_the_top_of_the_offered_range() {
         assert_eq!(
@@ -2149,18 +1943,10 @@ mod tests {
         );
     }
 
-    /// **The whole point of the readout, end to end.**
-    ///
-    /// Not "the estimator agrees with a formula" -- the estimator's own tests
-    /// cover that. This drives the pane's real options through the real
-    /// pipeline (`analyze` -> `build_speaker_world`, the same two calls
-    /// `generate`'s worker makes and the same two `main.rs` makes) and checks
-    /// that the world which comes out is the one the user was shown, down to
-    /// the gate.
-    ///
-    /// A readout that disagrees with its render has shipped twice in this
-    /// codebase. Both times the estimate looked entirely plausible; the only
-    /// thing that would have caught either is a test that built the thing.
+    // Drives the real pipeline (`analyze` -> `build_speaker_world`, the same
+    // calls `generate` and `main.rs` make) rather than checking the estimator
+    // against its own formula -- a readout that disagreed with its render has
+    // shipped before, and only building the thing would have caught it.
     #[test]
     fn the_readout_describes_the_world_the_bank_pipeline_actually_builds() {
         let clip = tone(4.0);
@@ -2192,9 +1978,8 @@ mod tests {
         assert_eq!(predicted.bricks, world.bricks.len(), "bricks");
     }
 
-    /// The same, through the other renderer -- which writes two streams per
-    /// speaker, so a readout that was right about bank mode can still be
-    /// exactly half right here.
+    // Voice mode writes two streams per speaker, so a readout right about
+    // bank mode could still be exactly half right here.
     #[test]
     fn the_readout_describes_the_world_the_voice_pipeline_actually_builds() {
         let clip = tone(4.0);
@@ -2220,9 +2005,6 @@ mod tests {
         assert_eq!(predicted.bricks, world.bricks.len(), "bricks");
     }
 
-    /// A preset must be renderable, not merely storable: every one of them is
-    /// driven all the way to a built world here, so a set of listened-for
-    /// numbers cannot ship as a combination the pipeline refuses.
     #[test]
     fn every_preset_renders_a_real_world_at_the_settings_it_carries() {
         let clip = tone(3.0);
@@ -2247,18 +2029,10 @@ mod tests {
         }
     }
 
-    /// **An inverted Inner Radius / Max Distance pair is refused BEFORE the
-    /// render, not after it.**
-    ///
-    /// Both are plain `DragValue`s with nothing coupling them (1..=100_000 and
-    /// 1..=1_000_000), so the pair is two drags away. It used to show a full,
-    /// plausible cost -- speakers, streams, gates, wires, bricks, frames --
-    /// offer Generate, run the entire analysis, and only then fail inside
-    /// `build_speaker_world`, with nothing written. The pane's contract is that
-    /// an impossible render is refused before Generate is offered, so
-    /// `validate` and `live_cost` must BOTH refuse it: `draw_submit` reads the
-    /// first and `draw_cost` the second, and a readout showing a cost beside a
-    /// "Cannot render" is the same contradiction the other way round.
+    // Inner Radius and Max Distance are plain DragValues with nothing coupling
+    // them, so both `validate` (draw_submit's gate) and `live_cost`
+    // (draw_cost's) must refuse an inverted pair, or the readout would show a
+    // cost beside a "Cannot render".
     #[test]
     fn an_inverted_attenuation_pair_is_refused_before_the_render() {
         for mode in [AudioMode::Bank, AudioMode::Voice] {
@@ -2286,8 +2060,7 @@ mod tests {
         }
     }
 
-    /// The other half of the same guard: a radius that is not a positive finite
-    /// number encodes perfectly and is audible nowhere.
+    // A non-positive or non-finite radius encodes fine and is audible nowhere.
     #[test]
     fn a_zero_or_non_finite_radius_is_refused_before_the_render() {
         for (inner, max) in [(0.0, 4000.0), (400.0, 0.0), (f32::NAN, 4000.0)] {
@@ -2301,9 +2074,6 @@ mod tests {
         }
     }
 
-    /// Both modes must be reachable and must produce genuinely different
-    /// builds; a mode radio that changed only a label would pass every other
-    /// test here.
     #[test]
     fn the_two_modes_build_different_graphs_from_the_same_source() {
         let mut app = with_source(45.0);

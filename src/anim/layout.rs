@@ -85,10 +85,9 @@ pub const STAGE_PITCH: i32 = 15;
 /// Height offset applied to the whole staged lattice, lifting every brick in
 /// the chip off the interaction plane instead of starting flush against it.
 ///
-/// Local **Z is up** inside the chip -- the plane lies flat, so its normal is
+/// Local Z is up inside the chip -- the plane lies flat, so its normal is
 /// world up. (X and Y are the two in-plane horizontal axes; shifting either
-/// one moves gates sideways, which is what made two earlier attempts to
-/// "raise" the gates go astray.) Every brick in the chip picks this up: the
+/// moves gates sideways, not up.) Every brick in the chip picks this up: the
 /// pixel gates and the service gates call [`lattice_pos_staged`] directly,
 /// and the clock and its I/O pins derive their positions from the service
 /// origin, so a single constant moves the whole graph.
@@ -127,7 +126,7 @@ pub fn lattice_pos(col: i32, row: i32, stage: i32, height: i32, half: IntVector)
 
 /// Scan `boxes` (as `(min, max)` corners) for an intersecting pair.
 ///
-/// Returns the first pair found, plus **how many pairs were actually tested** --
+/// Returns the first pair found, plus how many pairs were actually tested --
 /// which is what the tests below assert on, because the whole point of this
 /// function is that the second number does not grow quadratically.
 ///
@@ -434,7 +433,7 @@ mod tests {
         (*state >> 33) as i32
     }
 
-    /// **The check that the optimisation preserved exactly what it detects.**
+    /// The check that the optimisation preserved exactly what it detects.
     ///
     /// A spatial hash that missed a pair would turn this module's whole purpose
     /// -- catching bricks the game will silently drop -- into a no-op that
@@ -501,13 +500,13 @@ mod tests {
         assert!(saw_clear > 20, "only {saw_clear} clear cases -- not a real sweep");
     }
 
-    /// **The complexity itself, as a number rather than as a stopwatch.**
+    /// The complexity itself, as a number rather than as a stopwatch.
     ///
     /// `overlap_scan` reports how many pairs it actually tested, so this pins
     /// the growth directly and deterministically: an all-pairs loop over the
     /// same lattice tests `n*(n-1)/2`, which for the 41,472 pixel gates of a
     /// 192x108 render is ~8.6e8. A bounded number of neighbours per box means
-    /// the count grows LINEARLY, so doubling the lattice must roughly double
+    /// the count grows linearly, so doubling the lattice must roughly double
     /// the work rather than quadruple it.
     #[test]
     fn the_overlap_scan_is_proportional_to_the_brick_count() {

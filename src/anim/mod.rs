@@ -1,8 +1,10 @@
 pub mod bricks;
+pub mod cascade;
 pub mod chip;
 pub mod clock;
 pub mod color_bricks;
 pub mod color_pack;
+pub mod controls;
 pub mod cost;
 pub mod layout;
 pub mod pack;
@@ -32,7 +34,7 @@ pub enum AnimEncoding {
     #[default]
     Hex,
     /// Pixel-major linear colour arrays (see [`color_bricks`] and
-    /// [`color_pack`]). One `ArrayVar` per PIXEL holding that pixel's colour
+    /// [`color_pack`]). One `ArrayVar` per pixel holding that pixel's colour
     /// for every frame, read by that pixel's own `ArrayVar_Get` straight into
     /// its display brick's `Color`.
     ///
@@ -75,7 +77,7 @@ impl AnimEncoding {
 
     /// The build-cost estimate for this encoding. The two formulas are
     /// genuinely different -- colour-array mode has no chunks, no characters,
-    /// and a per-PIXEL select at every bank boundary -- so this dispatches
+    /// and a per-pixel select at every bank boundary -- so this dispatches
     /// rather than sharing one approximate number between them.
     ///
     /// Takes the whole [`bricks::AnimOptions`] for the same reason
@@ -97,7 +99,7 @@ impl AnimEncoding {
     }
 }
 
-/// Which MEDIUM an animated render is built from.
+/// Which medium an animated render is built from.
 ///
 /// Text mode is not a third [`AnimEncoding`]: it uses different bricks
 /// (`Component_TextDisplay` instead of a display brick per pixel), different
@@ -167,28 +169,20 @@ impl AnimMode {
     }
 
     /// The build-cost estimate for this mode. Dispatches to
-    /// [`AnimEncoding::estimate`] or [`cost::estimate_text`], which is exactly
-    /// why text mode is not folded into [`AnimEncoding`]: the two shapes
-    /// aren't reconcilable into one formula.
+    /// [`AnimEncoding::estimate`] or [`cost::estimate_text`], since the two
+    /// cost shapes aren't reconcilable into one formula.
     ///
-    /// Takes the whole [`bricks::AnimOptions`] rather than loose numbers so the
-    /// estimate can never describe a different graph from the one
-    /// [`Self::build`] would produce from the same options. Text mode's band
-    /// count depends on `opts.text.char_repeat`, and passing that separately
-    /// invited exactly the mismatch it caused once already: a `--font` with a
-    /// single-glyph cell bands 192x108 36 ways while the readout still claimed
-    /// 54. `opts.subtitles` is the second instance of the same class -- two
-    /// gates built and not counted -- and the reason the estimators BELOW now
-    /// take the options too rather than a `bank_size` plucked out of them.
+    /// Takes the whole [`bricks::AnimOptions`] rather than loose numbers so
+    /// the estimate can never describe a different graph from the one
+    /// [`Self::build`] would produce from the same options -- see [`cost`]'s
+    /// module doc.
     ///
     /// `Err` only from text mode, and only for a geometry
     /// [`text_layout::plan_bands`] cannot lay out at all (too wide for the
-    /// component character limit). Both brick encodings are total. The error is
-    /// the one [`Self::build`] would fail with, so a caller that shows this in
-    /// place of a cost tells the user exactly what pressing Generate would
-    /// tell them -- rather than the plausible, unusually cheap "5 gate(s), 1
-    /// brick(s)" a swallowed layout error used to read as. See
-    /// [`cost::estimate_text`].
+    /// component character limit). Both brick encodings are total. The error
+    /// is the one [`Self::build`] would fail with, so a caller that shows
+    /// this in place of a cost tells the user exactly what pressing Generate
+    /// would tell them. See [`cost::estimate_text`].
     pub fn estimate(
         &self,
         width: u32,

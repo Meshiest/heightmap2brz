@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables)]
-
 use super::logger;
 use crate::gui::audio::AudioApp;
 use crate::gui::heightmap::HeightmapApp;
@@ -7,8 +5,6 @@ use crate::gui::text::TextApp;
 use crate::gui::video::VideoApp;
 use eframe::App;
 use egui::{CentralPanel, Color32, Context, Id, ScrollArea, TopBottomPanel, Ui};
-
-type Progress = (&'static str, f32);
 
 pub struct BrzApp {
     always_on_top: bool,
@@ -127,7 +123,7 @@ impl BrzApp {
 }
 
 impl App for BrzApp {
-    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         CentralPanel::default().show(ctx, |ui| {
             self.draw_header(ui);
             ui.horizontal(|ui| {
@@ -145,8 +141,8 @@ impl App for BrzApp {
             ScrollArea::vertical()
                 .max_height((ui.available_height() - 50.0).max(50.0))
                 .show(ui, |ui| match self.pane {
-                    Menu::Image => self.heightmap.draw(ui, ctx, frame, &mut self.shared, true),
-                    Menu::Heightmap => self.heightmap.draw(ui, ctx, frame, &mut self.shared, false),
+                    Menu::Image => self.heightmap.draw(ui, ctx, &mut self.shared, true),
+                    Menu::Heightmap => self.heightmap.draw(ui, ctx, &mut self.shared, false),
                     Menu::Text => self.text.draw(ui, &mut self.shared),
                     Menu::Video => self.video.draw(ui, &mut self.shared),
                     Menu::Audio => self.audio.draw(ui, &mut self.shared),

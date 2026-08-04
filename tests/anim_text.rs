@@ -353,15 +353,15 @@ fn the_text_cost_estimate_matches_a_real_render() {
             .expect("build");
         let est = cost::estimate_text(w, h, n, &opts).expect("a legal geometry must estimate");
 
-        // Gates are every inner-grid brick that is not one of the clock's five
-        // I/O pins (Pause, Restart, Resume, Rate, Done).
+        // Gates are every inner-grid brick that is not one of the clock's seven
+        // I/O pins (Pause, Restart, Resume, Rate, Done, Length, Progress).
         let inner = world.grids[0].1.len();
         assert_eq!(
-            inner - 5,
+            inner - 7,
             est.gates,
             "{w}x{h}x{n} bank {bank}: estimate said {} gates, the render emitted {}",
             est.gates,
-            inner - 5
+            inner - 7
         );
         assert_eq!(
             world.wires.len(),
@@ -395,7 +395,7 @@ fn the_text_cost_estimate_matches_a_subtitled_render() {
             .build(&support::clip(64, 36, 6), &opts, &mut NoProgress)
             .expect("build");
         let est = cost::estimate_text(64, 36, 6, &opts).expect("a legal geometry must estimate");
-        assert_eq!(world.grids[0].1.len() - 5, est.gates, "bank {bank}: gate count");
+        assert_eq!(world.grids[0].1.len() - 7, est.gates, "bank {bank}: gate count");
         assert_eq!(world.wires.len(), est.wires, "bank {bank}: wire count");
         assert_eq!(world.bricks.len(), est.bricks, "bank {bank}: brick count");
     }

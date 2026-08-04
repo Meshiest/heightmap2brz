@@ -2,18 +2,16 @@
 //! adapted to the one shape everything downstream assumes -- mono `f32` at
 //! [`TARGET_RATE`].
 //!
-//! Split the same way [`crate::video::ffmpeg`] splits its source from its
-//! stream: [`SymphoniaSource`] holds nothing but the path, and every
+//! [`SymphoniaSource`] holds nothing but the path, and every
 //! [`AudioSource::open`] re-probes from scratch. That is what makes two opens
 //! agree sample for sample, which the two-pass band analysis in
-//! [`crate::audio::track`] depends on -- see [`AudioSource`]'s own doc for why
-//! this project declined a `rewind()` on both the video and audio sides.
+//! [`crate::audio::track`] depends on.
 //!
-//! This is the ONLY decode path the web build has: there is no ffmpeg on
+//! This is the only decode path the web build has: there is no ffmpeg on
 //! wasm, which is why `symphonia` sits in the unconditional `[dependencies]`
 //! block next to `rustfft` rather than the native-only one.
 
-use crate::audio::source::{AudioInfo, AudioSource, AudioStream};
+use crate::audio::source::{AudioInfo, AudioSource, AudioStream, first_non_finite};
 use std::path::{Path, PathBuf};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder, DecoderOptions};
@@ -47,22 +45,18 @@ impl SymphoniaSource {
     ///
     /// Everything that can be wrong with the file -- missing, not audio, no
     /// audio track, a codec this build was not compiled with -- is an error
-    /// HERE, at open time, rather than a surprise part-way through a render.
+    /// here, at open time, rather than a surprise part-way through a render.
     pub fn open_path(path: &Path) -> Result<Self, String> {
         let probed = probe_file(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             info: AudioInfo {
-                // Always the ADAPTED rate, never `probed.rate`. Every stream
+                // Always the adapted rate, never `probed.rate`. Every stream
                 // this source hands out resamples to it.
                 sample_rate: TARGET_RATE,
                 duration_hint: probed.duration,
             },
         })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 
@@ -101,7 +95,7 @@ struct Probed {
 /// Opens and probes `path`, building a demuxer and a decoder for its first
 /// real audio track.
 ///
-/// Called by BOTH [`SymphoniaSource::open_path`] and [`AudioSource::open`],
+/// Called by both [`SymphoniaSource::open_path`] and [`AudioSource::open`],
 /// from the same path with no retained state in between, which is exactly
 /// what makes two opens agree sample for sample.
 fn probe_file(path: &Path) -> Result<Probed, String> {
@@ -109,7 +103,7 @@ fn probe_file(path: &Path) -> Result<Probed, String> {
         .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
 
-    // The extension is a HINT, not a decision: symphonia still sniffs the
+    // The extension is a hint, not a decision: symphonia still sniffs the
     // actual bytes, so a `.wav` full of MP3 (or of junk, as the tests check)
     // is handled on its contents.
     let mut hint = Hint::new();
@@ -163,7 +157,7 @@ struct SymphoniaStream {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
     track_id: u32,
-    /// Carried ACROSS packets on purpose. See [`LinearResampler`].
+    /// Carried across packets on purpose. See [`LinearResampler`].
     resampler: LinearResampler,
     /// Reused between packets: interleaved `f32` in the decoder's own layout.
     sample_buf: Option<SampleBuffer<f32>>,
@@ -174,7 +168,7 @@ struct SymphoniaStream {
     /// Reused between packets: the downmixed mono block.
     mono: Vec<f32>,
     /// Source-rate frames decoded so far, so a rejected sample can be named
-    /// by its index in the SOURCE rather than by its offset in some packet
+    /// by its index in the source rather than by its offset in some packet
     /// the caller never sees.
     frames_seen: u64,
     done: bool,
@@ -244,7 +238,7 @@ impl AudioStream for SymphoniaStream {
             let sample_buf = self.sample_buf.as_mut().expect("just built above");
             sample_buf.copy_interleaved_ref(decoded);
 
-            // Mono is the AVERAGE of the channels, never their sum. Summing a
+            // Mono is the average of the channels, never their sum. Summing a
             // correlated stereo pair -- which nearly every mixed track is,
             // especially in the bass -- doubles it straight into clipping,
             // and the clipping happens here, before any of the normalisation
@@ -258,14 +252,9 @@ impl AudioStream for SymphoniaStream {
                     .map(|frame| frame.iter().sum::<f32>() * inv),
             );
 
-            // Non-finite samples die HERE, at the source, or they get
-            // laundered into full scale downstream: `f32::NAN.min(1.0)` is
-            // `1.0`, so `track::analyze`'s clamp turns a single NaN into a
-            // whole bank of speakers at maximum volume with nothing having
-            // errored anywhere. Measured on this codebase: one NaN sample
-            // produced 90 volumes of exactly 1.0 (three poisoned STFT windows
-            // across 30 bands). That is a listener-safety problem as much as a
-            // correctness one.
+            // Non-finite samples die here, at the source: `f32::NAN.min(1.0)`
+            // is `1.0`, so `track::analyze`'s clamp would otherwise launder a
+            // single NaN into a whole bank of speakers at maximum volume.
             if let Some((at, value)) = first_non_finite(&self.mono, self.frames_seen) {
                 self.done = true;
                 return Err(format!(
@@ -286,39 +275,19 @@ impl AudioStream for SymphoniaStream {
     }
 }
 
-/// The global index and value of the first non-finite sample in `block`,
-/// where `base` is `block[0]`'s index in the whole decoded stream.
-///
-/// Split out as a free function so the rejection rule can be tested directly
-/// on a NaN a decoder would only produce on a corrupt file.
-fn first_non_finite(block: &[f32], base: u64) -> Option<(u64, f32)> {
-    block
-        .iter()
-        .position(|s| !s.is_finite())
-        .map(|i| (base + i as u64, block[i]))
-}
-
 /// Linear interpolation from the source rate to [`TARGET_RATE`], with the
 /// read position carried across packet boundaries.
 ///
-/// **Linear is adequate here and nowhere else.** The band bank's finest
-/// resolution is 2.75 semitones, and linear interpolation's artefacts sit far
-/// below that -- what reaches the save is 32 band ENERGIES, not a waveform
-/// anybody listens to. A polyphase resampler would cost real time per render
-/// and change nothing a band could see.
+/// Linear is adequate here because the save gets band energies, not a raw
+/// waveform, so interpolation error does not matter the way it would for
+/// audio samples.
 ///
-/// **The state has to persist across packets.** Resetting the read position
-/// at every packet boundary re-reads each packet from its first sample, which
-/// puts a discontinuity at the packet rate -- ~38 Hz for MP3 at 44.1 kHz, an
-/// audible buzz -- while leaving the total sample count close enough that no
-/// length assertion notices. That is why `pos_*`, `consumed` and `prev` live
-/// on the stream and not inside a per-packet call.
+/// State (`pos_*`, `consumed`, `prev`) must persist across packets, or
+/// resetting the read position at every boundary buzzes at the packet rate.
 ///
 /// The position is an exact rational (`pos_int + pos_frac / TARGET_RATE`)
-/// rather than an accumulated `f64`, so it cannot drift: 11.4 million
-/// additions of 0.91875 do accumulate rounding, and a resampler that drifts
-/// desynchronises the audio from the video it is meant to accompany over the
-/// length of a track.
+/// rather than an accumulated `f64`, specifically so it cannot drift over the
+/// length of a long file.
 #[derive(Debug, Default)]
 struct LinearResampler {
     /// Global index of the input sample at or before the next output.
@@ -335,9 +304,9 @@ struct LinearResampler {
 impl LinearResampler {
     /// Appends the outputs that `block` (at `rate` Hz) makes available.
     ///
-    /// Emits only outputs whose BOTH interpolation ends are already known, so
-    /// the last sample of every block is held back in `prev` and used by the
-    /// next call. Nothing is dropped and nothing is re-read.
+    /// Emits only outputs whose interpolation ends are both already known,
+    /// so the last sample of every block is held back in `prev` and used by
+    /// the next call. Nothing is dropped and nothing is re-read.
     fn push(&mut self, block: &[f32], rate: u32, out: &mut Vec<f32>) {
         if block.is_empty() {
             return;
@@ -471,12 +440,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // --- Tests added beyond the task brief. A mutation campaign proved every
-    // --- property below was completely unprotected by the five tests above,
-    // --- even though this module's doc comments state each one. The brief's
-    // --- tests are all mono, all length-range assertions, and all on files
-    // --- with no non-finite sample in them, which is exactly the shape that
-    // --- cannot see a bad downmix, a per-packet resampler reset, or a NaN.
+    // --- The tests above are all mono, all length-range assertions, and all
+    // --- on files with no non-finite sample in them -- a shape that cannot
+    // --- see a bad downmix, a per-packet resampler reset, or a NaN. The
+    // --- tests below target those specifically.
 
     /// A WAV of arbitrary format tag / channel count / bit depth. Same
     /// hermetic, no-encoder-dependency approach as `wav_tone`, generalised so
@@ -533,7 +500,7 @@ mod tests {
             .collect()
     }
 
-    /// Linear resampling to 48 kHz computed OFFLINE, over the whole signal at
+    /// Linear resampling to 48 kHz computed offline, over the whole signal at
     /// once, with the read position recomputed from scratch for every output
     /// rather than carried in a state machine. The oracle for the streaming
     /// implementation: any packet-boundary bug shows up as divergence here
@@ -553,17 +520,14 @@ mod tests {
         }
     }
 
-    /// **The packet-boundary test.** The resampler's fractional read position
-    /// and the last sample of the previous packet must survive across
-    /// packets. Reset either one and every packet restarts from its own first
-    /// sample: a discontinuity at the packet rate (~38 Hz for MP3 at
-    /// 44.1 kHz, an audible buzz) that leaves the total sample count close
-    /// enough that both length assertions in the brief still pass.
+    /// The resampler's fractional read position and the last sample of the
+    /// previous packet must survive across packets, or every packet restarts
+    /// from its own first sample -- a discontinuity that a plain length
+    /// assertion cannot see.
     ///
-    /// Compared against an offline reference rather than a length, because a
-    /// length cannot see it. A 1 kHz tone is used precisely because its
-    /// sample-to-sample delta is bounded, so a phase slip of even a fraction
-    /// of one input sample is a visible outlier.
+    /// Compared against an offline reference rather than a length. A 1 kHz
+    /// tone is used because its sample-to-sample delta is bounded, so a phase
+    /// slip of even a fraction of one input sample is a visible outlier.
     #[test]
     fn resampling_is_continuous_across_packet_boundaries() {
         let path = wav_tone("cont44", 44_100, 0.5);
@@ -592,14 +556,14 @@ mod tests {
     }
 
     /// The same property at the unit level, and the one that pins it hardest:
-    /// how the input is CHUNKED must not change the output at all. Any
+    /// how the input is chunked must not change the output at all. Any
     /// per-packet reset makes irregular chunking diverge from one big push.
     ///
     /// Swept across every rate this project is likely to meet, in both
-    /// directions. DOWNsampling is the case the end-to-end tests cannot
+    /// directions. Downsampling is the case the end-to-end tests cannot
     /// reach and where the state machine is least obvious: a packet shorter
     /// than one output step produces no output at all, and the read position
-    /// then sits PAST the end of that packet when the next one arrives.
+    /// then sits past the end of that packet when the next one arrives.
     #[test]
     fn chunking_does_not_change_the_resampled_output() {
         for rate in [44_100u32, 48_000, 96_000, 192_000, 32_000, 22_050, 8_000] {
@@ -640,11 +604,9 @@ mod tests {
         }
     }
 
-    /// Mono is the AVERAGE of the channels, not their sum and not the left
-    /// channel. All three agree on length and on a mono file, so nothing in
-    /// the brief can tell them apart; a constant-DC stereo pair with unequal
-    /// channels separates all three by construction (avg 0.3, sum 0.6,
-    /// left 0.5).
+    /// Mono is the average of the channels, not their sum and not the left
+    /// channel. A constant-DC stereo pair with unequal channels separates
+    /// all three by construction (avg 0.3, sum 0.6, left 0.5).
     #[test]
     fn stereo_is_downmixed_by_averaging_not_summing() {
         let (l, r) = (16_384i16, 3_277i16); // 0.5 and ~0.1
@@ -661,7 +623,7 @@ mod tests {
         for (i, &s) in got.iter().enumerate() {
             assert!(
                 (s - want).abs() < 0.01,
-                "sample {i} is {s}, expected the channel AVERAGE {want} \
+                "sample {i} is {s}, expected the channel average {want} \
                  (a sum would be {}, the left channel alone {})",
                 want * 2.0,
                 l as f32 / 32_768.0
@@ -711,7 +673,7 @@ mod tests {
         }
     }
 
-    /// The index in that error is a GLOBAL sample index, not an offset into
+    /// The index in that error is a global sample index, not an offset into
     /// whichever packet happened to contain it -- a per-packet offset points
     /// at nothing the caller can find.
     #[test]
@@ -727,10 +689,10 @@ mod tests {
         );
     }
 
-    /// Nothing is dropped at the end of the stream. The brief's ±1000-sample
-    /// windows are wide enough for a whole final packet (1152 frames for MP3,
-    /// 4096 for this WAV reader) to go missing unnoticed, which is precisely
-    /// the tail a "write a save missing its end" bug looks like.
+    /// Nothing is dropped at the end of the stream. A loose length range is
+    /// wide enough for a whole final packet (1152 frames for MP3, 4096 for
+    /// this WAV reader) to go missing unnoticed, which is precisely the tail
+    /// a "write a save missing its end" bug looks like.
     #[test]
     fn the_final_partial_packet_is_not_dropped() {
         // 0.5s at each rate; only the last input sample is legitimately held
@@ -750,7 +712,7 @@ mod tests {
         }
     }
 
-    /// `duration_hint` is the SOURCE's real duration in seconds, not its
+    /// `duration_hint` is the source's real duration in seconds, not its
     /// sample count and not a value scaled by the resampling ratio.
     #[test]
     fn the_duration_hint_is_in_seconds_at_the_source_rate() {

@@ -187,27 +187,6 @@ fn an_empty_track_is_rejected_rather_than_producing_a_broken_save() {
     assert!(build_speaker_world(&track, &opts).is_err());
 }
 
-// ---------------------------------------------------------------------------
-// Tests beyond the brief.
-//
-// A mutation campaign run against the brief's six tests found that 14 of 22
-// mutations survived them, including EVERY property the task's own trap list
-// calls out. The brief's tests only ever count component TYPE names on the
-// inner grid, so they are blind to two whole categories:
-//
-//   * component DATA -- pitch, spatialization, which synth asset a band got.
-//     None of it is reachable from the in-memory `World` (a `LiteralComponent`'s
-//     values are opaque `Box<dyn AsBrdbValue>`), so these tests write a real
-//     `.brz` and decode it back, the same way `tests/anim_world.rs` checks a
-//     chip's published `PlaneExtent`.
-//   * WIRES. `world.wires` is public and carries both endpoints' brick id,
-//     component type and port name, so the graph's whole shape is checkable
-//     in memory with no round trip at all.
-//
-// Every property below is one the design already requires; none of it is new
-// behaviour.
-// ---------------------------------------------------------------------------
-
 use brdb::IntoReader;
 use brdb::schema::{BrdbStruct, BrdbValue, WireVariant};
 use heightmap::anim::bricks::{ARRAY_GET, ARRAY_VAR, BRANCH, SELECT};
@@ -502,10 +481,9 @@ fn the_bank_arrays_partition_every_bands_frames_exactly() {
     });
 }
 
-/// Each speaker must be driven by its OWN band's arrays. Pointing them all at
-/// band 0 leaves the brick, gate and wire counts identical -- every count the
-/// brief's tests make agrees with it -- and the render plays one band through
-/// 32 speakers.
+/// Each speaker must be driven by its own band's arrays. Pointing them all at
+/// band 0 leaves every brick, gate and wire count identical, and the render
+/// plays one band through 32 speakers.
 #[test]
 fn every_speaker_is_driven_by_its_own_bands_arrays() {
     let (track, _opts, world, n_banks) = multi_bank();
@@ -745,7 +723,10 @@ fn every_get_is_clocked_and_indexed_by_its_own_bank() {
 /// name encodes perfectly and fails only in game.
 #[test]
 fn the_save_references_exactly_the_three_synth_assets() {
-    let opts = AudioOptions::default();
+    // `control_buttons: false`: the button labels register a `BrickFontDescriptor`
+    // asset reference, which is real but has nothing to do with the synth assets
+    // this test is pinning.
+    let opts = AudioOptions { control_buttons: false, ..AudioOptions::default() };
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
 
@@ -808,7 +789,9 @@ const CHIP_GRID: usize = 2;
 /// the grid's brick list in emission order. That is only usable while the chip
 /// is a single chunk, so both halves of that assumption are asserted rather
 /// than trusted: if the chip ever grows past one chunk this panics loudly
-/// instead of silently mismatching ids.
+/// instead of silently mismatching ids. The default 79-band chip is two
+/// chunks, so callers need an explicit smaller `--bands` (e.g. 32) to keep
+/// this join valid.
 fn inner_structs_by_brick_id(world: &brdb::World, tag: &str) -> HashMap<usize, BrdbStruct> {
     let path = std::env::temp_dir().join(format!("h2b_audio_{tag}_{}.brz", std::process::id()));
     std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
@@ -905,14 +888,8 @@ fn outgoing(world: &brdb::World, brick: usize, port: &str) -> Vec<(String, usize
 /// pin that mutes the bank instead of spatialising it.
 #[test]
 fn the_three_attenuation_pins_reach_every_speaker_on_the_port_they_name() {
-    // `--bands 32` explicitly, NOT the derived default. `inner_structs_by_brick_id`
-    // joins components to bricks through `component_brick_indices`, which is only
-    // valid while the chip is ONE brick chunk -- and the default 81-band chip is
-    // two. That join is this file's own test scaffolding; rewriting it for
-    // multi-chunk chips is a separate job, and the property under test here (every
-    // pin reaches every speaker on the port it names) is per-band and does not
-    // depend on how many bands there are. The helper panics loudly rather than
-    // mis-joining if that ever stops being true.
+    // `--bands 32` explicitly, not the derived default -- see
+    // `inner_structs_by_brick_id` for why.
     let opts = AudioOptions { bands: Some(32), ..Default::default() };
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
@@ -1090,24 +1067,8 @@ fn the_volume_pin_scales_every_band_through_its_own_multiply() {
     assert_eq!(sel_inputb[0].1, "RER_Output", "from the pin's RER_Output");
 }
 
-/// The baked values standing behind the pins, read back out of a real save.
-///
-/// These are what every speaker uses while the pins are unwired, which is the
-/// default and by far the commonest case. `bSpatialization` must be false (the
-/// bank sums as 2D; 32 spatialised emitters at distinct positions comb-filter
-/// against each other) -- and note the game's OWN default for it is `true`, so
-/// dropping the field does not leave it unset, it turns spatialisation on.
-///
-/// The two radii must be REAL RANGE, not the game's single-prop defaults of
-/// 15 / 400. `bSpatialization = false` switches off panning and nothing else:
-/// distance attenuation still applies, so a 400-unit `MaxDistance` across a
-/// bank meant to be heard as one instrument leaves the listener hearing only
-/// whichever speakers are nearest -- a slice of the spectrum that changes as
-/// they walk. That was the shipped bug, confirmed in game. A zero
-/// `MaxDistance` is worse still: a speaker audible nowhere.
-///
-/// The numbers are spelled out rather than imported on purpose: an oracle that
-/// reads the same constant the renderer writes cannot disagree with it.
+/// The baked defaults behind the unwired pins (bSpatialization false, real
+/// InnerRadius/MaxDistance) must reach the save.
 #[test]
 fn the_baked_emitter_defaults_that_stand_behind_the_pins_reach_the_save() {
     let opts = AudioOptions::default();
@@ -1152,16 +1113,10 @@ fn the_baked_emitter_defaults_that_stand_behind_the_pins_reach_the_save() {
 // ---------------------------------------------------------------------------
 // Cluster geometry.
 //
-// POSITION IS AUDIBLE, and that is the whole reason this section exists.
-// `bSpatialization = false` turns off PANNING; distance attenuation still
-// applies. The bank originally stacked its speakers in one column 372 units
-// tall against a 400-unit `MaxDistance`, so from any listening position the
-// far end of the bank was attenuated or inaudible and the listener heard a
-// distance-filtered slice of the spectrum that changed as they walked. Every
-// count, every wire and every component value in the save was correct.
-//
-// The two properties that catch it are the two below: nothing may be far from
-// anything else, and no two speakers may share a slot.
+// Position is audible: `bSpatialization = false` turns off panning, not
+// distance attenuation, so the cluster must stay compact. The two properties
+// below check that: nothing may be far from anything else, and no two
+// speakers may share a slot.
 // ---------------------------------------------------------------------------
 
 /// Every speaker's position on the main grid, in band order.
@@ -1199,23 +1154,8 @@ fn max_separation(ps: &[brdb::Position]) -> (f64, usize, usize) {
     worst
 }
 
-/// **The shipped bug, in one assertion.** No two speakers may be far apart.
-///
-/// The bound is a fraction of `InnerRadius`, because that is the quantity it
-/// protects: inside `InnerRadius` there is NO distance attenuation at all, so
-/// a listener standing in a cluster far smaller than it hears every speaker at
-/// exactly the same level, and one standing outside sees a near/far distance
-/// ratio of at most `bound / distance`. A quarter of the radius keeps that
-/// under a few percent at any listening distance.
-///
-/// **It was 64 absolute units, sized for a 32-speaker cluster.** The bank now
-/// defaults to 81 speakers (every equal-tempered semitone the emitter's pitch
-/// range holds) and `--subdiv 24` allows 159, so a fixed number chosen for one
-/// band count was measuring the count rather than the property. The measured
-/// worst separations are 43.2 units at 32 bands, **67.1 at the 81-band
-/// default** and 85.5 at 159 -- 11%, 17% and 21% of the 400-unit radius. The
-/// failure this test exists to catch is not affected: a COLUMN of 32 measures
-/// 372 units, which still fails by a factor of nearly four.
+/// No two speakers may be far apart, so the cluster reads as one point source
+/// instead of a spread of distance-attenuated ones.
 #[test]
 fn no_two_speakers_are_far_apart() {
     // A fixed geometric bound, NOT derived from the inner radius: the near-field
@@ -1350,11 +1290,6 @@ fn the_cluster_layout_is_deterministic() {
                  take the same slot"
             );
         }
-        assert_eq!(
-            cluster_dims(n),
-            cluster_dims(n),
-            "n={n}: the cluster's own dimensions must be a pure function of n"
-        );
     }
 
     // A FIXED oracle for the default bank, written out rather than
@@ -1533,14 +1468,8 @@ fn an_impossible_radius_is_rejected_rather_than_baked() {
 /// `BrickComponentData_WireGraph_Expr_PrimMathVariantPrimMathVariant_PrimMathVariant`.
 #[test]
 fn the_volume_multiplies_bake_unity_gain_so_an_unwired_pin_changes_nothing() {
-    // `--bands 32` explicitly, NOT the derived default. `inner_structs_by_brick_id`
-    // joins components to bricks through `component_brick_indices`, which is only
-    // valid while the chip is ONE brick chunk -- and the default 81-band chip is
-    // two. That join is this file's own test scaffolding; rewriting it for
-    // multi-chunk chips is a separate job, and the property under test here (every
-    // pin reaches every speaker on the port it names) is per-band and does not
-    // depend on how many bands there are. The helper panics loudly rather than
-    // mis-joining if that ever stops being true.
+    // `--bands 32` explicitly, not the derived default -- see
+    // `inner_structs_by_brick_id` for why.
     let opts = AudioOptions { bands: Some(32), ..Default::default() };
     let track = tone_track(1.0, &opts);
     assert!(
@@ -1551,12 +1480,13 @@ fn the_volume_multiplies_bake_unity_gain_so_an_unwired_pin_changes_nothing() {
     let world = build_speaker_world(&track, &opts).expect("build");
 
     // Every MathMultiply on the inner grid: one volume multiply per band, plus
-    // the clock's.
+    // the clock's three (fps multiply + length and progress status taps).
     let all_multiplies = inner_ids_of(&world, MULTIPLY);
     assert_eq!(
         all_multiplies.len(),
-        track.plan.len() + 1,
-        "one volume multiply per band, plus the clock's own fps multiply"
+        track.plan.len() + 3,
+        "one volume multiply per band, plus the clock's fps multiply and its \
+         length + progress status taps"
     );
 
     let by_target = sources_by_target(&world);
@@ -1590,43 +1520,28 @@ fn the_volume_multiplies_bake_unity_gain_so_an_unwired_pin_changes_nothing() {
         );
     }
 
-    // ...and the one left over is the clock's, still carrying the fps.
-    let clock_multiply = all_multiplies
+    // ...and among the ones left over -- the clock's fps multiply plus the
+    // length and progress status taps -- one still carries the fps. (The length
+    // tap bakes InputB 1.0 like a volume multiply, so the fps one is told apart
+    // by its value, not by being the sole survivor.)
+    let leftover: Vec<usize> = all_multiplies
         .iter()
-        .find(|m| !volume_multiplies.contains(m))
-        .expect("the clock's multiply must survive");
-    let v = structs[clock_multiply]
-        .prop("InputB")
-        .expect("the clock multiply's InputB");
-    let WireVariant::Number(fps) = WireVariant::try_from(v).expect("a wire variant") else {
-        panic!("the clock's baked fps must be a Number, got {v:?}");
-    };
-    assert_eq!(
-        fps, track.fps as f64,
-        "the clock's own multiply must still carry the fps"
-    );
+        .copied()
+        .filter(|m| !volume_multiplies.contains(m))
+        .collect();
+    assert_eq!(leftover.len(), 3, "the fps multiply plus the length and progress taps");
+    let carries_fps = leftover.iter().any(|m| {
+        structs[m]
+            .prop("InputB")
+            .ok()
+            .and_then(|v| WireVariant::try_from(v).ok())
+            .is_some_and(|wv| matches!(wv, WireVariant::Number(n) if n == track.fps as f64))
+    });
+    assert!(carries_fps, "the clock's own fps multiply must survive carrying the fps");
 }
 
-/// The emitter's three pin-backed properties must be written EXPLICITLY by
-/// this crate, not left for brdb's `STRUCT_DEFAULTS` to fill in.
-///
-/// This is the one property here that a written save cannot show. brdb emits
-/// the field either way -- from the component's own data if it carries it,
-/// from `STRUCT_DEFAULTS` if it does not -- and for `InnerRadius` and
-/// `MaxDistance` that table currently holds exactly the values this crate
-/// wants, so deleting the explicit write produces an indistinguishable file.
-/// (Measured, not assumed: a mutation that drops the `InnerRadius` insert
-/// passes every other test in this file.)
-///
-/// It matters because `STRUCT_DEFAULTS` is REGENERATED from the game every
-/// build. A build that retunes the emitter would silently retune every render
-/// this crate has ever produced, and for two properties that only ever come
-/// into play the instant a builder turns `Directional` on -- i.e. the moment
-/// there is least reason to suspect the renderer.
-///
-/// So the assertion is made against the built `World`, through `AsBrdbValue`'s
-/// own "do you carry this property" hook: the same question brdb's writer asks
-/// when it decides between the component's value and the table's.
+/// The emitter's pin-backed properties must be written explicitly by this
+/// crate, not left for brdb's regenerated `STRUCT_DEFAULTS` to fill in.
 #[test]
 fn the_emitter_properties_behind_the_pins_are_written_explicitly() {
     let opts = AudioOptions::default();
@@ -1874,18 +1789,8 @@ fn a_voice_world_serialises() {
     assert!(bytes.len() > 500);
 }
 
-/// The efficiency claim, checked rather than asserted in prose -- and it only
-/// holds at a SMALL voice count.
-///
-/// `2V` dense arrays carry less raw data than the bank's 79 (2V*frames vs
-/// 79*frames doubles, so voice mode wins on raw bytes up to V = 39), but the
-/// bank's arrays are mostly zeros and a `.brz` is compressed. Measured on a
-/// 161 s piano master: bank 499 KB, voice 455 KB at V=8, 916 KB at V=16 and
-/// 1.76 MB at V=32. So the win is real at a handful of voices and reverses
-/// above about ten, because zeros compress and a tracked pitch curve does not.
-///
-/// Pinned at V=8, where it holds, so that a regression that made the dense
-/// streams larger still than they are would fail here.
+/// Voice mode's dense per-voice arrays compress smaller than the bank's mostly-
+/// zero ones, but only up to a small voice count; pinned at V=8, where it holds.
 #[test]
 fn a_voice_render_is_smaller_than_the_equivalent_bank_render() {
     let vo = voice_opts(8);
@@ -2351,4 +2256,96 @@ fn an_in_chip_voice_render_moves_speakers_keeps_the_pitch_wire_and_passes_wire_i
     std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
     wire_integrity::assert_wires_valid(&path);
     let _ = std::fs::remove_file(&path);
+}
+
+// --- Control buttons --------------------------------------------------------
+
+/// **The pre-wired control buttons on an audio render, verified end to end.**
+///
+/// The audio twin of `anim_world.rs`'s control-button test: with the toggle ON
+/// a speaker world carries three animated-button bricks on the MAIN grid
+/// (beside the speaker cluster), each also carrying a `Component_TextDisplay`
+/// label, each button's `bHeld` resolves to a distinct clock control pin, and
+/// the written `.brz`'s wires all resolve. With it OFF the render is exactly
+/// what it was before the feature.
+///
+/// Unverifiable in game and left to the owner: that a press actually
+/// pauses/restarts/resumes, that `PromptCustomLabel` shows on look, and that the
+/// label renders on the same brick as the animated button.
+#[test]
+fn the_control_buttons_appear_on_an_audio_render_and_vanish_when_disabled() {
+    const BUTTON: &str = "Component_Internal_AnimatedButton";
+    const TEXT_DISPLAY: &str = "Component_TextDisplay";
+
+    let opts = AudioOptions::default();
+    let track = tone_track(1.0, &opts);
+    let on = build_speaker_world(&track, &opts).expect("build");
+    let off = build_speaker_world(
+        &track,
+        &AudioOptions { control_buttons: false, ..AudioOptions::default() },
+    )
+    .expect("build");
+
+    let count = |world: &brdb::World, needle: &str| {
+        world
+            .bricks
+            .iter()
+            .filter(|b| {
+                b.components
+                    .iter()
+                    .any(|c| c.component_type().is_some_and(|t| t.as_ref() == needle))
+            })
+            .count()
+    };
+
+    assert_eq!(count(&on, BUTTON), 3, "three physical buttons");
+    assert_eq!(count(&on, TEXT_DISPLAY), 3, "three labels");
+    assert_eq!(count(&off, BUTTON), 0);
+    assert_eq!(count(&off, TEXT_DISPLAY), 0);
+    assert_eq!(on.bricks.len() - off.bricks.len(), 3, "3 buttons, each carrying a label");
+    assert_eq!(on.wires.len() - off.wires.len(), 3, "1 wire per control");
+
+    // Each button's bHeld drives a control pin the timer reads on
+    // Pause/Restart/Resume.
+    let mut button_pins: Vec<usize> = on
+        .wires
+        .iter()
+        .filter(|w| {
+            w.source.component_type.as_ref() == BUTTON
+                && w.source.port_name.as_ref() == "bHeld"
+                && w.target.component_type.as_ref() == MICROCHIP_INPUT
+        })
+        .map(|w| {
+            assert_eq!(w.target.port_name.as_ref(), "RER_Input");
+            w.target.brick_id
+        })
+        .collect();
+    let mut timer_control_pins: Vec<usize> = on
+        .wires
+        .iter()
+        .filter(|w| {
+            w.target.component_type.as_ref() == TIMER
+                && matches!(w.target.port_name.as_ref(), "Pause" | "Restart" | "Resume")
+                && w.source.component_type.as_ref() == MICROCHIP_INPUT
+        })
+        .map(|w| w.source.brick_id)
+        .collect();
+    button_pins.sort_unstable();
+    timer_control_pins.sort_unstable();
+    assert_eq!(button_pins.len(), 3, "one button per control pin");
+    assert_eq!(
+        button_pins, timer_control_pins,
+        "each button must resolve to a Pause/Restart/Resume pin the timer reads"
+    );
+
+    for (world, tag) in [(&on, "on"), (&off, "off")] {
+        let path = std::env::temp_dir()
+            .join(format!("h2b_audio_buttons_{tag}_{}.brz", std::process::id()));
+        std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
+        let result = std::panic::catch_unwind(|| wire_integrity::assert_wires_valid(&path));
+        let _ = std::fs::remove_file(&path);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
 }

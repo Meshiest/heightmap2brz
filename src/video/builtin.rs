@@ -3,27 +3,19 @@
 //! so wasm -- which cannot spawn `ffmpeg` -- has a decode path, and so native
 //! builds can skip a subprocess for the codec this crate actually handles.
 //!
-//! **CABAC only.** Task 1's evaluation (`.superpowers/sdd/2026-07-27-video-
-//! decode-backends/task-1-evaluation.md`) measured `rust_h264` 0.4.0 against
-//! ffmpeg on 13 clips: every CABAC stream (all 7 real-world captures, every
-//! CABAC synthetic clip) landed within 0.0-0.26 mean absolute per-channel
-//! difference -- rounding noise. But two CAVLC clips decoded to visibly wrong
-//! pixels -- mean absolute difference up to ~27 on luma, ~49 on chroma --
-//! while `rust_h264` returned no error and did not panic. The owner's ruling
-//! (recorded in `progress.md`) was to ship this backend CABAC-only:
-//! [`BuiltinVideoSource::open_path`] refuses anything else before a single frame
-//! is decoded, per [`crate::video::demux::EntropyCoding`]'s own doc. This is
-//! deliberately redundant with Task 6's later `video::backend` routing guard
-//! (not yet built when this module was written) -- a caller that reaches this
-//! type directly, bypassing that guard, must still be protected.
+//! CABAC only: `rust_h264` decodes CAVLC streams to visibly wrong pixels
+//! with no error and no panic, so [`BuiltinVideoSource::open_path`] refuses
+//! anything but CABAC before a single frame is decoded, per
+//! [`crate::video::demux::EntropyCoding`]'s own doc. This is deliberately
+//! redundant with `video::backend`'s routing guard -- a caller that reaches
+//! this type directly, bypassing that guard, must still be protected.
 //!
 //! Decoding happens lazily inside [`FrameStream::next`]: packets are pulled
 //! from the [`Demuxer`] one at a time, fed to an `OrderedDecoder`, and any
 //! frames it returns (0 or more per packet -- B-frame reordering means a
 //! frame's packet and its emission don't line up 1:1) are queued for pickup.
 //! That queue is bounded by the decoder's own reorder depth (16 frames by
-//! `rust_h264`'s default), never the whole clip -- an accumulating `Vec` of
-//! every decoded frame would defeat the entire point of this plan.
+//! `rust_h264`'s default), never the whole clip.
 
 use crate::video::demux::{BitReader, Demuxer, EntropyCoding};
 use crate::video::stream::{FrameSource, FrameStream, SourceInfo};
@@ -714,11 +706,9 @@ fn check_planes(frame: &H264Frame) -> Result<(), String> {
 
 /// The per-sample halves of the matrix, precomputed for all 256 input values.
 ///
-/// Every term in the conversion depends on exactly ONE of the three `u8`
+/// Every term in the conversion depends on exactly one of the three `u8`
 /// samples, so all of them fit in 256-entry tables and the per-pixel work
-/// drops to three adds and three casts. The tables hold the identical
-/// expressions the per-pixel arithmetic used to evaluate inline, so this is a
-/// hoist, not a re-derivation.
+/// drops to three adds and three casts.
 struct Tables {
     /// `(luma - y_offset) * y_scale`.
     y: [f32; 256],
@@ -759,16 +749,10 @@ impl Tables {
 ///
 /// Walks two luma pixels at a time because 4:2:0 chroma is nearest-neighbour
 /// upsampled -- one `cb`/`cr` pair covers a 2x2 luma block -- so the chroma
-/// table lookups happen once per PAIR rather than once per pixel. The final
-/// (odd) pixel of an odd-width row falls out of `chunks_exact_mut(4)`
-/// naturally: the last chunk of 8 is short, and the inner loop simply runs
-/// once.
+/// table lookups happen once per pair rather than once per pixel.
 ///
-/// The arithmetic is deliberately associated exactly as the previous
-/// per-pixel form was -- in particular green is `(y + g_cb) + g_cr`, not
-/// `y + (g_cb + g_cr)`. Those are equal over the reals but not in `f32`, and
-/// the second form would shift occasional pixels by one least-significant
-/// bit against the oracle the whole backend is pinned to.
+/// Green must be `(y + g_cb) + g_cr`, not `y + (g_cb + g_cr)`: equal over the
+/// reals, not in `f32`, and the backend is pinned to ffmpeg bit-for-bit.
 fn convert_row(out: &mut [u8], luma: &[u8], cb: &[u8], cr: &[u8], identity: bool, t: &Tables) {
     if identity {
         // matrix_coefficients 0: the "luma" plane is G and the two "chroma"
@@ -800,59 +784,32 @@ fn convert_row(out: &mut [u8], luma: &[u8], cb: &[u8], cr: &[u8], identity: bool
 
 /// Round to nearest and clamp to `0..=255`, without a libm call.
 ///
-/// This is EXACTLY `v.round().clamp(0.0, 255.0) as u8`, which is what it
-/// replaces -- not an approximation of it:
-/// - Rust's `f32 as u8` cast has been saturating since 1.45, so out-of-range
-///   values land on 0/255 by themselves and NaN lands on 0, matching the
-///   explicit `clamp` (and `NaN as u8 == 0`) it drops.
-/// - Truncation toward zero of `v + 0.5` is round-half-away-from-zero for
-///   `v >= 0`; every `v < 0` clamps to 0 under both forms, so the sign case
-///   the two disagree on is unreachable.
-/// - The `+ 0.5` is done in `f64` so the addition is EXACT. In `f32` it is
-///   not: near 255 the spacing is ~1.5e-5, so a `v` a hair under `k + 0.5`
-///   could round UP to exactly `k + 0.5` and then truncate to `k + 1`, one
-///   least-significant bit away from `round`. `f64` has ample room to hold
-///   any `f32` plus a half exactly, so that case cannot arise at all.
-///
-/// The point is that `f32::round` lowers to a `roundf` LIBRARY CALL on
-/// baseline x86-64 (SSE2 has no round instruction; SSE4.1's `roundss` is not
-/// in the default target features). At three channels per pixel that was ~6M
-/// calls per 1080p frame, and it dominated this function's cost.
+/// Exactly `v.round().clamp(0, 255) as u8` without the `roundf` library call
+/// `f32::round` lowers to on baseline x86-64 (SSE2 has no round instruction;
+/// ~6M calls per 1080p frame dominated this function's cost). `+0.5` is done
+/// in `f64` so it is exact even near 255, where `f32`'s spacing (~1.5e-5)
+/// could otherwise round a value up into the next integer.
 fn clamp_u8(v: f32) -> u8 {
     (f64::from(v) + 0.5) as u8
 }
 
-// ---------------------------------------------------------------------------
-// Task 6's BT.2020 routing guard. ADDITIVE ONLY: nothing above this line was
-// touched to add it, matching how Task 5 exposed `Demuxer::avc_decoder_config`
-// for this same module rather than reworking `Demuxer` itself. In particular
-// `colour_info_from_sps_rbsp` above -- verified by the oracle tests at the
-// bottom of this file -- is untouched: `matrix_coefficients_from_sps_rbsp`
-// below is a SEPARATE walk, not a refactor of it and not a call into it, kept
-// deliberately independent so a change here can never alter what that
+// `matrix_coefficients_from_sps_rbsp` below is a deliberately SEPARATE walk
+// from `colour_info_from_sps_rbsp` above, not a refactor of it and not a call
+// into it -- so a change here can never alter what that oracle-tested
 // function returns.
-// ---------------------------------------------------------------------------
 
 /// The raw `matrix_coefficients` byte (ITU-T H.264 §E.2.1, Table E-5) one
 /// SPS's VUI colour description carries, or `None` when the stream does not
-/// carry one -- no VUI at all, no `video_signal_type_present_flag`, or no
-/// `colour_description_present_flag` (the range can be stated without the
-/// matrix being stated; see `colour_info_from_sps_rbsp`'s identical branch).
+/// carry one.
 ///
-/// This exists only so [`crate::video::backend`]'s BT.2020 guard can see the
-/// value BEFORE [`colour_info_from_sps_rbsp`]'s own mapping folds
-/// `matrix_coefficients` 9/10 into [`ColourMatrix::Bt601`] with no warning --
-/// a fold that is only safe because that guard is what is supposed to
-/// intercept 9/10 before a stream carrying it ever reaches decode at all (see
-/// that match arm's own comment). It is a second, independent walk over the
-/// same bits rather than a shared helper factored out of the first, on
-/// purpose: `colour_info_from_sps_rbsp` is oracle-tested and this task must
-/// not risk it. The two are cross-checked directly by
-/// `both_colour_walks_agree_on_whether_a_stream_is_bt2020` below, so a
-/// divergence between them would be caught rather than silently drifting.
-/// `skip_scaling_list` is the one piece actually reused (called, not
-/// copied) -- reusing an already-correct helper carries none of the risk
-/// that editing shared code would.
+/// Exists so [`crate::video::backend`]'s BT.2020 guard can see the value
+/// before [`colour_info_from_sps_rbsp`]'s own mapping folds
+/// `matrix_coefficients` 9/10 into [`ColourMatrix::Bt601`] with no warning
+/// (safe only because that guard intercepts 9/10 before decode). A second,
+/// independent walk over the same bits rather than a shared helper, since
+/// `colour_info_from_sps_rbsp` is oracle-tested and must not be risked --
+/// `both_colour_walks_agree_on_whether_a_stream_is_bt2020` below cross-checks
+/// the two so a divergence would be caught, not silently drift.
 fn matrix_coefficients_from_sps_rbsp(rbsp: &[u8]) -> Option<u8> {
     let mut bits = BitReader::new(rbsp);
 

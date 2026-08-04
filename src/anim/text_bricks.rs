@@ -1,6 +1,6 @@
 //! Text mode: the whole clip rendered as a stack of animated
-//! `Component_TextDisplay` bricks, at ~2 gates per BAND of image rows instead
-//! of 2 gates per PIXEL.
+//! `Component_TextDisplay` bricks, at ~2 gates per band of image rows instead
+//! of 2 gates per pixel.
 //!
 //! This is the third sibling of [`super::bricks::build_brick_world`] and
 //! [`super::color_bricks::build_color_array_world`], and it shares their
@@ -13,29 +13,29 @@
 //! Brick mode spends 2 gates per pixel and the game drops frames near 20 000
 //! gates -- about 10 000 pixels. Text mode spends 2 gates per band: a 192x108
 //! screen is 54 bands, so 113 gates including the clock. The cost does not
-//! vanish so much as MOVE, from the wire graph into the game's text layout,
+//! vanish so much as move, from the wire graph into the game's text layout,
 //! which is why `examples/text_probe.rs` exists and why the human-verification
 //! list at the end of the plan is not optional.
 //!
 //! # Per-band anchors, not `start_row` newlines
 //!
 //! [`crate::text::encode_bands`] pads a band with leading newlines and
-//! [`crate::text::add_text_bricks`] stacks all of a tile's bands behind ONE
+//! [`crate::text::add_text_bricks`] stacks all of a tile's bands behind one
 //! anchor cube, compensating with a per-band component `Offset.Z` equal to its
 //! depth. At 54 bands that needs an `Offset.Z` of up to 106, and
 //! [`crate::text::add_text_tiles`]' own doc states the game does not honour
-//! large component `Offset` values. So every band gets its OWN anchor cube at
+//! large component `Offset` values. So every band gets its own anchor cube at
 //! its own image row -- one [`TextTile`] per band with `tile_override` set to
 //! the band height -- which is how an ordinary tiled `--text` export already
-//! anchors. The probe established this in game; it is not a preference.
+//! anchors.
 //!
 //! # Exec wiring: fan-out, never fan-in
 //!
 //! Each bank's exec entry drives every one of that bank's `Get.Exec` inputs
 //! directly, the pattern [`super::color_bricks`] established. Exec fan-out (one
 //! output driving many exec inputs) is supported and costs the same as a chain;
-//! exec FAN-IN (two sources into one exec input) is unverified, so nothing here
-//! ever produces it -- the bank branches cascade at the FRONT of the chain
+//! exec fan-in (two sources into one exec input) is unverified, so nothing here
+//! ever produces it -- the bank branches cascade at the front of the chain
 //! rather than branching and rejoining.
 //!
 //! # Determinism
@@ -43,11 +43,11 @@
 //! Bands are walked in index order, which is image-row order. Nothing here
 //! iterates a `HashMap`: doing so would mint brick ids in a different order on
 //! every run and make two renders of the same clip differ for no reason.
-use super::bricks::{
-    ARRAY_GET, ARRAY_VAR, AnimOptions, BRANCH, CHANGE_DETECTOR, COMPARE_GE, SELECT, SUBTRACT,
-};
+use super::bricks::{ARRAY_GET, ARRAY_VAR, AnimOptions, CHANGE_DETECTOR, SELECT};
+use super::cascade;
 use super::chip;
 use super::clock::{self, gate};
+use super::controls;
 use super::layout::{GATE_HALF, STAGE_PITCH, lattice_pos_staged};
 use super::pack;
 use super::palette::Palette;
@@ -59,7 +59,7 @@ use crate::text::{TextBand, TextOptions, TextTile, add_text_tiles};
 use crate::video::stream::FrameSource;
 use brdb::{
     AsBrdbValue, IntVector, Position, Vector3f, WirePort, World,
-    schema::{WireArrayVariant, WireVariant},
+    schema::WireArrayVariant,
 };
 use image::RgbaImage;
 
@@ -85,7 +85,7 @@ pub const PALETTE_SAMPLE_FRAMES: usize = 120;
 /// pixel.
 const STAGES_PER_BANK: i32 = 2;
 
-/// Where the chip shell sits on the main grid, RELATIVE to the anchor column.
+/// Where the chip shell sits on the main grid, relative to the anchor column.
 ///
 /// Beside the anchor column on +X/+Y, never stacked on it: the anchor cubes
 /// span x and y in `[-1, 1]` about their own column (they are 1-half-extent
@@ -93,7 +93,7 @@ const STAGES_PER_BANK: i32 = 2;
 /// is clear with room to spare. Every coordinate stays non-negative, which is
 /// what the game requires.
 ///
-/// The `y` is an OFFSET from the anchor column, not an absolute: a subtitled
+/// The `y` is an offset from the anchor column, not an absolute: a subtitled
 /// render slides the whole picture sideways ([`subtitle_centre_shift`]) so the
 /// subtitle can anchor at the picture's centre, and a shell pinned to an
 /// absolute `y = 20` would end up inside the anchor column for any clip whose
@@ -105,13 +105,13 @@ const CHIP_SHELL_POS: Position = Position { x: 20, y: 20, z: 2 };
 ///
 /// Signature, streaming contract and cancellation semantics are identical to
 /// [`super::bricks::build_brick_world`] -- including that a cancelled render
-/// returns an EMPTY `Ok(World)` rather than a partial one, and that it is still
-/// on the CALLER to re-check `progress.is_cancelled()` and write nothing when
+/// returns an empty `Ok(World)` rather than a partial one, and that it is still
+/// on the caller to re-check `progress.is_cancelled()` and write nothing when
 /// it is true. This mode has one extra place a cancel can land -- the palette
 /// pass below, which is a whole additional traversal of the source -- and
 /// honours it there too.
 ///
-/// When `opts.colors > 0` the source is traversed TWICE: once to sample frames
+/// When `opts.colors > 0` the source is traversed twice: once to sample frames
 /// for the palette (see [`sample_frames`]) and once to encode. `FrameSource` is
 /// a cheap re-openable handle precisely so a consumer can do that. At
 /// `opts.colors == 0` -- the default -- the sampling pass is skipped entirely
@@ -140,7 +140,7 @@ pub fn build_text_world(
 
     // --- 2. The palette (optional, and a second traversal) ------------------
     let palette = if opts.colors > 0 {
-        // The total is the number of frames that will actually be SAMPLED, not
+        // The total is the number of frames that will actually be sampled, not
         // the cap: a bar that stops at 30/120 on a 30-frame clip reads as a
         // stall. When the source cannot give an exact length, its estimate is
         // capped the same way and the bar says it is an estimate -- see
@@ -152,7 +152,7 @@ pub fn build_text_world(
         .begin(progress, "sampling colours");
         let sampled = sample_frames(source, PALETTE_SAMPLE_FRAMES, progress);
         progress.finish();
-        // The encoder's OWN alpha threshold, not `opts.alpha_threshold`:
+        // The encoder's own alpha threshold, not `opts.alpha_threshold`:
         // `crate::text::encode_row` skips pixels below `opts.text.alpha_threshold`
         // entirely, so those pixels are never drawn and must not be allowed to
         // spend palette entries on colours nothing displays.
@@ -163,7 +163,7 @@ pub fn build_text_world(
         Palette::default()
     };
 
-    // CANCELLED during the palette pass: return before the encode pass reopens
+    // Cancelled during the palette pass: return before the encode pass reopens
     // the source. Sampling is a whole extra traversal (`sample_frames` may
     // decode most of the clip to reach its last sample), so this is a real
     // place for a cancel to land and the encode pass behind it is the entire
@@ -206,7 +206,7 @@ pub fn build_text_world(
     progress.finish();
     let seen = seen?;
 
-    // CANCELLED: return before anything is built, and ahead of the zero-frame
+    // Cancelled: return before anything is built, and ahead of the zero-frame
     // guard so a cancel is never reported as that error. Same reasoning, in
     // full, on `build_brick_world`.
     if progress.is_cancelled() {
@@ -233,7 +233,7 @@ pub fn build_text_world(
 
     // --- 4. Text bricks on the main grid ------------------------------------
     //
-    // One TILE per band, each carrying a single band, so `add_text_tiles`
+    // One tile per band, each carrying a single band, so `add_text_tiles`
     // anchors every component at its own image row -- no depth stack and no
     // large `Offset` values (see the module doc). The bands are a uniform
     // `rows` tall (only the last may be short), so their `start_row`s are exact
@@ -280,16 +280,16 @@ pub fn build_text_world(
         ));
     }
 
-    // Each band renders DOWNWARD from its own anchor, so the bottom band hangs
+    // Each band renders downward from its own anchor, so the bottom band hangs
     // one band-height below the lowest cube (z=1) and would sit underground.
     // Positions are plain data until the world is encoded (`World::add_brick`
     // only pushes), so shifting them here is safe and carries each band's text
     // with its own cube.
     //
     // The subtitle needs no strip of its own below the picture -- it is
-    // anchored at its own BOTTOM edge and grows upward over the picture (see
+    // anchored at its own bottom edge and grows upward over the picture (see
     // `subtitle_display::SUBTITLE_ANCHOR`) -- but it does need the picture's
-    // horizontal CENTRE to be a legal brick coordinate, which is a sideways
+    // horizontal centre to be a legal brick coordinate, which is a sideways
     // shift rather than a lift. Both are 0 without subtitles, which is what
     // keeps a subtitle-free render's brick positions exactly what they are
     // today.
@@ -307,7 +307,7 @@ pub fn build_text_world(
     // World +X faces the viewer, so the frontmost brick is the picture's front:
     // normally the front plane of anchor cubes, and for a graffiti render the
     // invisible collision canvas `add_text_tiles` puts one cube ahead of them,
-    // which is the surface the glyphs actually appear on. The BOTTOM, though,
+    // which is the surface the glyphs actually appear on. The bottom, though,
     // is a property of the cubes alone -- each band draws `band_lift` downward
     // from its own cube, and the canvas is a slab whose centre says nothing
     // about where the picture ends -- so that one looks only at the cubes,
@@ -323,7 +323,7 @@ pub fn build_text_world(
         .min()
         .unwrap_or(band_lift)
         - band_lift;
-    // The picture's LEFT edge: every band anchors there and its glyphs run
+    // The picture's left edge: every band anchors there and its glyphs run
     // from it toward world -Y (`add_text_tiles`), and the leftmost anchor is
     // the one at the greatest y.
     let picture_left_y = world
@@ -356,14 +356,14 @@ pub fn build_text_world(
     let bank_size = opts.bank_size.max(1);
     let n_banks = frame_count.div_ceil(bank_size).max(1);
 
-    // Service gates sit BEHIND every band stage, so the service stage depends
+    // Service gates sit behind every band stage, so the service stage depends
     // on how many stages a band uses -- the same arithmetic
     // `color_bricks` uses, with bands where it has pixels. A band occupies
     // `STAGES_PER_BANK` stages per bank (its ArrayVar and its Get) plus one
     // stage per boundary for its own Select; at a single bank that is stages
     // 0..=1 and a service stage of 2, exactly the probe's layout.
     //
-    // `lattice_pos_staged`'s `height` is the BAND count here, and service rows
+    // `lattice_pos_staged`'s `height` is the band count here, and service rows
     // are always negative, so `x = (n_bands - 1 - row) * CELL + half.x` stays
     // positive for both -- no inner-grid coordinate can go negative.
     let boundaries = (n_banks - 1) as i32;
@@ -373,19 +373,22 @@ pub fn build_text_world(
     };
 
     // --- 6. Frame index source ---------------------------------------------
-    let frame_index = if opts.external_clock {
+    // `control_pins` carries the clock's Pause/Restart/Resume pin ids for the
+    // control buttons below; `None` under `--external-clock` (no timer, no pins).
+    let (frame_index, control_pins) = if opts.external_clock {
         let pin = chip::add_input_pin(&mut chip, "Frame", service(0, -1));
-        chip::pin_source(pin, true)
+        (chip::pin_source(pin, true), None)
     } else {
-        clock::build_clock(
+        let clock = clock::build_clock(
             &mut world,
             &mut chip,
             info.fps,
             frame_count,
             opts.loop_playback,
             service(0, -2),
-        )
-        .frame_index
+        );
+        let pins = (clock.pause_pin, clock.restart_pin, clock.resume_pin);
+        (clock.frame_index, Some(pins))
     };
 
     // --- 7. Exec source -----------------------------------------------------
@@ -401,70 +404,39 @@ pub fn build_text_world(
         WirePort::new(detector, CHANGE_DETECTOR, "Input"),
     );
 
-    // --- 8. Per-bank index and boundary comparators -------------------------
-    // Byte-for-byte the same construction as both brick paths': bank 0 reads
-    // the frame index directly, bank k subtracts `k * bank_size` so its own
-    // array is addressed from zero, and `ge[k-1]` is true once the frame index
-    // reaches bank k -- which is `Select`'s `bSelectB` sense (true picks
-    // InputB, the later bank).
-    let mut index_of_bank = Vec::with_capacity(n_banks);
-    index_of_bank.push(frame_index.clone());
-    for k in 1..n_banks {
-        let sub = gate(&mut chip, "B_1x1_Gate_Expr_MathSubtract", SUBTRACT,
-            service(k as i32, -6), vec![(
-                "InputB",
-                Box::new(WireVariant::Number((k * bank_size) as f64)) as Box<dyn AsBrdbValue>,
-            )]);
-        world.add_wire_connection(frame_index.clone(), WirePort::new(sub, SUBTRACT, "InputA"));
-        index_of_bank.push(WirePort::new(sub, SUBTRACT, "Output"));
-    }
-
-    let mut ge = Vec::with_capacity(n_banks.saturating_sub(1));
-    for k in 1..n_banks {
-        let cmp = gate(&mut chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE,
-            service(k as i32, -7), vec![(
-                "InputB",
-                Box::new(WireVariant::Int((k * bank_size) as i64)) as Box<dyn AsBrdbValue>,
-            )]);
-        world.add_wire_connection(frame_index.clone(), WirePort::new(cmp, COMPARE_GE, "InputA"));
-        ge.push(WirePort::new(cmp, COMPARE_GE, "bOutput"));
-    }
-
-    // --- 9. Exec entry per bank ---------------------------------------------
-    // Branches cascade at the FRONT so exactly one bank's gets run and no exec
-    // input ever takes two sources (ExecOutA = keep descending, ExecOutB = this
-    // bank). With `n_banks == 1` this emits no branch at all and
-    // `entry_of_bank[0]` is simply the detector's `OnChanged`, so a clip that
-    // never spills is wired exactly as the probe wired it.
-    let mut entry_of_bank = Vec::with_capacity(n_banks);
-    let mut exec_src = WirePort::new(detector, CHANGE_DETECTOR, "OnChanged");
-    for bi in 0..n_banks {
-        if bi + 1 < n_banks {
-            let br = gate(&mut chip, "B_1x1_Gate_Exec_Branch", BRANCH,
-                service(bi as i32, -8), vec![]);
-            world.add_wire_connection(ge[bi].clone(), WirePort::new(br, BRANCH, "bCond"));
-            world.add_wire_connection(exec_src, WirePort::new(br, BRANCH, "Exec"));
-            // true -> keep descending; false -> this bank
-            exec_src = WirePort::new(br, BRANCH, "ExecOutA");
-            entry_of_bank.push(WirePort::new(br, BRANCH, "ExecOutB"));
-        } else {
-            entry_of_bank.push(exec_src.clone());
-        }
-    }
+    // --- 8. Per-bank index, boundary comparators and exec entry -------------
+    // The shared per-bank spine (see `cascade`), identical to both brick
+    // paths': bank 0 reads the frame index directly, bank k subtracts
+    // `k * bank_size` so its own array is addressed from zero, `ge[k-1]` is true
+    // once the frame index reaches bank k (`Select`'s `bSelectB` sense), and the
+    // branch cascade at the front keeps exactly one bank's gets running
+    // (ExecOutA = keep descending, ExecOutB = this bank). With `n_banks == 1`
+    // this emits no gate at all and `entry_of_bank[0]` is simply the detector's
+    // `OnChanged`, so a clip that never spills is wired exactly as the probe
+    // wired it.
+    let cascade::BankCascade { index_of_bank, ge, entry_of_bank } = cascade::bank_cascade(
+        &mut world,
+        &mut chip,
+        &frame_index,
+        WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"),
+        n_banks,
+        bank_size,
+        &service,
+    );
 
     // --- 10. Two gates per band, per bank -----------------------------------
     //
     // Walked in band order, which is image-row order -- never by iterating a
     // map, so two runs of the same clip mint the same brick ids.
     //
-    // A bank boundary costs one extra ArrayVar + Get + Select per BAND, which
+    // A bank boundary costs one extra ArrayVar + Get + Select per band, which
     // at 54 bands is cheap in absolute terms (three orders of magnitude under
-    // colour-array mode's per-PIXEL seam) -- and it only bites past
+    // colour-array mode's per-pixel seam) -- and it only bites past
     // `BANK_FRAMES` (65 535) frames, about 90 minutes at 12 fps.
     for (bi, texts) in band_texts.into_iter().enumerate() {
         // Polled per band, the same way both brick modes poll per pixel. There
         // are only tens of bands rather than thousands of pixels, but a band
-        // carries one string PER FRAME and copies the lot into its `ArrayVar`,
+        // carries one string per frame and copies the lot into its `ArrayVar`,
         // so an iteration here is far from free on a long clip.
         if progress.is_cancelled() {
             return Ok(World::new());
@@ -512,7 +484,7 @@ pub fn build_text_world(
                 index_of_bank[k].clone(),
                 WirePort::new(get, ARRAY_GET, "Index"),
             );
-            // THE FAN-OUT. One exec source drives every band's Get for this
+            // The fan-out: one exec source drives every band's Get for this
             // bank; no chaining, and no exec input ever gains a second source.
             world.add_wire_connection(
                 entry_of_bank[k].clone(),
@@ -561,46 +533,33 @@ pub fn build_text_world(
 
     // --- 10b. Subtitles, if any ---------------------------------------------
     //
-    // LAST, after every band gate exists: `add_subtitle_display` places its
+    // Last, after every band gate exists: `add_subtitle_display` places its
     // own two gates a clear cell beyond the chip's current x extent, which is
     // only collision-free against bricks that are already there.
     //
     // Gated on `opts.subtitles` so a render without a track is untouched.
-    // Anchored at the picture's bottom CENTRE, one cube in front of the glyph
+    // Anchored at the picture's bottom centre, one cube in front of the glyph
     // wall, so the cue lies across the bottom of the picture instead of
     // hanging under it -- see the `ScreenExtent` built below.
     if let Some(subs) = &opts.subtitles {
-        // `opts.source_start_s`, NOT 0.0: a subtitle file is in SOURCE time,
+        // `opts.source_start_s`, not 0.0: a subtitle file is in source time,
         // and frame 0 of what this renderer receives is at source time
         // `--start` (see `AnimOptions::source_start_s`). Timing the cues from
         // zero puts the whole track `--start` seconds early.
         let per_frame = subs.per_frame(opts.source_start_s, info.fps as f64, frame_count)?;
-        // `--subtitle-lift`, along `+z`. Text mode's screen is an upright wall
-        // where `z` genuinely IS the image row, so moving the anchor toward
-        // the picture's TOP means INCREASING z -- the opposite of both brick
-        // encodings' flat, ground-facing screen (`-y`; see
-        // `bricks::subtitle_extent`). **This is the mode
-        // `DEFAULT_SUBTITLE_LIFT` was measured by eye against** -- see its
-        // doc for the exact configuration (192x108, `--subtitle-scale 6`).
+        // `--subtitle-lift` applies along +z here: text mode's screen is an
+        // upright wall where z genuinely is the image row, so moving the
+        // anchor toward the picture's top means increasing z -- the opposite
+        // of both brick encodings' flat, ground-facing screen (-y; see
+        // `bricks::subtitle_extent`). This is the mode `DEFAULT_SUBTITLE_LIFT`
+        // was measured by eye against.
         //
-        // Rejected, not clamped, if it would push the anchor below z=0.
-        //
-        // The reason is TEXT MODE'S OWN, not a claim about `brdb`. This used to
-        // say "main-grid brick coordinates cannot be negative (`brdb`'s chunk
-        // encoding mishandles them)", which is false -- `Position::to_relative`
-        // is exact for negatives and `World::add_brick_grid` already stores
-        // every microchip gate around -1024; see
-        // `bricks::subtitle_extent`, where the same false claim was rejecting
-        // legal BRICK-mode renders and has been dropped.
-        //
-        // What is true here is narrower: this mode keeps its entire main grid
-        // non-negative by construction, because `crate::text::add_text_tiles`
-        // translates the whole glyph grid to make it so
-        // (`a_subtitled_text_render_keeps_every_main_grid_brick_non_negative`
-        // pins it). The subtitle's anchor cube is the one brick placed outside
-        // that translation, so a lift below the picture's own bottom edge would
-        // be the single thing to break the invariant -- which is worth an error
-        // rather than a silent exception to it.
+        // Rejected, not clamped, if it would push the anchor below z=0: text
+        // mode keeps its entire main grid non-negative by construction
+        // (`crate::text::add_text_tiles` translates the whole glyph grid for
+        // it), and the subtitle's anchor cube is the one brick placed outside
+        // that translation, so this is the one thing that could break the
+        // invariant.
         let lift = subtitle_display::lift_units(opts.subtitle_lift);
         let subtitle_z = picture_bottom_z + lift;
         if subtitle_z < 0 {
@@ -626,14 +585,14 @@ pub fn build_text_world(
             opts,
             subtitle_display::ScreenExtent {
                 anchor: Position {
-                    // ONE CUBE IN FRONT of the picture's own surface: the
-                    // subtitle now overlays the picture, and a block drawn in
-                    // the same plane as the glyph wall would z-fight with it.
+                    // One cube in front of the picture's own surface: the
+                    // subtitle overlays the picture, and a block drawn in the
+                    // same plane as the glyph wall would z-fight with it.
                     // Resting the cube flush on that surface puts the
                     // subtitle's glyph plane a full cube (2 units) proud of it.
                     x: picture_front_x + 2 * crate::text::ANCHOR_CUBE_HALF,
                     // The picture's horizontal centre. The band cubes anchor at
-                    // the picture's LEFT edge and the glyphs run toward world
+                    // the picture's left edge and the glyphs run toward world
                     // -Y from there (see `add_text_tiles`), so the centre is
                     // half a picture-width in that direction -- which is why
                     // `centre_shift` slid the whole stack up-y first: without
@@ -643,13 +602,13 @@ pub fn build_text_world(
                             as i32,
                     // The picture's bottom edge, so the cue's own bottom
                     // (`SUBTITLE_ANCHOR`'s Y of 1) sits there and the line
-                    // grows upward INTO the picture -- PLUS `--subtitle-lift`,
+                    // grows upward into the picture, plus `--subtitle-lift`,
                     // which lifts that whole baseline further up-picture still
                     // (see the comment above `lift`).
                     z: subtitle_z,
                 },
                 row_height: opts.text.line_world_height * opts.text.pitch_y,
-                // The screen here IS a vertical wall facing world +X, in the
+                // The screen here is a vertical wall facing world +X, in the
                 // very plane a TextDisplay draws in, so the subtitle uses the
                 // same upright face every glyph band does. (Both brick
                 // encodings lay their screen flat and need `FACE_Z_POSITIVE`
@@ -657,6 +616,19 @@ pub fn build_text_world(
                 face: crate::text::FACE_X_POSITIVE,
             },
         )?;
+    }
+
+    // --- 10c. Control buttons -----------------------------------------------
+    //
+    // Same as both brick modes: default-on physical buttons on the main grid,
+    // wired into the clock's control pins, skipped under `--external-clock` and
+    // when off. Placed beyond the picture's own x extent by `control_anchor`, so
+    // it clears the glyph wall and the subtitle anchor just added. Before
+    // `chip::finish` (its overlap check must see them) and before the final
+    // `register_used_components`.
+    if let (true, Some((pause, restart, resume))) = (opts.control_buttons, control_pins) {
+        let anchor = controls::control_anchor(&world);
+        controls::add_control_buttons(&mut world, pause, restart, resume, anchor);
     }
 
     // --- 11. Publish --------------------------------------------------------
@@ -669,9 +641,9 @@ pub fn build_text_world(
     if progress.is_cancelled() {
         return Ok(World::new());
     }
-    // Asserts non-overlap on BOTH grids before publishing.
+    // Asserts non-overlap on both grids before publishing.
     chip::finish(&mut world, chip)?;
-    // Must be last, and must come AFTER `chip::finish`: it registers every
+    // Must be last, and must come after `chip::finish`: it registers every
     // component type and port name actually used, and has to see all bricks,
     // grids and wires first. `add_text_tiles` already called it once, before
     // the chip existed -- this re-registration is the one that counts.
@@ -681,7 +653,7 @@ pub fn build_text_world(
 
 /// World width of a rendered text-mode picture.
 ///
-/// [`add_text_tiles`] advances one TILE -- `tile_px` image pixels -- by
+/// [`add_text_tiles`] advances one tile -- `tile_px` image pixels -- by
 /// `tile_px * line_world_height * pitch_x`, so one pixel is
 /// `line_world_height * pitch_x` wide and `width_px` of them are this. It is
 /// the same two fields the placement itself uses, on purpose: an independently
@@ -689,46 +661,38 @@ pub fn build_text_world(
 /// subtitle would then be centred on a picture edge that does not exist.
 ///
 /// `char_repeat` deliberately does not appear. The crate's placement model does
-/// not use it either: `pitch_x` is CALIBRATED for the chosen repeat (two block
+/// not use it either: `pitch_x` is calibrated for the chosen repeat (two block
 /// characters per pixel is what makes a Monaspace/Iosevka pixel square), which
 /// is exactly what [`TextOptions::pitch_x`] documents.
 fn picture_width_world(width_px: usize, opts: &TextOptions) -> f32 {
     width_px as f32 * opts.line_world_height * opts.pitch_x
 }
 
-/// World units a SUBTITLED text render slides its whole picture along +Y, and
+/// World units a subtitled text render slides its whole picture along +Y, and
 /// `0` when there are no subtitles.
 ///
-/// Text mode's band cubes anchor at the picture's LEFT edge and their glyphs
+/// Text mode's band cubes anchor at the picture's left edge and their glyphs
 /// run from there toward world -Y, so an unshifted picture occupies
-/// `-width ..= 0` and its horizontal CENTRE -- where the subtitle's anchor cube
+/// `-width ..= 0` and its horizontal centre -- where the subtitle's anchor cube
 /// has to go, since the cue is centred on its anchor -- is at a negative
-/// coordinate. Negative main-grid brick coordinates are not an option HERE --
-/// not because `brdb` cannot encode them (it can; see
-/// `crate::anim::bricks::subtitle_extent`, where that claim was false and has
-/// been dropped) but because this mode keeps its whole main grid non-negative
-/// by construction, via [`crate::text::add_text_tiles`]'s own translation. So
-/// the picture moves instead of the anchor, which keeps the rule whole rather
-/// than carving one brick out of it.
+/// coordinate. This mode keeps its whole main grid non-negative by
+/// construction, via [`crate::text::add_text_tiles`]'s own translation, so the
+/// picture moves instead of the anchor, which keeps the rule whole rather than
+/// carving one brick out of it.
 ///
-/// Half a picture-width, rounded UP, is the least that does it: the centre then
+/// Half a picture-width, rounded up, is the least that does it: the centre then
 /// lands at `ceil(w/2) - round(w/2)`, which is 0 or 1 and never negative. The
 /// glyphs still spill to negative y on the picture's right-hand half, which is
 /// harmless -- they are drawn by a component, not placed as bricks, and that is
 /// already true of every text render today.
-///
-/// This replaced the old `subtitle_headroom`, which lifted the picture UP to
-/// make room for a cue hanging below it. Nothing hangs below it any more (see
-/// [`subtitle_display::SUBTITLE_ANCHOR`]), so that lift is gone; this is a
-/// different axis and a different reason, not a rename of it.
 pub fn subtitle_centre_shift(opts: &AnimOptions, width_px: usize) -> i32 {
     if opts.subtitles.is_none() {
         return 0;
     }
     let half = picture_width_world(width_px, &opts.text) / 2.0;
     // A NaN or negative width would `ceil` into something unusable as a
-    // coordinate, so the floor is applied to the RESULT rather than trusting
-    // the arithmetic -- the same guard the old `subtitle_headroom` applied.
+    // coordinate, so the floor is applied to the result rather than trusting
+    // the arithmetic.
     if half.is_finite() && half > 0.0 {
         half.ceil() as i32
     } else {
@@ -801,7 +765,7 @@ fn sample_frames(
                     out.push(f);
                 }
                 index += 1;
-                // Frames SCANNED, not retained: the retained count halves
+                // Frames scanned, not retained: the retained count halves
                 // periodically, and a tick that went backwards would read as a
                 // bug. There is no total to compare it against here anyway --
                 // this branch runs precisely when the length is unknown.
@@ -835,7 +799,9 @@ mod wire_integrity;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anim::bricks::{ARRAY_GET, ARRAY_VAR, AnimOptions, SELECT};
+    use crate::anim::bricks::{
+        ARRAY_GET, ARRAY_VAR, AnimOptions, BRANCH, COMPARE_GE, SELECT, SUBTRACT,
+    };
     use crate::anim::text_layout::plan_bands;
     use crate::progress::NoProgress;
     use crate::video::Clip;
@@ -938,8 +904,8 @@ mod tests {
     }
 
     /// The same regression both brick modes carry (see
-    /// `bricks::tests::a_cancel_while_packing_builds_no_graph_at_all`):
-    /// stopping the decode loop used to leave every later phase to run anyway.
+    /// `bricks::tests::a_cancel_while_packing_builds_no_graph_at_all`): a
+    /// cancel mid-decode must build no graph at all.
     #[test]
     fn a_cancel_while_packing_builds_no_graph_at_all() {
         const TOTAL_FRAMES: usize = 120;
@@ -954,7 +920,7 @@ mod tests {
         let full = build_text_world(&c, &AnimOptions::default(), &mut ran).expect("build");
         assert!(
             !full.bricks.is_empty() && !full.grids.is_empty(),
-            "the uncancelled control must actually build a graph, or this test proves nothing"
+            "the uncancelled control must actually build a graph"
         );
 
         assert!(stopped.bricks.is_empty(), "a cancelled render must place no text bricks");
@@ -963,14 +929,14 @@ mod tests {
     }
 
     /// Text mode's extra cancellation point: the palette pass, a whole second
-    /// traversal of the source that runs BEFORE the encode loop and so is
+    /// traversal of the source that runs before the encode loop and so is
     /// reached by no other cancellation test in the crate.
     ///
     /// `cancel_after` is set inside the sample budget, so the flag is already
     /// up when sampling ends -- the encode pass and the entire build behind it
     /// must then be skipped rather than run.
     ///
-    /// Asserted on the PHASE list rather than on the returned world: the
+    /// Asserted on the phase list rather than on the returned world: the
     /// post-decode check would produce an empty world here too, having decoded
     /// the clip a second time first. Only the absence of a "packing frames"
     /// phase shows the encode pass was never entered.
@@ -1016,7 +982,7 @@ mod tests {
     }
 
     /// Write a world out and reopen it, returning the reader plus the chip's
-    /// persistent grid id (assigned at WRITE time, so it has to be discovered
+    /// persistent grid id (assigned at write time, so it has to be discovered
     /// by reading entities back). Lifted from `tests/anim_color.rs`.
     fn write_and_open(
         world: &brdb::World,
@@ -1046,7 +1012,7 @@ mod tests {
     }
 
     /// Every `<color="` tag across every band string actually persisted in the
-    /// save. Component DATA is only reachable through a written file --
+    /// save. Component data is only reachable through a written file --
     /// `BrdbComponent` exposes the component type but not its values -- so this
     /// round-trips, the same way `tests/anim_color.rs` reads its colour arrays.
     fn total_color_tags(world: &brdb::World) -> usize {
@@ -1093,24 +1059,26 @@ mod tests {
 
     #[test]
     fn each_band_anchor_sits_at_its_own_image_row_with_no_depth_stack() {
-        let opts = AnimOptions::default();
+        // Buttons off: their labels are TextDisplays too, and this counts and
+        // positions the picture's band anchors, not the control labels.
+        let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
         let w = build_text_world(&clip(192, 8, 2), &opts, &mut NoProgress).unwrap();
         let anchors = text_anchor_positions(&w);
         assert_eq!(anchors.len(), plan_bands(192, 8, 2).unwrap().len());
-        // `add_text_tiles` stacks a tile's extra bands along world X, so DEPTH
+        // `add_text_tiles` stacks a tile's extra bands along world X, so depth
         // is x -- one anchor per band means nothing may stack there.
         let mut depths: Vec<i32> = anchors.iter().map(|p| p.x).collect();
         depths.sort_unstable();
         depths.dedup();
         assert_eq!(depths.len(), 1, "anchors must not stack in depth: {depths:?}");
-        // ... and each band must anchor at its OWN image row, which is z.
+        // ... and each band must anchor at its own image row, which is z.
         let mut rows: Vec<i32> = anchors.iter().map(|p| p.z).collect();
         rows.sort_unstable();
         rows.dedup();
         assert_eq!(rows.len(), anchors.len(), "each band must sit at its own height");
     }
 
-    /// Run at BOTH a small size and the 192x108 this mode is reported at: the
+    /// Run at both a small size and the 192x108 this mode is reported at: the
     /// latter puts 54 bands in the chip, whose lattice then spans far enough to
     /// land inner bricks in more than one brick chunk -- exactly where a wire's
     /// chunk-relative brick index can go wrong. The multi-bank case is included
@@ -1173,22 +1141,22 @@ mod tests {
             "one select per band per boundary"
         );
         // The rest of the boundary hardware: one subtract, one comparator and
-        // one branch per boundary, all SHARED across bands. Spelled out here so
+        // one branch per boundary, all shared across bands. Spelled out here so
         // the cost formula has a witness -- gates are every inner brick that is
-        // not one of the chip's five I/O pins.
+        // not one of the chip's seven I/O pins.
         let (banks, boundaries) = (3usize, 2usize);
         for shared in [SUBTRACT, COMPARE_GE, BRANCH] {
             assert_eq!(count_components(&w, shared), boundaries, "{shared} per boundary");
         }
         assert_eq!(
-            w.grids[0].1.len() - 5,
-            2 * bands * banks + 5 + boundaries * 3 + boundaries * bands,
-            "2 per band per bank + the 5 service gates + 3 shared per boundary + 1 select per \
+            w.grids[0].1.len() - 7,
+            2 * bands * banks + 7 + boundaries * 3 + boundaries * bands,
+            "2 per band per bank + the 7 service gates + 3 shared per boundary + 1 select per \
              band per boundary"
         );
     }
 
-    /// The sampling pass must span the WHOLE clip, not its opening shot -- a
+    /// The sampling pass must span the whole clip, not its opening shot -- a
     /// source with scene cuts would otherwise get a palette from frame 0
     /// alone. Pinned on both `FrameSource` shapes: one that reports its own
     /// length (the seek path) and one that does not (the decimating fallback).
@@ -1245,7 +1213,7 @@ mod tests {
         );
         assert!(
             *indices.last().expect("non-empty") >= 80,
-            "the fallback must reach the END of the clip, not just its first frames: {indices:?}"
+            "the fallback must reach the end of the clip, not just its first frames: {indices:?}"
         );
     }
 
@@ -1276,7 +1244,7 @@ mod tests {
         }
     }
 
-    /// Exec **fan-in** is the unverified case, so this design must never
+    /// Exec fan-in is the unverified case, so this design must never
     /// produce it: no exec input may have two sources, at any bank count.
     #[test]
     fn no_exec_input_ever_has_two_sources() {
@@ -1319,22 +1287,25 @@ mod tests {
         );
     }
 
-    /// **The headline number.** A 192x108 screen is 54 bands, so a
+    /// The headline number: a 192x108 screen is 54 bands, so a
     /// single-bank render must cost exactly `2 * 54 + 5` gates -- two per band
     /// plus the shared clock chain and change detector -- against brick mode's
-    /// 2 per PIXEL. Gates are every inner-grid brick that is not one of the
+    /// 2 per pixel. Gates are every inner-grid brick that is not one of the
     /// chip's five I/O pins (Pause, Restart, Resume, Rate, Done), counted the
     /// same way `tests/anim_color.rs` counts them.
     #[test]
     fn a_192x108_render_costs_two_gates_per_band_plus_the_clock() {
-        let w = build_text_world(&clip(192, 108, 2), &AnimOptions::default(), &mut NoProgress)
-            .expect("build");
+        // Buttons off: `w.bricks.len()` below counts the band anchor cubes and
+        // the shell, not the default-on control buttons (3 more main-grid
+        // bricks). The inner-grid gate count is unaffected by them either way.
+        let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+        let w = build_text_world(&clip(192, 108, 2), &opts, &mut NoProgress).expect("build");
         let bands = plan_bands(192, 108, 2).unwrap().len();
         assert_eq!(bands, 54, "192 wide at char_repeat 2 bands 2 rows at a time");
         assert_eq!(
-            w.grids[0].1.len() - 5,
-            2 * bands + 5,
-            "two gates per band, plus the 4-gate clock chain and the change detector"
+            w.grids[0].1.len() - 7,
+            2 * bands + 7,
+            "two gates per band, plus the 6-gate clock and the change detector"
         );
         assert_eq!(
             w.bricks.len(),
@@ -1343,7 +1314,7 @@ mod tests {
         );
     }
 
-    /// The service stage must sit strictly BEHIND every band stage, or the
+    /// The service stage must sit strictly behind every band stage, or the
     /// clock can collide with the deepest band gates. Mirrors
     /// `color_bricks`'s equivalent, since the two share the arithmetic.
     #[test]

@@ -33,19 +33,14 @@ pub fn ffmpeg_available() -> bool {
 
 /// Keep a spawned helper process from flashing a console window on Windows.
 ///
-/// **Every `ffprobe` spawn in this crate goes through here.** Without
-/// `CREATE_NO_WINDOW`, a console-subsystem child launched from the GUI (which
-/// is built `windows_subsystem = "windows"` and so has no console of its own)
-/// gets one allocated for it, and the user sees a black box blink open and
-/// shut -- most visibly when picking an audio file, which probes it for a
-/// duration before anything else happens.
+/// Every raw `ffprobe` spawn in this crate goes through here. Without
+/// `CREATE_NO_WINDOW`, a console-subsystem child launched from the GUI
+/// (built `windows_subsystem = "windows"`, so it has no console of its own)
+/// gets one allocated for it, flashing a black box open and shut.
+/// `FfmpegCommand` needs no such call -- `ffmpeg-sidecar` sets the same flag
+/// itself -- so only the raw `std::process::Command` spawns need this.
 ///
-/// `FfmpegCommand` needs no such call: `ffmpeg-sidecar` sets the same flag in
-/// its own constructor, and so does the `ffmpeg_is_installed` above. It is only
-/// the raw `std::process::Command` spawns that are ours to remember.
-///
-/// A no-op off Windows, where the flag does not exist and no window is created
-/// in the first place.
+/// A no-op off Windows, where the flag does not exist.
 pub fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
     #[cfg(windows)]
     {
@@ -106,26 +101,149 @@ fn refusal() -> String {
         .to_string()
 }
 
+/// A crate-owned mirror of `ffmpeg_sidecar`'s download progress events.
+///
+/// Deliberately NOT the sidecar's own `FfmpegDownloadProgressEvent`: keeping a
+/// type of our own here means the sidecar enum never leaks into this crate's
+/// signatures (the GUI's shared progress cell and the CLI's stderr printer both
+/// speak this), so a sidecar bump that reshapes its event type is a one-line
+/// change in [`translate_progress`] rather than a ripple through the panes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfmpegDownloadProgress {
+    /// The fetch has begun but no bytes have arrived yet (connecting).
+    Starting,
+    /// Bytes are arriving. `total` is 0 when the server sent no
+    /// `Content-Length`, in which case a percentage is a fabrication -- see
+    /// [`download_fraction`].
+    Downloading { done: u64, total: u64 },
+    /// The archive is downloaded and is being unpacked to its final location.
+    Unpacking,
+    /// ffmpeg is installed and ready.
+    Done,
+}
+
+/// Translate one `ffmpeg_sidecar` download event into this crate's own
+/// [`FfmpegDownloadProgress`]. The one place the sidecar's enum is named, so a
+/// version bump that reshapes it touches only here.
+fn translate_progress(
+    event: ffmpeg_sidecar::download::FfmpegDownloadProgressEvent,
+) -> FfmpegDownloadProgress {
+    use ffmpeg_sidecar::download::FfmpegDownloadProgressEvent as E;
+    match event {
+        E::Starting => FfmpegDownloadProgress::Starting,
+        E::Downloading { total_bytes, downloaded_bytes } => FfmpegDownloadProgress::Downloading {
+            done: downloaded_bytes,
+            total: total_bytes,
+        },
+        E::UnpackingArchive => FfmpegDownloadProgress::Unpacking,
+        E::Done => FfmpegDownloadProgress::Done,
+    }
+}
+
+/// The fraction downloaded so far, in `[0.0, 1.0]`, or `None` when `total` is 0
+/// -- which is how the sidecar reports a server that sent no `Content-Length`.
+/// A percentage of an unknown total would be a fabrication, so callers show an
+/// indeterminate bar in that case rather than a made-up number.
+pub fn download_fraction(done: u64, total: u64) -> Option<f32> {
+    (total > 0).then(|| (done as f32 / total as f32).clamp(0.0, 1.0))
+}
+
+/// How long a download may go without a single new byte before it is treated
+/// as stalled. The gyan.dev Windows mirror is notoriously slow and
+/// rate-limited under load, and a dead connection there is indistinguishable
+/// from a crawling one except by this silence -- so 30s of no bytes is
+/// reported as a stall rather than as normal slowness.
+pub const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a download whose most recent byte arrived `since_last_byte` ago
+/// should be reported as stalled. A pure function of the elapsed time so the
+/// threshold decision is unit-testable without a real socket or a 30s sleep --
+/// nothing here aborts anything, this only decides whether to show the "looks
+/// stalled" message driven off the timestamp the callback records.
+pub fn download_is_stalled(since_last_byte: std::time::Duration) -> bool {
+    since_last_byte >= STALL_AFTER
+}
+
+/// Prints ffmpeg-download progress to stderr as a single carriage-return line.
+///
+/// This is what keeps `--yes` (and an answered `Ask`) from being a silent
+/// multi-minute hang: the gyan.dev Windows build is slow, and without a
+/// visible percentage a working-but-crawling download looks identical to a
+/// dead one. `\r` keeps it to one rewritten line; the trailing spaces clear a
+/// longer previous line, and `Done` ends it with a newline. A no-op-on-error
+/// sink -- a failed write to stderr must never fail the install.
+fn cli_stderr_progress(progress: FfmpegDownloadProgress) {
+    let mut err = std::io::stderr();
+    match progress {
+        FfmpegDownloadProgress::Starting => {
+            let _ = write!(err, "\rDownloading ffmpeg: connecting...          ");
+        }
+        FfmpegDownloadProgress::Downloading { done, total } => {
+            let done_mb = done as f64 / 1_000_000.0;
+            match download_fraction(done, total) {
+                Some(frac) => {
+                    let _ = write!(
+                        err,
+                        "\rDownloading ffmpeg: {:>3.0}% ({:.1}/{:.1} MB)   ",
+                        frac * 100.0,
+                        done_mb,
+                        total as f64 / 1_000_000.0,
+                    );
+                }
+                None => {
+                    let _ = write!(err, "\rDownloading ffmpeg: {done_mb:.1} MB   ");
+                }
+            }
+        }
+        FfmpegDownloadProgress::Unpacking => {
+            let _ = write!(err, "\rDownloading ffmpeg: unpacking...            ");
+        }
+        FfmpegDownloadProgress::Done => {
+            let _ = writeln!(err, "\rDownloading ffmpeg: done.                   ");
+        }
+    }
+    let _ = err.flush();
+}
+
 /// Makes sure an `ffmpeg` binary is available, per `consent`.
+///
+/// The CLI entry point: identical to [`ensure_ffmpeg_with_progress`] except
+/// that progress goes to stderr as a carriage-return percentage line (see
+/// [`cli_stderr_progress`]). Every existing caller -- the CLI's
+/// `--yes`/`--no-download`/prompt path, and the GUI workers that call this with
+/// [`DownloadConsent::Never`] purely to reuse one open path -- keeps working
+/// unchanged; only the consenting branches actually reach the sink, so a
+/// `Never` call prints nothing. The GUI's download modal calls
+/// [`ensure_ffmpeg_with_progress`] directly instead, with a sink that drives a
+/// real progress bar.
+pub fn ensure_ffmpeg(consent: DownloadConsent) -> Result<(), String> {
+    ensure_ffmpeg_with_progress(consent, cli_stderr_progress)
+}
+
+/// Makes sure an `ffmpeg` binary is available, per `consent`, reporting
+/// download progress through `progress`.
 ///
 /// Already-installed ffmpeg (found the same way [`ffmpeg_available`] finds
 /// it -- `PATH` or next to the running executable) short-circuits every
 /// variant of `consent` to `Ok`, including [`DownloadConsent::Never`]: an
-/// existing install is not something to refuse.
+/// existing install is not something to refuse, and `progress` is never called.
 ///
-/// Otherwise: [`DownloadConsent::Always`] downloads immediately via
-/// `ffmpeg_sidecar::download::auto_download`. [`DownloadConsent::Ask`]
-/// prompts on stdin, unless stdin is not a terminal, in which case it is
-/// downgraded to [`DownloadConsent::Never`] by [`resolve_consent`] before it
-/// ever reaches a read. [`DownloadConsent::Never`] always refuses with
-/// [`refusal`]'s message.
-pub fn ensure_ffmpeg(consent: DownloadConsent) -> Result<(), String> {
+/// Otherwise: [`DownloadConsent::Always`] downloads immediately.
+/// [`DownloadConsent::Ask`] prompts on stdin, unless stdin is not a terminal,
+/// in which case it is downgraded to [`DownloadConsent::Never`] by
+/// [`resolve_consent`] before it ever reaches a read. [`DownloadConsent::Never`]
+/// always refuses with [`refusal`]'s message. Both consenting branches funnel
+/// through [`download_ffmpeg`], so both report progress through the same sink.
+pub fn ensure_ffmpeg_with_progress(
+    consent: DownloadConsent,
+    progress: impl Fn(FfmpegDownloadProgress),
+) -> Result<(), String> {
     if ffmpeg_available() {
         return Ok(());
     }
 
     match resolve_consent(consent, std::io::stdin().is_terminal()) {
-        DownloadConsent::Always => download_ffmpeg(),
+        DownloadConsent::Always => download_ffmpeg(progress),
         DownloadConsent::Never => Err(refusal()),
         DownloadConsent::Ask => {
             // `resolve_consent` above has already ruled out a non-terminal
@@ -144,7 +262,7 @@ pub fn ensure_ffmpeg(consent: DownloadConsent) -> Result<(), String> {
 
             let mut answer = String::new();
             match std::io::stdin().read_line(&mut answer) {
-                Ok(_) if answer.trim().eq_ignore_ascii_case("y") => download_ffmpeg(),
+                Ok(_) if answer.trim().eq_ignore_ascii_case("y") => download_ffmpeg(progress),
                 _ => Err(refusal()),
             }
         }
@@ -152,11 +270,21 @@ pub fn ensure_ffmpeg(consent: DownloadConsent) -> Result<(), String> {
 }
 
 /// The one call in this file that actually reaches the network. Kept as its
-/// own function so [`ensure_ffmpeg`]'s two consenting branches
+/// own function so [`ensure_ffmpeg_with_progress`]'s two consenting branches
 /// (`Always`, and `Ask` answered "y") share one code path and one error
 /// message rather than two copies that could drift.
-fn download_ffmpeg() -> Result<(), String> {
-    ffmpeg_sidecar::download::auto_download().map_err(|e| format!("failed to download ffmpeg: {e}"))
+///
+/// Uses `auto_download_with_progress` rather than the blocking, silent
+/// `auto_download`: the download is a real 100 MB fetch from a slow mirror, and
+/// a caller with no progress feed cannot tell a crawling download from a dead
+/// one. Each `read` off the socket fires the sidecar's callback, which is
+/// translated into a crate-owned [`FfmpegDownloadProgress`] before reaching
+/// `progress` -- the sidecar's own event type never escapes this function.
+fn download_ffmpeg(progress: impl Fn(FfmpegDownloadProgress)) -> Result<(), String> {
+    ffmpeg_sidecar::download::auto_download_with_progress(move |event| {
+        progress(translate_progress(event));
+    })
+    .map_err(|e| format!("failed to download ffmpeg: {e}"))
 }
 
 /// A re-openable [`FrameSource`] backed by a spawned `ffmpeg` process.
@@ -356,16 +484,10 @@ impl FrameSource for FfmpegSource {
     fn open(&self) -> Result<Box<dyn FrameStream + '_>, String> {
         let mut cmd = FfmpegCommand::new();
         // Overrides the constructor's default `-loglevel level+info`: stderr
-        // must carry only genuine errors, since `FfmpegFrameStream::finish`
-        // below treats any leftover stderr text as a decode error.
-        //
-        // `hide_banner` is not just cosmetic here: measured directly against
-        // this ffmpeg build, the startup version/build banner prints to
-        // stderr at "info" severity regardless of a later `-v error`
-        // overriding the *effective* level for the rest of the run -- only
-        // `-hide_banner` suppresses it. Without this, every successful decode
-        // would surface that banner text as a false "ffmpeg reported an
-        // error".
+        // must carry only genuine errors, since `finish` below treats any
+        // leftover stderr as a decode error. `hide_banner` matters too --
+        // ffmpeg's startup banner prints at "info" severity regardless of
+        // `-v error`, and only `-hide_banner` suppresses it.
         cmd.hide_banner();
         cmd.args(["-v", "error"]);
         cmd.arg("-i").arg(&self.path);
@@ -376,20 +498,12 @@ impl FrameSource for FfmpegSource {
         if let Some(vf) = self.filtergraph() {
             cmd.args(["-vf", &vf]);
         }
-        // Deliberately NOT `ffmpeg-sidecar`'s `.rawvideo()` helper, which is
-        // hard-coded to `-f rawvideo -pix_fmt rgb24 -`. Appending a
-        // `-pix_fmt rgba` before it does not win: ffmpeg takes the LAST
-        // occurrence of an output option, so the helper's rgb24 silently
-        // overrides the override. Measured directly -- piping a 64x36 clip
-        // through `-pix_fmt rgba -f rawvideo -pix_fmt rgb24` produced 34560
-        // bytes for 5 frames (64*36*3*5, i.e. rgb24), not the 46080 rgba
-        // would give. So the args are built explicitly here instead.
-        //
-        // rgba, not rgb24, because `FitMode::Contain`'s letterbox padding
-        // must be genuinely transparent so it is culled downstream (see
-        // `filtergraph`). ffmpeg converts yuv420p content to rgba with alpha
-        // 255 for real pixels, so no per-pixel widening is needed on our side
-        // at all.
+        // Not `ffmpeg-sidecar`'s `.rawvideo()` helper: it hard-codes
+        // `-pix_fmt rgb24`, and ffmpeg takes the last occurrence of an
+        // output option, so appending `-pix_fmt rgba` first would not win.
+        // rgba (not rgb24) is what lets `FitMode::Contain`'s letterbox
+        // padding be genuinely transparent so it is culled downstream (see
+        // `filtergraph`).
         cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"]);
 
         let mut child = cmd
@@ -521,12 +635,8 @@ impl FrameStream for FfmpegFrameStream {
             ));
         }
 
-        // `open` asks ffmpeg for `-pix_fmt rgba` directly, so the pipe is
-        // already in `RgbaImage`'s exact layout -- no per-pixel widening, and
-        // no chance of the shifted-colour-channel bug that assuming the wrong
-        // format would cause silently. ffmpeg gives real content alpha 255
-        // and `FitMode::Contain`'s pad filter gives letterboxing alpha 0,
-        // which is the whole reason for using rgba over rgb24.
+        // `open` asks ffmpeg for `-pix_fmt rgba`, so the pipe is already in
+        // `RgbaImage`'s exact layout -- no per-pixel widening.
         let frame = RgbaImage::from_raw(self.width, self.height, buf)
             .ok_or_else(|| "decoded frame buffer had the wrong size".to_string())?;
         Ok(Some(frame))
@@ -536,14 +646,12 @@ impl FrameStream for FfmpegFrameStream {
     ///
     /// The bytes themselves cannot be skipped: ffmpeg has already decoded and
     /// written them, and the pipe has to be drained in order or the next read
-    /// lands mid-frame. What CAN be skipped is everything `next` does around
-    /// the read -- a fresh `frame_bytes`-sized allocation, faulted in a page
-    /// at a time as it fills, and an `RgbaImage` built over it -- for the
-    /// `n - 1` frames being passed over. At 1080p that is 8.3 MB per frame,
-    /// and on a 30fps→10fps render it is two frames in every three.
+    /// lands mid-frame. What can be skipped is everything `next` does around
+    /// the read -- a fresh `frame_bytes`-sized allocation and an `RgbaImage`
+    /// built over it -- for the `n - 1` frames being passed over.
     ///
     /// `n <= 1` delegates straight to `next`, because there is nothing to
-    /// pass over and routing it through the scratch buffer would ADD a copy.
+    /// pass over and routing it through the scratch buffer would add a copy.
     /// The drain paths hand back whatever is in the scratch buffer, which is
     /// the last frame actually read -- exactly what the default body would
     /// have returned, and what `FpsStream` repeats when a source ends between
@@ -603,22 +711,10 @@ impl FrameStream for FfmpegFrameStream {
 }
 
 impl Drop for FfmpegFrameStream {
-    /// Best-effort cleanup for a stream dropped before it drained -- e.g. a
-    /// caller that errors out elsewhere mid-render. A no-op error (ignored)
-    /// if the process already exited via `finish`.
-    ///
-    /// `kill()` alone only SIGNALS the child -- `ffmpeg-sidecar`'s `kill`
-    /// forwards straight to `std::process::Child::kill`, which does not reap.
-    /// Without the `wait()` below the process is never collected: a zombie on
-    /// Unix, and on Windows a race against the input file's handle being
-    /// released, since nothing confirms the process actually exited. That was
-    /// always latent (a stream dropped mid-render), and the GUI's mid-render
-    /// cancel -- which drops the stream at an arbitrary frame rather than
-    /// only at clean end of stream -- makes it routine. `wait()` cannot
-    /// deadlock here: stderr is drained by its own thread from `open`, so
-    /// there is no full pipe for the child to block on. The result is
-    /// ignored because the process is being torn down and a failure to reap
-    /// is not actionable.
+    /// Best-effort cleanup for a stream dropped before it drained (e.g. a
+    /// mid-render cancel). `kill()` alone only signals the child; `wait()`
+    /// is what actually reaps it (a zombie on Unix otherwise), and cannot
+    /// deadlock here since stderr is drained on its own thread from `open`.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -705,27 +801,12 @@ fn probe_metadata(path: &Path) -> Result<ProbedInfo, String> {
 }
 
 /// Whether ffprobe's `avg_frame_rate` and `r_frame_rate` disagree -- the
-/// standard signal that a stream is genuinely variable frame rate rather
-/// than constant, chosen over the alternative (comparing `nb_frames` against
-/// `duration * avg_frame_rate`) because `avg_frame_rate` is itself commonly
-/// COMPUTED from `nb_frames`/`duration` by ffprobe, which would make that
-/// comparison close to a tautology.
-///
-/// For genuinely constant frame rate content the two rationals coincide
-/// EXACTLY -- confirmed here against real `ffprobe` output on a plain
-/// integer rate (10/1 both) and a fractional NTSC-style rate (30000/1001
-/// both). For variable frame rate content `r_frame_rate` reports a finer
-/// time base than the true average, since it has to be able to represent
-/// every distinct inter-frame gap the stream actually contains: measured
-/// here on a clip built from a 1s/6fps segment concatenated with a
-/// 1s/24fps one (`ffmpeg -f lavfi -i testsrc2=rate=6:duration=1 -f lavfi -i
-/// testsrc2=rate=24:duration=1 -filter_complex concat=n=2:v=1:a=0 -fps_mode
-/// vfr ...`), `ffprobe` reports `avg_frame_rate=40/3` against
-/// `r_frame_rate=24/1` -- clearly disjoint, not rounding noise.
-///
-/// Compared as exact rationals (cross-multiplied in [`parse_rational`]), not
-/// as floats, so no tolerance needs tuning and no floating-point rounding
-/// can paper over a genuine mismatch or manufacture a fake one.
+/// standard signal that a stream is genuinely variable frame rate, chosen
+/// over comparing `nb_frames` against `duration * avg_frame_rate` because
+/// `avg_frame_rate` is itself commonly computed from those, making that
+/// comparison close to a tautology. Compared as exact rationals
+/// (cross-multiplied in [`parse_rational`]), not as floats, so there is no
+/// tolerance to tune.
 fn frame_rates_disagree(avg: &str, r: &str) -> bool {
     match (parse_rational(avg), parse_rational(r)) {
         (Some((an, ad)), Some((rn, rd))) => an * rd != rn * ad,
@@ -820,23 +901,14 @@ pub(crate) mod tests {
     }
 
     /// Builds a genuinely variable-frame-rate clip: a 1s@6fps segment
-    /// concatenated with a 1s@24fps one via `-filter_complex concat`,
-    /// encoded with `-fps_mode vfr` so the CONTAINER keeps the real, unequal
-    /// inter-frame gaps rather than ffmpeg conforming them away at ENCODE
-    /// time -- this file's DECODE-time conformance (see `open`'s comment on
-    /// `-fps_mode`, and `frame_count_hint`'s doc in `probe`) is what needs a
-    /// source that genuinely varies to exercise. `-coder 1` matches every
-    /// other generator in this file (CABAC), though entropy coding itself is
-    /// irrelevant here.
+    /// concatenated with a 1s@24fps one, encoded with `-fps_mode vfr` so the
+    /// container keeps the real, unequal inter-frame gaps instead of ffmpeg
+    /// conforming them away at encode time -- `open`'s own decode-time
+    /// conformance needs a source that genuinely varies to exercise. ffprobe
+    /// reports `nb_frames=30` for this clip (6 + 24), but decoding it the way
+    /// `FfmpegSource::open` does emits 50.
     ///
-    /// Measured against this exact clip: `ffprobe` reports `nb_frames=30`
-    /// (6 + 24, correct for the untouched container), but decoding it the
-    /// same way `FfmpegSource::open` does (no `-fps_mode`, so ffmpeg's
-    /// default conforms to a fixed output rate) emits 50 frames -- the
-    /// duplicate-frame gap-fill this task's fix has to account for.
-    ///
-    /// Skips (returns `None`), never fails, when ffmpeg is not on `PATH`,
-    /// the same convention as `sample_clip`/`sample_clip_args`.
+    /// Skips (returns `None`), never fails, when ffmpeg is not on `PATH`.
     fn sample_vfr_clip(name: &str) -> Option<std::path::PathBuf> {
         if !ffmpeg_available() {
             eprintln!("SKIPPING {name}: ffmpeg not on PATH");
@@ -858,13 +930,10 @@ pub(crate) mod tests {
         ok.then_some(path)
     }
 
-    /// **The `.mkv` progress-bar case.** Matroska stores no frame count, so
-    /// ffprobe's `nb_frames` is `N/A` and `frame_count_hint` is honestly
-    /// `None` -- which left the render's bar with no total at all, drawn as an
-    /// indeterminate spinner that reads as a hang. The duration IS known, and
-    /// for constant-rate content `duration * fps` is what the stream really
-    /// emits; the estimate has to be within a frame or two of that or it is
-    /// not worth showing.
+    /// Matroska stores no frame count, so `frame_count_hint` is honestly
+    /// `None`. The duration is known, and for constant-rate content
+    /// `duration * fps` is what the stream really emits, so the estimate has
+    /// to be within a frame or two of that or it is not worth showing.
     #[test]
     fn an_mkv_has_no_hint_but_estimates_a_total_that_matches_what_it_emits() {
         let Some(path) = sample_mkv("ffmpeg_mkv_estimate", 2, 64, 48, 10) else { return };
@@ -891,17 +960,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A VFR source gets NO estimate, deliberately.
-    ///
-    /// Its duration is known, so an estimate is available -- and it is wrong
-    /// in a specific, systematic direction: `out_fps` is the AVERAGE rate
-    /// while `open`'s conformance duplicates frames up to a fixed one, so
-    /// `duration * average` comes out ~46% SHORT on this exact clip (27
-    /// against 50, measured). A bar that fills barely halfway through and then
-    /// keeps growing is a worse lie than a spinner that admits it has no
-    /// total, so `probe` withholds the estimate here. This test is what stops
-    /// a future "we know the duration, just use it" simplification from
-    /// quietly reintroducing that.
+    /// A VFR source gets no estimate, deliberately: its duration is known,
+    /// but `out_fps` is the AVERAGE rate while `open`'s conformance
+    /// duplicates frames up to a fixed one, so `duration * average` is
+    /// systematically short of what actually gets emitted. A bar that fills
+    /// partway and then keeps growing is a worse lie than an honest spinner.
     #[test]
     fn a_variable_frame_rate_clip_gets_no_estimate_rather_than_a_systematically_short_one() {
         let Some(path) = sample_vfr_clip("vfr_no_estimate") else { return };
@@ -938,18 +1001,11 @@ pub(crate) mod tests {
         ok.then_some(path)
     }
 
-    /// **The regression test for Important 1/2.** Before this fix,
-    /// `frame_count_hint` blindly trusted ffprobe's `nb_frames` whenever no
-    /// `fps` filter was requested -- for a genuinely variable-frame-rate
-    /// source, that is a lie: `open`'s default output timing duplicates
-    /// frames to conform the variable input to a fixed rate. Measured on
-    /// `sample_vfr_clip`'s exact clip: `nb_frames` says 30, the pipe emits
-    /// 50. Confirmed this test FAILS against the pre-fix code (which always
-    /// returned `probed.nb_frames` here) -- it asserted `Some(30)` while the
-    /// stream actually produced 50 frames, i.e. exactly the "hint doesn't
-    /// match what was emitted" violation this task exists to close (checked
-    /// by hand against the prior `frame_count_hint` implementation before
-    /// this fix landed; see this task's report).
+    /// `frame_count_hint` must not blindly trust ffprobe's `nb_frames` when
+    /// no `fps` filter is requested: for a genuinely variable-frame-rate
+    /// source, `open`'s default output timing duplicates frames to conform
+    /// the input to a fixed rate, so `nb_frames` (30 on this clip) understates
+    /// what the pipe actually emits (50).
     #[test]
     fn a_variable_frame_rate_clip_gets_an_honest_hint() {
         let Some(path) = sample_vfr_clip("vfr_hint") else { return };
@@ -1173,6 +1229,76 @@ pub(crate) mod tests {
             err.contains("--backend") || err.to_lowercase().contains("install"),
             "error must tell the user what to do: {err}"
         );
+    }
+
+    /// Every sidecar download event must map onto the crate-owned type, byte
+    /// counts preserved -- this translation is the only place the sidecar's
+    /// enum is named, so if it drifts nothing else in the crate would notice.
+    #[test]
+    fn every_sidecar_event_translates_to_the_crate_type() {
+        use ffmpeg_sidecar::download::FfmpegDownloadProgressEvent as E;
+        assert_eq!(translate_progress(E::Starting), FfmpegDownloadProgress::Starting);
+        assert_eq!(
+            translate_progress(E::Downloading { total_bytes: 101, downloaded_bytes: 42 }),
+            FfmpegDownloadProgress::Downloading { done: 42, total: 101 },
+            "downloaded_bytes -> done and total_bytes -> total, not swapped"
+        );
+        assert_eq!(translate_progress(E::UnpackingArchive), FfmpegDownloadProgress::Unpacking);
+        assert_eq!(translate_progress(E::Done), FfmpegDownloadProgress::Done);
+    }
+
+    /// The percentage is honest: a real fraction while the total is known, and
+    /// `None` -- not a fabricated 0% or a divide-by-zero -- when the server
+    /// sent no `Content-Length` (the sidecar reports `total = 0` then).
+    #[test]
+    fn download_fraction_is_none_without_a_known_total() {
+        assert_eq!(download_fraction(50, 0), None, "no Content-Length means no percentage");
+        assert_eq!(download_fraction(0, 100), Some(0.0));
+        assert_eq!(download_fraction(25, 100), Some(0.25));
+        assert_eq!(download_fraction(100, 100), Some(1.0));
+        // A server that over-reports (done past total) must clamp, never draw
+        // a bar past its own end.
+        assert_eq!(download_fraction(150, 100), Some(1.0), "clamped, never over 1.0");
+    }
+
+    /// The stall decision is purely the elapsed time crossing [`STALL_AFTER`]:
+    /// a fresh byte is not stalled, and a long silence is -- no socket, no
+    /// sleep, just the timestamp arithmetic the modal drives off.
+    #[test]
+    fn a_download_is_stalled_only_after_the_threshold_of_silence() {
+        use std::time::Duration;
+        assert!(!download_is_stalled(Duration::from_secs(0)), "a fresh byte is not a stall");
+        assert!(
+            !download_is_stalled(STALL_AFTER - Duration::from_millis(1)),
+            "just under the threshold is not yet a stall"
+        );
+        assert!(download_is_stalled(STALL_AFTER), "exactly the threshold counts");
+        assert!(
+            download_is_stalled(STALL_AFTER + Duration::from_secs(60)),
+            "a long silence is certainly a stall"
+        );
+    }
+
+    /// The plumbing: `download_ffmpeg` must forward every event to its sink,
+    /// translated. When ffmpeg is already installed the sidecar returns before
+    /// emitting anything, so this only asserts what it CAN without a network --
+    /// that a no-op sink type-checks through the whole chain, and that on an
+    /// already-installed machine the sink is simply never called (no spurious
+    /// events). The real event forwarding is exercised end to end by the
+    /// GUI-side plumbing test and, if run, a live download.
+    #[test]
+    fn download_forwards_translated_events_to_its_sink() {
+        use std::sync::Mutex;
+        let seen: Mutex<Vec<FfmpegDownloadProgress>> = Mutex::new(Vec::new());
+        // Only exercise the sink wiring when ffmpeg is already present, so this
+        // never actually reaches out to the network in CI.
+        if ffmpeg_available() {
+            let _ = download_ffmpeg(|p| seen.lock().unwrap().push(p));
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "an already-installed ffmpeg short-circuits before any event is emitted"
+            );
+        }
     }
 
     /// `FitMode::Contain`'s letterbox padding must be fully TRANSPARENT, the

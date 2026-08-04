@@ -1,8 +1,8 @@
 //! The closed-form band layout for text mode.
 //!
 //! Text components are physical bricks at fixed positions with fixed wiring,
-//! so the image rows a given component draws MUST NOT move between frames.
-//! The layout is therefore decided ONCE, from a worst-case bound on row width,
+//! so the image rows a given component draws must not move between frames.
+//! The layout is therefore decided once, from a worst-case bound on row width,
 //! before a single frame is looked at: a row of `width` pixels costs at most
 //! `width * (TAG_CHARS + char_repeat)` characters, because the worst case is
 //! every pixel changing colour and so emitting its own `<color="RRGGBB">` tag.
@@ -24,13 +24,13 @@
 use crate::text::MAX_COMPONENT_CHARS;
 
 /// Characters one `<color="RRGGBB">` tag costs: `<color="` (8) + 6 hex + `">`
-/// (2). The worst-case row bound assumes EVERY pixel emits one, which is what
+/// (2). The worst-case row bound assumes every pixel emits one, which is what
 /// `heightmap::text::encode_row` does when no two neighbours share a colour.
 const TAG_CHARS: usize = 16;
 
 /// One `TextDisplay`'s worth of image rows, fixed for the whole clip.
 ///
-/// Each band is meant to get its OWN anchor cube at its own image row (see
+/// Each band is meant to get its own anchor cube at its own image row (see
 /// `heightmap::text::add_text_tiles`), rather than one shared anchor with
 /// leading newlines pushing each band down: that alternative stacks bands in
 /// depth and needs a component `Offset.Z` the game does not honour past a

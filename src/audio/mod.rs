@@ -19,7 +19,7 @@ pub mod voices;
 /// that follow spectral peaks and writes both pitch and volume.
 ///
 /// A shared type rather than a `bool` in each front end, because the two modes
-/// disagree about what several flags MEAN -- `--max-voices` most sharply (an
+/// disagree about what several flags mean -- `--max-voices` most sharply (an
 /// upper bound on bands sounding vs the number of speakers built, with 0 legal
 /// in one and an error in the other) -- and every place that has to branch on
 /// that should be branching on the same thing the CLI parsed.
@@ -29,7 +29,7 @@ pub enum AudioMode {
     /// and broadband material.
     #[default]
     Bank,
-    /// `--max-voices` speakers that TRACK spectral peaks, changing pitch and
+    /// `--max-voices` speakers that track spectral peaks, changing pitch and
     /// volume every frame -- no band grid, so no tuning error. Best for tonal
     /// material such as piano.
     Voice,
@@ -48,7 +48,7 @@ impl AudioMode {
 
     /// Display name for UIs.
     ///
-    /// These describe what each mode DOES rather than how it is implemented:
+    /// These describe what each mode does rather than how it is implemented:
     /// `Bank` gives every speaker one fixed pitch and moves only its volume,
     /// and `Voice` re-pitches a handful of speakers every frame to track
     /// spectral peaks. The `--audio-mode` spellings ([`Self::flag`]) are

@@ -5,6 +5,11 @@
 //! (`srt`, `ass` and `vtt`) and produce a [`Subtitles`] track; this module
 //! only knows how to time one against a clock, not how to read a file
 //! format.
+//!
+//! Every parser here keeps "found no cues" and "could not read this as the
+//! format at all" as separate outcomes: a silently empty track renders as a
+//! video with no dialogue, indistinguishable from a correct render of a
+//! quiet scene.
 
 pub mod ass;
 // `ffmpeg-sidecar` spawns a subprocess, so this is native-only -- gated the
@@ -17,32 +22,16 @@ pub mod vtt;
 
 /// Parse subtitle text with whichever parser the file is in, choosing by
 /// `extension` first and sniffing the content when that does not settle it.
-///
-/// A DISPATCHER, not a parser: it knows only how to tell [`srt`], [`ass`] and
-/// [`vtt`] apart. It lives here rather than in any one parser because both the
-/// CLI's `--subtitles` and the GUI's subtitle picker need exactly this
-/// decision, and two copies of it would drift -- a file the CLI read as ASS and
-/// the GUI read as SubRip would render two different subtitle tracks from one
-/// file.
+/// Lives here (not in any one parser) because both the CLI's `--subtitles`
+/// and the GUI's subtitle picker need this exact decision, and two copies of
+/// it could drift.
 ///
 /// The extension is authoritative when it is one this crate knows (`srt`,
-/// `ass`, `ssa`, `vtt`, `webvtt`, matched case-insensitively). Anything else --
-/// `.txt`, `.sub`, no extension at all, a file picked out of a browser sandbox
-/// -- falls back to sniffing, in this order:
-///
-/// 1. a `WEBVTT` signature at the very front, which is WebVTT's only
-///    unambiguous marker. It is tested FIRST because WebVTT also contains
-///    `-->`, so testing the arrow first would hand every WebVTT file to the
-///    SubRip parser, which cannot read one (different fraction separator,
-///    optional hours field, a header block with no arrow at all);
-/// 2. `[Events]`, ASS's own section header, which appears in no SubRip file;
-/// 3. `-->`, SubRip's timing arrow, which appears in no ASS file.
-///
-/// A file matching none is an `Err` naming the markers, never a silently
-/// empty track: an empty track renders as a video with no dialogue, which is
-/// indistinguishable from a correct render of a scene where nobody speaks.
-/// (An EMPTY `.srt` still parses to an empty track -- that is the parser's own
-/// documented "no cues is valid" stance, and the extension said what it was.)
+/// `ass`, `ssa`, `vtt`, `webvtt`, case-insensitive). Anything else falls back
+/// to sniffing, in this order: a `WEBVTT` signature first (VTT also contains
+/// `-->`, so testing the arrow first would steal every VTT file for the
+/// SubRip parser), then `[Events]` (ASS), then `-->` (SubRip). No match is an
+/// `Err` naming the markers, never an empty track.
 pub fn parse_auto(text: &str, extension: Option<&str>) -> Result<Subtitles, String> {
     match extension.map(|e| e.to_lowercase()).as_deref() {
         Some("srt") | Some("subrip") => return srt::parse(text),
@@ -116,20 +105,11 @@ impl Subtitles {
 
     /// The subtitle text active at time `t_s`, or `""` if none covers it.
     ///
-    /// A cue covers `t_s` when `start_s <= t_s < end_s` -- the end is
-    /// exclusive so that two adjacent cues sharing a boundary instant (one
-    /// ending exactly where the next begins) do not both match at that
-    /// instant.
-    ///
-    /// **Overlap resolution:** when more than one cue covers `t_s` (e.g. a
-    /// sign translation running over dialogue), the cue with the greatest
-    /// `start_s` -- the most recently begun -- wins. This is a deliberate
-    /// simplification: merging overlapping lines would need layout rules
-    /// (which line goes on top, how to fit both) that this module does not
-    /// have. A linear scan is fine here because this is the RANDOM-ACCESS
-    /// entry point, called once per query; [`Subtitles::per_frame`] walks
-    /// time forwards and uses a sweep instead, precisely so that a large
-    /// track does not cost `frames * cues`.
+    /// `start_s <= t_s < end_s` (end exclusive, so two adjacent cues sharing
+    /// a boundary instant don't both match). When more than one cue covers
+    /// `t_s` (e.g. a sign translation over dialogue), the one with the
+    /// greatest `start_s` wins -- merging overlapping lines would need
+    /// layout rules this module does not have.
     pub fn at(&self, t_s: f64) -> &str {
         self.cues
             .iter()
@@ -139,36 +119,15 @@ impl Subtitles {
             .unwrap_or("")
     }
 
-    /// Renders one subtitle string per output frame, `frames` long, starting
-    /// at clip time `start_s` and advancing by `1.0 / fps` per frame.
+    /// Renders one cue string per frame from `start_s` at `fps`. Rejects
+    /// non-finite/<=0 fps (NaN slips a bare `<=0` guard). A heap sweep, not
+    /// `frames` calls to [`Subtitles::at`], so a 100k-cue ASR track is not
+    /// `O(frames * cues)`; `per_frame_agrees_with_at_on_a_dense_overlapping_track`
+    /// pins the two as equivalent.
     ///
-    /// `fps` must be finite and positive, checked with `!fps.is_finite() ||
-    /// fps <= 0.0` rather than `fps <= 0.0` alone -- the latter is false for
-    /// `NaN` and lets it slip through to produce a garbage array of
-    /// timestamps. `audio::stft::hop_for` shipped exactly that bug once
-    /// already in this project.
-    ///
-    /// Returns `Result` rather than panicking: this is reached from the GUI's
-    /// render thread as well as the CLI, and an `Err` surfaces there as a
-    /// message while a panic takes the window with it. Returning an all-empty
-    /// track instead would be worse than either -- it renders as a video with
-    /// no dialogue, which is indistinguishable from a correct render of a
-    /// silent scene.
-    ///
-    /// **A SWEEP, not `frames` calls to [`Subtitles::at`].** Frame times only
-    /// ever increase, so a cue whose `end_s` has passed can never match
-    /// again: cues enter a max-heap keyed on `start_s` as their start is
-    /// reached, and expire off the top once passed. That makes this
-    /// `O((frames + cues) log cues)` instead of `O(frames * cues)`. The naive
-    /// form was documented as safe because a track has "at most a few
-    /// thousand cues", but word-level ASR caption exports routinely run 50k
-    /// to 200k, and 100k cues against a 60k-frame render is ~6e9 iterations
-    /// run synchronously before any progress is reported -- indistinguishable
-    /// from a hang.
-    ///
-    /// The result is identical to calling `at` per frame, cue for cue; the
-    /// `cues_agree_with_at_on_a_dense_overlapping_track` test below pins that
-    /// against a generated track.
+    /// Returns `Result` rather than panicking: this is reached from the
+    /// GUI's render thread as well as the CLI, and an `Err` surfaces there as
+    /// a message while a panic takes the window with it.
     pub fn per_frame(
         &self,
         start_s: f64,
@@ -250,6 +209,88 @@ impl Subtitles {
         }
         Ok(out)
     }
+}
+
+/// An unsigned integer written in ASCII digits and nothing else -- no sign,
+/// no exponent, no `inf`. Every timestamp component in every parser here
+/// (`srt`, `ass`, `vtt`) is read through this rather than `f64::from_str`,
+/// which also accepts `inf`/`NaN`/exponents/signs -- each of those would
+/// parse to a cue no frame time can ever fall inside, silently dropped from
+/// the render with no diagnostic at all.
+fn digits(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Parses a `H:MM:SS<sep>frac` timestamp -- or, when `hours_optional` is
+/// set, also the hours-less `MM:SS<sep>frac` -- into seconds. `sep` is the
+/// fraction's separator (`,` for SubRip, `.` for ASS and WebVTT); `frac_scale`
+/// is what the fractional part counts in (`1000.0` for milliseconds, `100.0`
+/// for centiseconds). Every component goes through [`digits`], so a sign,
+/// `inf`, `NaN` or exponent anywhere in the timestamp is rejected rather than
+/// silently producing a cue no frame time can fall inside.
+fn parse_timestamp(s: &str, sep: char, frac_scale: f64, hours_optional: bool) -> Option<f64> {
+    let s = s.trim();
+    let (hms, frac) = s.split_once(sep)?;
+    let parts: Vec<&str> = hms.split(':').collect();
+    let (hours, minutes, seconds) = if hours_optional {
+        match parts.as_slice() {
+            [m, sec] => (0u64, digits(m)?, digits(sec)?),
+            [h, m, sec] => (digits(h)?, digits(m)?, digits(sec)?),
+            _ => return None,
+        }
+    } else {
+        match parts.as_slice() {
+            [h, m, sec] => (digits(h)?, digits(m)?, digits(sec)?),
+            _ => return None,
+        }
+    };
+    let frac = digits(frac)?;
+    Some(hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds as f64 + frac as f64 / frac_scale)
+}
+
+/// Rejects a cue whose end precedes its start, naming `format` (e.g.
+/// `"SubRip"`) and `context` (each caller's own `{:?}`-quoted source text) in
+/// the message. A reversed cue can never satisfy `start_s <= t < end_s` in
+/// [`Subtitles::at`], so accepting it would drop that one line from the
+/// render with no diagnostic at all -- the per-cue form of the empty-track
+/// failure this module's docs forbid.
+fn reject_reversed(format: &str, start_s: f64, end_s: f64, context: &str) -> Result<(), String> {
+    if end_s < start_s {
+        return Err(format!(
+            "{format} cue ends before it starts ({start_s}s --> {end_s}s): {context}"
+        ));
+    }
+    Ok(())
+}
+
+/// Splits already newline-normalized `text` into blocks of consecutive
+/// non-blank lines, on a separator of one or more lines that are blank AFTER
+/// trimming. Shared by `srt` and `vtt`, whose cue blocks are both separated
+/// this way (`ass` is not: it reads its `[Events]` section line by line).
+///
+/// The trim matters: a separator line holding only a space or tab is
+/// invisible in an editor but is not `""`, so splitting on a literal
+/// `"\n\n"` would merge the blocks either side of it -- one cue's text
+/// swallowing the next cue's timing line, and that next cue vanishing with
+/// no error.
+fn blocks(text: &str) -> Vec<Vec<&str>> {
+    let mut blocks = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+    // The appended "" flushes the last block in text that does not end blank.
+    for line in text.lines().chain(std::iter::once("")) {
+        if !line.trim().is_empty() {
+            block.push(line);
+            continue;
+        }
+        if !block.is_empty() {
+            blocks.push(std::mem::take(&mut block));
+        }
+    }
+    blocks
 }
 
 /// Maps a non-NaN `f64` to a `u64` whose unsigned ordering matches the
@@ -429,8 +470,6 @@ mod tests {
 
     #[test]
     fn a_file_that_is_neither_format_errors_rather_than_parsing_to_nothing() {
-        // An all-empty track is indistinguishable in game from a correct
-        // render of a scene where nobody speaks, so this must never be one.
         let err = parse_auto("just some prose\nwith no timings at all\n", Some("txt"))
             .expect_err("must reject");
         assert!(err.contains("[Events]"), "names the ASS marker: {err}");
@@ -447,11 +486,8 @@ mod tests {
     #[test]
     fn per_frame_rejects_a_nonsense_fps_rather_than_timing_against_it() {
         let s = Subtitles::new(vec![cue(1.0, 2.0, "hi")]);
-        // NaN is the one that matters: `fps <= 0.0` alone is FALSE for NaN, so
-        // a guard written that way lets it through and every timestamp becomes
-        // NaN -- which matches no cue, yielding a silent all-empty track that
-        // looks exactly like a correct render of a scene with no dialogue.
-        // `audio::stft::hop_for` shipped this bug once already.
+        // NaN is the one that matters: a bare `fps <= 0.0` guard is false
+        // for NaN and lets it through.
         for bad in [f64::NAN, 0.0, -12.0, f64::INFINITY] {
             let err = s
                 .per_frame(0.0, bad, 3)

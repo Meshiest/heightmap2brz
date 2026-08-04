@@ -1,19 +1,14 @@
 //! The speaker cluster and its wiring.
 //!
 //! Two components per band per bank: an `ArrayVar` of `f64` volumes and an
-//! `ArrayVar_Get` that reads it. The get's `Value` wires DIRECTLY into that
-//! speaker's `VolumeMultiplier` -- no `Component_BrickPropertyChanger`,
-//! because unlike brick colour, volume is a real wire input.
+//! `ArrayVar_Get` that reads it into that speaker's `VolumeMultiplier` -- no
+//! `Component_BrickPropertyChanger`, since volume is a real wire input.
+//! Pitch and the audio asset are build-time component data: no gates, no wires.
 //!
-//! Pitch and the audio asset are build-time component data, costing no gates
-//! and no wires at all.
-//!
-//! Four further inputs are surfaced as microchip pins (see
-//! [`build_speaker_world`]'s attenuation section): `Inner Radius`,
-//! `Max Distance` and `Directional` fan straight out to every speaker's
-//! matching emitter port, and `Volume` scales every band through a per-band
-//! multiply. Every one of them keeps a baked component value underneath, which
-//! is what the speaker reads while the pin is unwired.
+//! Four more inputs are microchip pins: `Inner Radius`, `Max Distance` and
+//! `Directional` fan out to every speaker's matching emitter port, `Volume`
+//! scales every band through a per-band multiply. Each keeps a baked value
+//! underneath for when its pin is unwired.
 use super::bands::{BandKind, PITCH_MAX, PITCH_MIN};
 use super::track::{AudioOptions, VoiceTrack};
 use super::voices::VoiceStreams;
@@ -27,19 +22,14 @@ use brdb::{
     AsBrdbValue, Brick, BrickType, IntVector, Position, Vector3f, WirePort, World,
     assets::{
         LiteralComponent,
-        external::{ASSET_TYPES, BA_SYNTH_BASIC_SINE, BA_SYNTH_NOISE_PINK, BA_SYNTH_NOISE_WHITE},
+        external::{ASSET_TYPES, BA_SYNTH_NOISE_PINK, BA_SYNTH_NOISE_WHITE},
     },
     schema::{BrdbValue, WireArrayVariant, WireVariant},
 };
 
-/// The emitter component's type name.
-///
-/// **No `BrickComponentType_` prefix.** That prefix belongs to the wire-graph
-/// gate components only; this one is a plain `Component_*`, and the name is
-/// resolved by string lookup in global data with no validation anywhere, so a
-/// "corrected" name would encode fine and do nothing in game. Verified against
-/// `COMPONENT_TYPE_STRUCT_PAIRS` in brdb 0.9.1 (see
-/// `docs/superpowers/notes/2026-07-28-audio-feasibility.md`).
+/// The emitter component's type name: a plain `Component_*` (no
+/// `BrickComponentType_` prefix), resolved by unvalidated string lookup, so a
+/// wrong name encodes fine and does nothing in game.
 pub const AUDIO_EMITTER: &str = "Component_AudioEmitter";
 pub const SPEAKER_BRICK: &str = "B_1x1F_Speaker";
 
@@ -53,74 +43,40 @@ pub const BUFFER_TICKS: &str = "BrickComponentType_WireGraphPseudo_BufferTicks";
 pub const COMPARE_NE: &str = "BrickComponentType_WireGraph_Expr_CompareNotEqual";
 /// The external asset type every synth descriptor lives under.
 pub const AUDIO_ASSET_TYPE: &str = "BrickAudioDescriptor";
-/// `B_1x1F_Speaker`'s TRUE half-extents, from the game's brick catalog.
-///
-/// NOTE: this is *not* what the build-time overlap check measures -- see
-/// [`speaker_half`]. Only ever used as a FLOOR under the measured value.
+/// `B_1x1F_Speaker`'s true half-extents, from the game's brick catalog. Not
+/// what the build-time overlap check measures -- see [`speaker_half`]. Only
+/// ever used as a floor under the measured value.
 const SPEAKER_HALF: IntVector = IntVector { x: 5, y: 5, z: 2 };
 
-/// Lattice "height" fed to [`lattice_pos_staged`] for the service rows.
-///
-/// The video renderer passes the screen's height there because its service
-/// gates sit behind a real pixel lattice. This chip has no pixel lattice at
-/// all, so row 0 is the front row and 1 is the smallest height that puts it
-/// there: `x = (height - 1 - row) * CELL + half.x`, i.e. `-row * CELL + 5`.
-/// Every row index used below is <= 0, so every x is >= 5 -- which is the
-/// whole point, see [`build_speaker_world`]'s `service`.
+/// Lattice "height" fed to [`lattice_pos_staged`] for the service rows: 1, so
+/// row 0 is the front row and every used row index maps to x >= 5.
 const LATTICE_HEIGHT: i32 = 1;
 
-/// Default baked `InnerRadius` / `MaxDistance` for every speaker, in game units
-/// (10 units = 1 brick). The game's own single-prop values; `--inner-radius` /
-/// `--max-distance` raise them (e.g. 400 / 4000) for one flat equal-level field
-/// across a large build.
-///
-/// 15 is below the cluster's ~44-unit diagonal (see [`cluster_dims`]), so the
-/// bank attenuates within itself -- near-field and local, not a flat field.
-/// `bSpatialization = false` stops panning but NOT distance attenuation, so
-/// this applies regardless.
-///
-/// Written explicitly, not left to brdb's `STRUCT_DEFAULTS`: that table is
-/// regenerated per build, so a retuned game default would silently move every
-/// render. 0.0 is not a safe "unset" -- a zero `MaxDistance` is audible nowhere.
+/// Default baked `InnerRadius` / `MaxDistance` per speaker, game units (10 = 1
+/// brick). Written explicitly, never left to brdb's `STRUCT_DEFAULTS`
+/// (regenerated per build). 15 sits inside the cluster's diagonal (see
+/// [`cluster_dims`]), so the bank attenuates within itself; `--inner-radius` /
+/// `--max-distance` raise it for a flat field. `bSpatialization = false` does
+/// NOT disable distance attenuation.
 pub const DEFAULT_INNER_RADIUS: f32 = 15.0;
 pub const DEFAULT_MAX_DISTANCE: f32 = 400.0;
 
-/// Baked `bSpatialization`, i.e. what the `Directional` pin overrides.
-///
-/// MUST stay `false`. The whole bank design rests on the speakers summing as
-/// 2D sources: spatialized emitters at 32 distinct positions comb-filter
-/// against each other and the mix changes as the listener walks. Note the
-/// game's own default here is `true`, so omitting this field does not merely
-/// leave the value unspecified -- it turns spatialization ON.
-///
-/// It does NOT switch off distance attenuation, which is why the radii above
-/// matter even in a default render.
+/// Baked `bSpatialization`, overridden by the `Directional` pin. Must stay
+/// `false`: spatialized emitters at 32 distinct positions comb-filter against
+/// each other as the listener moves. Game default is `true`, so omitting this
+/// field turns spatialization ON. Does NOT disable distance attenuation.
 const SPATIALIZATION: bool = false;
 
-/// Baked `InputB` on the per-band volume multiply, i.e. what the `Volume` pin
-/// overrides.
-///
-/// MUST stay `1.0`: this is the gain the multiply applies while nothing is
-/// attached to the pin, so any other value rescales every render that never
-/// touches the pin at all. `0.0` would mute the entire bank, in game only.
+/// Baked `InputB` on the per-band volume multiply, overridden by the `Volume`
+/// pin. Must stay `1.0`: it's the gain applied while the pin is unwired, so
+/// any other value rescales every render that never touches the pin.
 const VOLUME_SCALE: f64 = 1.0;
 
-/// The speaker brick's half-size AS THE BUILD-TIME OVERLAP CHECK MEASURES IT,
-/// floored at the brick's true size.
-///
-/// Derived from `local_bounds()` rather than hardcoded, because `chip::finish`
-/// runs `layout::assert_bricks_dont_overlap` and that measures every brick the
-/// same way: a spacing derived from anything else can disagree with the
-/// checker and the whole render is rejected. brdb 0.9.1 knows no basic brick's
-/// real size and returns a flat (5, 5, 6) guess for every one, this speaker
-/// included, whose true half-extent is [`SPEAKER_HALF`] (5, 5, 2). Spacing on
-/// the guess is always safe -- it is bigger than the brick, never smaller, so
-/// the only in-game consequence is a little air between the speakers. A
-/// hardcoded 4-unit pitch (the true height) reads as a collision and is
-/// rejected before it can be written; that is not hypothetical, it happened.
-///
-/// The `.max` floor covers the opposite case: a build whose catalog reports
-/// something SMALLER than the brick really is.
+/// The speaker brick's half-size as `layout::assert_bricks_dont_overlap`
+/// measures it (from `local_bounds`), floored at the true size
+/// ([`SPEAKER_HALF`]). brdb 0.9.1 returns a flat (5, 5, 6) guess for every
+/// basic brick; spacing on the guess is always safe (bigger, never smaller),
+/// while a hardcoded true height reads as a collision and is rejected.
 pub fn speaker_half() -> IntVector {
     let (min, max) = Brick {
         asset: BrickType::from(SPEAKER_BRICK),
@@ -134,33 +90,11 @@ pub fn speaker_half() -> IntVector {
     }
 }
 
-/// Slot counts `(nx, ny, nz)` for a compact, near-cubic cluster of `n`
-/// speakers.
-///
-/// WHY A CLUSTER AND NOT A COLUMN. `bSpatialization = false` turns off panning
-/// but NOT distance attenuation, so where a speaker is decides how loud it is.
-/// A column of 32 is 372 units end to end -- comparable to the whole audible
-/// range -- so a listener standing anywhere hears the near bands and not the
-/// far ones: the bank is spatially filtered into a slice of the spectrum that
-/// changes as they walk. Packing the same 32 into 4x3x3 makes the greatest
-/// separation between any two speakers about 43 units, a tenth of the inner
-/// radius, so every band reaches the listener at the same level. That
-/// equality, not compactness for its own sake, is the point.
-///
-/// THE SHAPE. `nx` is the smallest integer with `nx^3 >= n`, `ny` the smallest
-/// with `nx*ny^2 >= n`, and `nz = ceil(n / (nx*ny))` -- so `nx >= ny >= nz`,
-/// the box is within one slot of cubic for every `n`, and there are always at
-/// least `n` slots. Integer arithmetic throughout, deliberately: `cbrt(27.0)`
-/// is `3.0000000000000004` on some targets and `ceil` would make it 4.
-///
-/// The largest count lands on x and the smallest on z because the measured
-/// cell (see [`speaker_half`]) is 10 x 10 x 12 -- taller than it is wide -- so
-/// the fewest layers belong on the long axis. For 32 that is 4x3x3 = 40 x 30 x
-/// 24 units of centres, whose diagonal is the ~43 units above.
-///
-/// DETERMINISM. A pure function of `n` alone. Band `k` must land in the same
-/// slot on every run, or two renders of the same file differ and a listener
-/// comparing them is comparing geometry, not audio.
+/// Slot counts (nx,ny,nz) for a compact near-cubic cluster of n speakers,
+/// nx>=ny>=nz. Compact because bSpatialization=false leaves distance
+/// attenuation on, so a spread bank is heard as a slice of the spectrum.
+/// Integer-only: cbrt(27.0) can be 3.0000000000000004 and ceil to 4. Pure
+/// function of n (two renders of one file must place band k identically).
 pub fn cluster_dims(n: usize) -> (usize, usize, usize) {
     let n = n.max(1);
     let mut nx = 1usize;
@@ -175,17 +109,11 @@ pub fn cluster_dims(n: usize) -> (usize, usize, usize) {
     (nx, ny, nz)
 }
 
-/// Where speaker `index` of `total` sits on the main grid.
-///
-/// x fastest, then y, then z, over the slots [`cluster_dims`] hands back. Each
-/// index below `total` gets its OWN slot: two speakers sharing a position
-/// overlap, and an overlap makes the game silently delete one of the two
-/// bricks -- a band that vanishes with nothing anywhere to say so.
-///
-/// Every coordinate is >= 0. The main grid tolerates negatives (only the
-/// chip's INNER grid deletes bricks at negative coordinates), but keeping the
-/// cluster in the positive octant is what lets the chip sit at a fixed
-/// negative x and clear it for ANY band count -- see [`build_speaker_world`].
+/// Where speaker `index` of `total` sits on the main grid: x fastest, then y,
+/// then z, over the slots [`cluster_dims`] hands back. Each index gets its own
+/// slot -- an overlap makes the game silently delete one of the two bricks.
+/// Coordinates stay >= 0 so the chip can sit at a fixed negative x and clear
+/// the cluster for any band count.
 pub fn speaker_position(index: usize, total: usize) -> Position {
     let (nx, ny, _) = cluster_dims(total);
     let half = speaker_half();
@@ -199,36 +127,19 @@ pub fn speaker_position(index: usize, total: usize) -> Position {
     }
 }
 
-/// Low-x face of the in-chip speaker block, in inner-grid units.
-///
-/// The service gates occupy rows 0..-10, which [`service`] maps onto x in
-/// `[0, 110]` -- row -10 (the per-speaker volume multiplies) is the farthest,
-/// at x-face 110. Starting the speaker block here leaves a full gate cell (10
-/// units) of clearance past that, so it can never collide with a gate: growing the
-/// band count lengthens the service rows along y (more columns), NEVER along x,
-/// so this margin holds for every render. `chip::finish` asserts non-overlap on
-/// the inner grid, so a clash here would be a loud build error, not a silent
-/// drop -- but by construction there is none.
+/// Low-x face of the in-chip speaker block, in inner-grid units. Service gates
+/// occupy rows 0..-10, mapped by [`service`] onto x in `[0, 110]`; starting the
+/// block at 120 leaves a full gate cell of clearance. Growing the band count
+/// lengthens the service rows along y, never x, so the margin holds for any render.
 const SPEAKER_BLOCK_X: i32 = 120;
 
-/// Where in-chip speaker `index` of `total` sits on the chip's INNER grid, for
-/// [`AudioOptions::speakers_in_chip`].
-///
-/// The same compact [`cluster_dims`] packing as [`speaker_position`] -- so band
-/// `k` lands in the same relative slot -- but offset past the service rows into
-/// empty inner-grid space (see [`SPEAKER_BLOCK_X`]) and lifted onto the
-/// interaction plane at [`STAGE_BASE_Z`] like every gate.
-///
-/// Every coordinate is NON-NEGATIVE. That is not cosmetic: negative inner-grid
-/// coordinates delete bricks in-game (see `chip::finish`), and
-/// `Chip::recompute_plane_extent` carries a `debug_assert` against them. The
-/// block's low faces are `x = SPEAKER_BLOCK_X`, `y = 0`, `z = STAGE_BASE_Z`, all
-/// at or above zero for every slot.
-///
-/// The layout is purely PHYSICAL: an emitter on a microchip inner grid plays
-/// from the chip's world position, not from its brick position, so unlike
-/// [`speaker_position`] this shape buys no near-field geometry -- it only has to
-/// be non-overlapping and non-negative. See [`AudioOptions::speakers_in_chip`].
+/// Where in-chip speaker `index` of `total` sits on the chip's inner grid, for
+/// [`AudioOptions::speakers_in_chip`]. Same [`cluster_dims`] packing as
+/// [`speaker_position`], offset past the service rows ([`SPEAKER_BLOCK_X`]) and
+/// lifted onto [`STAGE_BASE_Z`]. Coordinates stay non-negative: negative
+/// inner-grid coordinates delete bricks in-game. An emitter on the inner grid
+/// plays from the chip's world position, so this shape buys no near-field
+/// geometry -- it only needs to be non-overlapping.
 pub fn speaker_inner_position(index: usize, total: usize) -> Position {
     let (nx, ny, _) = cluster_dims(total);
     let half = speaker_half();
@@ -242,35 +153,20 @@ pub fn speaker_inner_position(index: usize, total: usize) -> Position {
     }
 }
 
-/// Where a service gate at lattice (`col`, `row`) sits inside the chip.
-///
-/// Rows are numbered BACKWARD from the clock (0) through the select cascade
-/// (-9) and the master-volume multiplies (-10): the negative row index is this
-/// crate's established way of saying "further back in the service lattice", and
-/// it is what the video renderer uses too.
-///
-/// It is only a row INDEX, never a coordinate. This turns it into
-/// `x = (LATTICE_HEIGHT - 1 - row) * CELL + half.x`, so a more negative row
-/// lands further along POSITIVE x, and every brick in the chip stays in the
-/// non-negative octant. That matters twice over: negative inner-grid
-/// coordinates delete bricks in-game (see `chip::finish`'s doc comment for how
-/// that was found), and `Chip::recompute_plane_extent` carries a
-/// `debug_assert` against them. Writing the coordinate straight from the row
-/// (`y: row * CELL`) puts every service gate at a negative y and trips both.
+/// Where a service gate at lattice (`col`, `row`) sits inside the chip. Rows
+/// count backward from the clock (0) through the select cascade (-9) and the
+/// master-volume multiplies (-10). `row` is an index, not a coordinate: it maps
+/// to `x = (LATTICE_HEIGHT - 1 - row) * CELL + half.x`, so a more negative row
+/// lands further along positive x and every brick stays in the non-negative
+/// octant (negative inner-grid coordinates delete bricks in-game).
 fn service(col: i32, row: i32) -> Position {
     lattice_pos_staged(col, row, 0, LATTICE_HEIGHT, GATE_HALF, STAGE_PITCH)
 }
 
 /// Reject an attenuation setting that would encode perfectly and be audible
-/// nowhere.
-///
-/// Both radii are baked as bare `f32`s into every emitter, and nothing
-/// downstream looks at them again: a NaN, an infinity or a zero encodes
-/// perfectly and produces a bank that is silent, or audible nowhere, only in
-/// game. Owned here rather than by the flag parser, so the GUI and any other
-/// caller is covered by the same guard -- and called by
-/// [`cost::check`](crate::audio::cost::check) as well as by both builders, so
-/// the refusal reaches the front end BEFORE the analysis instead of after it.
+/// nowhere: a NaN, infinity or zero radius encodes fine and is silent only in
+/// game. Shared by the flag parser, the GUI and [`cost::check`](crate::audio::cost::check),
+/// so the refusal lands before the analysis runs, not after.
 pub(crate) fn check_attenuation(opts: &AudioOptions) -> Result<(), String> {
     for (flag, value) in [
         ("--inner-radius", opts.inner_radius),
@@ -294,26 +190,15 @@ pub(crate) fn check_attenuation(opts: &AudioOptions) -> Result<(), String> {
 }
 
 /// Build one speaker carrying a baked `Component_AudioEmitter`, mint its brick
-/// id (returned, for wiring its ports), and PLACE it: on the world's main grid
-/// straight away when `deferred` is `None`, or -- for
-/// [`AudioOptions::speakers_in_chip`] -- pushed into `deferred` for the caller
-/// to hand to `Chip::add_brick` once the chip exists (the chip is built by
-/// [`scaffold`], AFTER this loop, and `with_id_split` is idempotent so the id
-/// minted here survives that second placement unchanged).
+/// id (for wiring its ports), and place it: on the main grid when `deferred`
+/// is `None`, or pushed into `deferred` for [`AudioOptions::speakers_in_chip`]
+/// to hand to `Chip::add_brick` once the chip exists.
 ///
-/// `position` is where the brick goes -- [`speaker_position`] for the main-grid
-/// cluster, [`speaker_inner_position`] for the in-chip block -- and is the
-/// caller's to choose so the two placements share this one builder.
-///
-/// Shared by both render modes: the emitter's settings are audible (see
-/// [`DEFAULT_INNER_RADIUS`] and [`SPATIALIZATION`]), so a second copy of this
-/// for the voice mode would be a second instrument that only sounds the same
-/// until one of them is retuned.
-///
-/// `pitch` is the STARTING pitch. In the band bank it is the band's fixed pitch
-/// and nothing ever writes it again; in voice mode it is frame 0's value and a
-/// wire overwrites it every frame. Either way it is what a paused or unwired
-/// chip plays, so it must be a real note.
+/// `position` is [`speaker_position`] for the main-grid cluster or
+/// [`speaker_inner_position`] for the in-chip block. `pitch` is the starting
+/// pitch: the band's fixed pitch in the bank (never rewritten), or frame 0's
+/// value in voice mode (overwritten every frame by a wire) -- either way it's
+/// what a paused or unwired chip plays.
 fn add_emitter(
     world: &mut World,
     asset_name: &str,
@@ -324,39 +209,23 @@ fn add_emitter(
 ) -> Result<usize, String> {
     let mut data: std::collections::HashMap<brdb::BString, Box<dyn AsBrdbValue>> =
         std::collections::HashMap::new();
-    // Bare `f32`, NOT a `WireVariant`. `BrickComponentData_AudioEmitter`
-    // declares `PitchMultiplier` and `VolumeMultiplier` as plain `f32`
-    // fields (see `BRSavedComponentChunkSoA_max.schema`), not the tagged
-    // wire-graph union that gate ports use -- a `WireVariant::Number`
-    // here compiles and then fails at encode time with
-    // `UnimplementedCast("f32", WireVariant)`. Same trap as the clock's
-    // `BitwiseOR.InputB`.
+    // Bare `f32`, not a `WireVariant`: the schema declares PitchMultiplier and
+    // VolumeMultiplier as plain f32 fields, not the tagged wire-graph union
+    // gate ports use, so a WireVariant here compiles and fails at encode with
+    // UnimplementedCast("f32", WireVariant).
     data.insert(
         "PitchMultiplier".into(),
         Box::new(pitch) as Box<dyn AsBrdbValue>,
     );
-    // 2D sound. Without this, a cluster of emitters at distinct positions
-    // comb-filters against itself and the mix changes as the listener
-    // moves -- the single thing that would make a swarm unusable.
-    //
-    // This is ALSO the value the `Directional` pin overrides, and it is
-    // what stands while that pin is unwired -- so it must keep describing
-    // the default (2D) build, not the pin's existence. See [`SPATIALIZATION`].
+    // 2D sound: emitters at distinct positions would otherwise comb-filter
+    // against each other as the listener moves. Also what `Directional`
+    // overrides while unwired.
     data.insert(
         "bSpatialization".into(),
         Box::new(SPATIALIZATION) as Box<dyn AsBrdbValue>,
     );
-    // The two attenuation radii the `Inner Radius` / `Max Distance` pins
-    // override. These are LIVE in a default render, not inert:
-    // `bSpatialization = false` disables panning only, and distance
-    // attenuation applies regardless -- which is exactly how the bank came
-    // to be spatially filtered when they were left at the game's own
-    // 15/400. Defaults and reasoning: [`DEFAULT_INNER_RADIUS`].
-    //
-    // Bare `f32` -- the schema declares both as plain f32, same as
-    // `PitchMultiplier` above, so a `WireVariant` compiles and dies at
-    // encode. Note the two are the same type: swapping them is invisible
-    // to everything but a read-back of the written save.
+    // Live in a default render: bSpatialization=false disables panning only,
+    // not distance attenuation. Also bare f32, same trap as PitchMultiplier.
     data.insert(
         "InnerRadius".into(),
         Box::new(opts.inner_radius) as Box<dyn AsBrdbValue>,
@@ -366,8 +235,7 @@ fn add_emitter(
         Box::new(opts.max_distance) as Box<dyn AsBrdbValue>,
     );
     data.insert("bEnabled".into(), Box::new(true) as Box<dyn AsBrdbValue>);
-    // Starts silent; the wire drives it from frame 0. Bare `f32` again,
-    // for the same reason as `PitchMultiplier` above.
+    // Starts silent; the wire drives it from frame 0.
     data.insert(
         "VolumeMultiplier".into(),
         Box::new(0.0f32) as Box<dyn AsBrdbValue>,
@@ -387,12 +255,9 @@ fn add_emitter(
         std::sync::Arc::new(data),
     ))
     .with_id_split();
-    // Main grid now, or deferred for the chip's inner grid. The wire endpoints
-    // this crate builds reference `id`, not the brick's location, and brdb
-    // resolves each wire to a local or remote source at WRITE time from where
-    // its bricks actually land (`brick_id_map` in `save::add_wire`) -- so the
-    // per-band volume/pitch wires become same-grid internal wires for an
-    // in-chip speaker with no change here.
+    // Main grid now, or deferred for the chip's inner grid. Wires reference
+    // `id`, not the brick's location, and brdb resolves each to a local or
+    // remote source at write time from where its bricks land.
     match deferred {
         Some(v) => v.push(brick),
         None => world.add_brick(brick),
@@ -404,33 +269,26 @@ fn add_emitter(
 /// scaffolding both render modes put around their speakers.
 struct Scaffold {
     chip: Chip,
+    /// The clock's `Pause`/`Restart`/`Resume` control pin ids, for the
+    /// pre-wired control buttons. Audio always builds the clock, so these
+    /// always exist.
+    control_pins: (usize, usize, usize),
     /// Source port carrying the wrapped integer frame index.
     frame_index: WirePort,
-    /// The GATED master-volume source every per-speaker multiply reads: the
-    /// pause-mute `Select`'s output, NOT the raw `Volume` pin. It passes the
-    /// master volume through while the clock is advancing and emits 0 while the
-    /// clock is frozen (paused, an ended no-loop track, or a stalled external
-    /// clock), so a paused render falls silent instead of sustaining its last
-    /// frame. The `Volume` pin still feeds this through the Select -- see
-    /// [`scaffold`].
+    /// The gated master-volume source every per-speaker multiply reads: the
+    /// pause-mute `Select`'s output, not the raw `Volume` pin. Passes the
+    /// master volume through while the clock advances, emits 0 while frozen
+    /// (paused, an ended no-loop track, or a stalled external clock).
     master_volume: WirePort,
 }
 
 /// Build the microchip, its clock, and the four input pins, and fan three of
 /// them out to every speaker.
 ///
-/// # The pin contract, and the one thing that must not be got wrong
-///
-/// An input pin with nothing attached to it drives NOTHING. It does not
-/// deliver zero or false to its target -- the target simply keeps whatever
-/// value is baked into it. This is exactly the contract `clock.rs`'s
-/// `rate_pin` relies on (an inlined fps on `Multiply.InputB`, overridden live
-/// only when the pin is wired), and it is why each of these four keeps a real
-/// baked value underneath it: [`SPATIALIZATION`] and `opts.inner_radius` /
-/// `opts.max_distance` on the emitters, and [`VOLUME_SCALE`] on the per-speaker
-/// multiplies. Were it the other way round -- an unwired pin forcing its target
-/// -- this would hand every speaker `MaxDistance = 0` and silence the whole
-/// build, in game only, with a save that builds and looks perfect.
+/// An unwired input pin drives NOTHING: the target keeps its baked value (same
+/// contract as clock.rs's rate_pin). So each of the four pins keeps a real
+/// baked value underneath it; the inverse (unwired pin forcing 0) would
+/// silence the build in game with a save that looks perfect.
 fn scaffold(
     world: &mut World,
     speaker_ids: &[usize],
@@ -438,15 +296,10 @@ fn scaffold(
     frame_count: usize,
     loop_playback: bool,
 ) -> Scaffold {
-    // Beside the cluster on X, never inside it: an overlap on the main grid
-    // makes the game silently DROP one of the two bricks.
-    //
-    // The cluster grows along POSITIVE x, y and z from a low corner at exactly
-    // (0, 0, 0) -- slot 0's centre is `half`, so its low face is the origin
-    // (see [`speaker_position`]). So any chip_x whose shell stays at negative
-    // x clears the cluster for EVERY speaker count; the shell's own
-    // half-extent is 5 and this leaves 15 units of air on top of that.
-    // Growing the count moves the cluster's far corner, never this face.
+    // Beside the cluster on x, never inside it: an overlap on the main grid
+    // silently drops one of the two bricks. The cluster grows from the origin
+    // along positive x/y/z, so any chip_x that keeps the shell negative clears
+    // it for every speaker count.
     let chip_x = -(speaker_half().x * 4);
     let mut chip = new_chip(
         world,
@@ -467,43 +320,30 @@ fn scaffold(
         },
     );
 
-    // Reused unchanged from the video path: timer -> multiply by fps ->
-    // truncate -> modulo frame count, plus Pause/Restart/Resume/Rate pins.
-    // `loop_playback` rides along for the same reason -- one clock, one
-    // meaning, so a track and a clip stop the same way.
+    // Timer -> multiply by fps -> truncate -> modulo frame count, plus
+    // Pause/Restart/Resume/Rate pins. `loop_playback` rides along so a track
+    // and a clip stop the same way.
     let clock = build_clock(world, &mut chip, fps, frame_count, loop_playback, service(0, 0));
     let frame_index = clock.frame_index.clone();
+    // The clock's control pins, for the pre-wired control buttons.
+    let control_pins = (clock.pause_pin, clock.restart_pin, clock.resume_pin);
     // The timer's raw stopwatch, tapped for the pause-mute detector below.
     let time = clock.time.clone();
 
-    // Row -2 is chosen because it is empty: the clock's own gates sit at row
-    // 0 and `build_clock` puts its five control pins one cell further along x,
-    // i.e. row -1, while the detector starts again at -4. These are row
-    // INDICES, not coordinates -- `service` maps them onto positive x.
-    // `chip::finish` collision-checks the whole inner grid, so a clash here is
-    // a build error rather than a brick the game drops.
-    //
-    // `Directional` is the user-facing name for `bSpatialization`, the only
-    // directional property this component has.
+    // The clock occupies the positive rows from 0 (its six gates and seven
+    // pins grow downward from `service(0, 0)`); these speaker input pins sit at
+    // row -2 and the pause-mute detector at -4, both clear of it. `Directional`
+    // is the user-facing name for `bSpatialization`, the only directional
+    // property this component has.
     let inner_radius_pin = add_input_pin(&mut chip, "Inner Radius", service(0, -2));
     let max_distance_pin = add_input_pin(&mut chip, "Max Distance", service(1, -2));
     let directional_pin = add_input_pin(&mut chip, "Directional", service(2, -2));
     let volume_pin = add_input_pin(&mut chip, "Volume", service(3, -2));
 
-    // Three of them fan straight out to EVERY speaker's own emitter port --
-    // one pin, `speaker_ids.len()` wires. A pin wired to only some of the
-    // cluster leaves the rest on their baked values, so the build would split
-    // into two groups the moment the pin moved.
-    //
-    // These are real wire inputs on `Component_AudioEmitter` (its `inputs`
-    // list in brdb's component catalog carries `InnerRadius`, `MaxDistance`
-    // and `bSpatialization`), so this is wiring, not data -- wiring a
-    // data-only field is what produces a save the game rejects.
-    //
-    // `pin_source(pin, true)` is the INPUT pin's `RER_Output`: the port that
-    // carries an input pin's value onward into the chip's graph. `RER_Input`
-    // (`pin_target`) is the far side, fed from outside the chip; sourcing a
-    // wire from it instead points the wire backwards.
+    // Three fan straight out to every speaker's own emitter port -- one pin,
+    // `speaker_ids.len()` wires -- so a pin wired to only some of the cluster
+    // never happens. `pin_source(pin, true)` is the input pin's `RER_Output`,
+    // the port that carries its value onward into the chip's graph.
     for (pin, port) in [
         (inner_radius_pin, "InnerRadius"),
         (max_distance_pin, "MaxDistance"),
@@ -517,43 +357,21 @@ fn scaffold(
         }
     }
 
-    // --- Pause-mute detector: silence while the clock is FROZEN -------------
+    // --- Pause-mute detector: silence while the clock is frozen -------------
+    // Three shared gates. Gates on whether the clock is actually advancing,
+    // not the Pause exec, so any stall (pause, stalled external clock, ended
+    // no-loop track) silences the bank. `BufferTicks` holds `Timer.Time` back
+    // one tick; `CompareNotEqual` is true while `Time` changed since last
+    // tick; `Select` passes the master volume through while true, emits 0
+    // while frozen.
     //
-    // Three shared gates, +3 for the whole bank whatever the speaker count.
-    // The trick is to gate the master volume on whether the clock is actually
-    // ADVANCING, not on the Pause exec: that way ANY stall silences the bank --
-    // the Pause exec, a stalled external clock, or a no-loop track that ended --
-    // with no dependence on how the builder wired their pause.
+    // UNVERIFIED IN GAME: assumes `Time` updates every tick, not just at the
+    // fps interval -- if it only refreshes at fps, audio would chop into
+    // clicks instead of just silencing on pause. Fallback: key off the Pause
+    // exec with an `Exec_Toggle` latch instead of Time-change detection.
     //
-    // `Timer.Time` (continuous seconds) moves every tick while running and
-    // freezes while paused. `BufferTicks` holds it back one tick, so its
-    // `Output` is last tick's `Time`; `CompareNotEqual` is then true exactly
-    // while `Time` changed since last tick -- i.e. while the clock is moving.
-    // A `Select` on that boolean passes the master volume through when playing
-    // and emits 0 when frozen.
-    //
-    // UNVERIFIED IN GAME: this rests on `Time` being CONTINUOUS (updated every
-    // tick). If the game instead only refreshes `Time` at the fps interval,
-    // `Time == prev_time` between updates even while playing and the audio would
-    // CHOP into clicks. `Time` is a stopwatch and the frame index is
-    // `floor(Time*fps)`, so it is almost certainly continuous -- but the owner
-    // must confirm normal playback is smooth. Fallback if it chops: key off the
-    // Pause exec directly with an `Exec_Toggle` latch instead of Time-change
-    // detection.
-    //
-    // Row -3 is EMPTY: the clock's gates sit at row 0, its control pins at -1,
-    // the four audio pins at -2, and `build_stream_cascade` starts again at -4
-    // (detector) through -10 (per-speaker multiplies). `chip::finish`
-    // collision-checks the whole inner grid, so a clash here would be a build
-    // error, not a silently dropped brick.
-    //
-    // `TicksToWait` is a plain `i32` field on
-    // `BrickComponentData_WireGraphPseudo_BufferTicks` (like the clock's
-    // `BitwiseOR.InputB`), NOT the wire-graph variant union -- so the literal is
-    // a bare `1i32`, not a `WireVariant`. `CompareNotEqual`'s inputs are both
-    // wired (no literal). The `Select`'s `InputA`/`InputB` ARE the
-    // `WireGraphVariant` union, so their baked literals are `WireVariant::Number`
-    // (same trap as the per-speaker multiply below).
+    // `TicksToWait` is a bare `i32` (not a `WireVariant`); the `Select`'s
+    // `InputA`/`InputB` are `WireVariant::Number`.
     let buffer = gate(
         &mut chip,
         "B_1x1_Gate_Pseudo_BufferTicks",
@@ -576,12 +394,9 @@ fn scaffold(
         WirePort::new(playing, COMPARE_NE, "InputB"),
     );
 
-    // `bSelectB` true -> take `InputB` (the master volume); false -> take
-    // `InputA` (baked 0.0). `InputB` also carries the baked [`VOLUME_SCALE`]
-    // (1.0) underneath the `Volume` pin: THIS is where the pin's unwired-default
-    // now lives (see [`volume_multiply`]'s doc). With the Volume pin unwired a
-    // PLAYING render therefore multiplies by 1.0, exactly as before the feature;
-    // baking 0.0 here instead would mute every playing render, in game only.
+    // `bSelectB` true -> InputB (master volume); false -> InputA (baked 0.0).
+    // `InputB` also carries the baked [`VOLUME_SCALE`] (1.0) underneath the
+    // `Volume` pin, so an unwired pin on a playing render multiplies by 1.0.
     let gated = gate(
         &mut chip,
         "B_1x1_Gate_Expr_Select",
@@ -609,40 +424,19 @@ fn scaffold(
 
     Scaffold {
         chip,
+        control_pins,
         frame_index,
         master_volume: WirePort::new(gated, SELECT, "Output"),
     }
 }
 
-/// One per-speaker master-volume multiply, and the wire from its output into
-/// that speaker's `VolumeMultiplier`. Returns the gate's `InputA` port, which
-/// is where the frame data goes.
-///
-/// The master volume CANNOT wire into `VolumeMultiplier` directly -- that input
-/// is already driven by this speaker's own value, and an input with two sources
-/// is precisely what this graph never does. So the scaling goes in a gate the
-/// master can own outright: frame value on `InputA`, master on `InputB`.
-///
-/// `master_volume` is the GATED master from [`scaffold`]'s pause-mute `Select`,
-/// not the raw `Volume` pin: while the clock advances it is the pin's value (or
-/// the baked 1.0 default when the pin is unwired), and while the clock is frozen
-/// it is 0, so a paused render's speakers go silent here rather than sustaining.
-///
-/// `InputB` still carries an inlined [`VOLUME_SCALE`] (1.0) underneath the
-/// wire, copied from `build_clock`'s `rate_pin` pattern -- but note the
-/// unwired-`Volume`-pin unity default has MOVED up to the Select's own `InputB`
-/// (see [`scaffold`]), because the pin now feeds the Select, not this multiply.
-/// The literal here is a secondary fallback: it is what this gate would
-/// multiply by if the Select's wire were ever absent, so a stray edit leaves a
-/// speaker at unity gain rather than muted. Baking 0.0 here would still mute
-/// every speaker in that case, in game only.
-///
-/// TYPE TRAP: `MathMultiply`'s ports are the `WireGraphPrimMathVariant` tagged
-/// union, so this literal must be a `WireVariant::Number` -- unlike
-/// `PitchMultiplier`/`VolumeMultiplier` on the emitter, which are bare `f32`
-/// fields where a `WireVariant` compiles and then dies at encode with
-/// `UnimplementedCast("f32", WireVariant)`. Both conventions live in this one
-/// module; they are not interchangeable.
+/// Per-speaker master-volume multiply: frame value on InputA, Volume pin on
+/// InputB. Separate gate because VolumeMultiplier already has one source;
+/// InputB inlines VOLUME_SCALE (1.0) so an untouched chip renders identically.
+/// The unwired-Volume-pin unity default lives on the Select's own InputB (see
+/// [`scaffold`]); this literal is a fallback if that wire were ever absent.
+/// TYPE TRAP: MathMultiply ports are WireVariant::Number, unlike the emitter's
+/// bare-f32 PitchMultiplier/VolumeMultiplier. Not interchangeable.
 fn volume_multiply(
     world: &mut World,
     chip: &mut Chip,
@@ -794,10 +588,8 @@ fn build_stream_cascade(
         }
     }
 
-    // Exec: branches cascade at the FRONT so exactly one bank's chain runs.
-    // POLARITY: a truthy `bCond` takes `ExecOutA`. This was inverted in an
-    // earlier draft of the video path and would have made every multi-bank
-    // render silent -- do not "fix" it without re-reading `Exec_Branch`.
+    // Exec: branches cascade at the front so exactly one bank's chain runs.
+    // A truthy `bCond` takes `ExecOutA` -- easy to invert by mistake.
     let mut exec_src = WirePort::new(detector, CHANGE_DETECTOR, "OnChanged");
     for bi in 0..n_banks {
         let entry = if bi + 1 < n_banks {
@@ -865,22 +657,20 @@ pub fn build_speaker_world(track: &VoiceTrack, opts: &AudioOptions) -> Result<Wo
         "Audio spectrum playback generated from an audio file".to_string();
 
     // --- 1. The speaker cluster on the main grid ----------------------------
-    // POSITION IS AUDIBLE. `bSpatialization = false` stops the panning, not
-    // the distance attenuation, so a bank spread over hundreds of units is a
-    // bank the listener hears a slice of. Every speaker therefore goes into
-    // the tightest legal 3D packing instead of a column -- see
-    // [`cluster_dims`] for the arithmetic and [`speaker_position`] for the
-    // slot each band takes.
+    // Position is audible: bSpatialization=false stops panning, not distance
+    // attenuation, so speakers go into the tightest 3D packing (cluster_dims),
+    // not a column.
     let n_speakers = track.plan.len();
     let in_chip = opts.speakers_in_chip;
     let mut speaker_ids = Vec::with_capacity(n_speakers);
-    // Holds the emitter bricks until the chip exists, when `--speakers-in-chip`
-    // is set; stays empty otherwise (and the placement loop below a no-op), so
-    // the beside-the-chip render is structurally unchanged.
+    // Holds emitter bricks until the chip exists, when --speakers-in-chip is
+    // set; empty otherwise (placement loop below is then a no-op).
     let mut in_chip_speakers: Vec<Brick> = Vec::new();
     for (b, kind) in track.plan.kinds.iter().enumerate() {
         let asset_name = match kind {
-            BandKind::Tonal => BA_SYNTH_BASIC_SINE,
+            // Tonal bands play the user-selected waveform (sine by default);
+            // the noise bands are a different asset and untouched by the choice.
+            BandKind::Tonal => opts.tonal_synth.asset(),
             BandKind::WhiteNoise => BA_SYNTH_NOISE_WHITE,
             BandKind::PinkNoise => BA_SYNTH_NOISE_PINK,
         };
@@ -908,10 +698,8 @@ pub fn build_speaker_world(track: &VoiceTrack, opts: &AudioOptions) -> Result<Wo
         opts.loop_playback,
     );
 
-    // With `--speakers-in-chip`, place the deferred speakers on the chip's inner
-    // grid now that it exists. `chip::finish` will collision-check them against
-    // every gate and `recompute_plane_extent` will grow the plane to contain
-    // them. Empty (a no-op) for the default beside-the-chip layout.
+    // With --speakers-in-chip, place the deferred speakers on the chip's inner
+    // grid now it exists; empty (a no-op) for the default layout.
     for brick in in_chip_speakers {
         sc.chip.add_brick(brick, speaker_half());
     }
@@ -926,9 +714,8 @@ pub fn build_speaker_world(track: &VoiceTrack, opts: &AudioOptions) -> Result<Wo
         .collect();
 
     // --- 4. One stream per band: its volume ---------------------------------
-    // Pitch is build-time component data here and is never written, so a band
-    // fading in and out carries no retrigger risk. That is the property the
-    // voice mode gives up in exchange for having no grid at all.
+    // Pitch is build-time data here, never rewritten, so a band fading in and
+    // out carries no retrigger risk -- the property voice mode gives up.
     let streams: Vec<FrameStream<'_>> = track
         .volumes
         .iter()
@@ -944,44 +731,35 @@ pub fn build_speaker_world(track: &VoiceTrack, opts: &AudioOptions) -> Result<Wo
         &streams,
     );
 
+    // --- 5. Control buttons -------------------------------------------------
+    // Default-on: three labelled buttons wired into the clock's control pins,
+    // placed beyond the cluster by `control_anchor`. Before `finish` so its
+    // overlap check sees them.
+    if opts.control_buttons {
+        let (pause, restart, resume) = sc.control_pins;
+        let anchor = crate::anim::controls::control_anchor(&world);
+        crate::anim::controls::add_control_buttons(&mut world, pause, restart, resume, anchor);
+    }
+
     finish(&mut world, sc.chip)?;
-    // Must be LAST, after `finish` has published the chip's inner grid.
-    // `register_used_components` walks `world.bricks` and `world.grids` and
-    // registers only the component types it can see; running it before
-    // `finish` leaves every gate inside the chip unregistered and
-    // `to_brz_vec()` then fails with `UnregisteredComponentType`. brdb's own
-    // doc on that method says the same ("Call this AFTER all bricks/grids
-    // have been added"), and the video renderer orders it the same way.
+    // Must be last: register_used_components only sees registered gates after
+    // finish publishes the chip's inner grid, else to_brz_vec fails with
+    // UnregisteredComponentType.
     world.register_used_components();
     Ok(world)
 }
 
-/// Build a world whose speakers TRACK spectral peaks: both pitch and volume
-/// written every frame.
+/// Build a world whose speakers track spectral peaks: both pitch and volume
+/// written every frame. Same cluster, chip, clock, pins and banking cascade as
+/// [`build_speaker_world`], but `voice_count` speakers (all tonal, no
+/// `BandKind`/noise -- cymbals, sibilance and sub-bass are simply absent, see
+/// `voices::min_hz`) each contributing two streams instead of one.
 ///
-/// The same cluster, the same chip, the same clock, the same four pins and the
-/// same banking cascade as [`build_speaker_world`] -- the only differences are
-/// that there are `voice_count` speakers instead of one per band, that they all
-/// play the sine synth, and that each contributes **two** streams instead of
-/// one.
-///
-/// # Every speaker is a sine
-///
-/// There is no `BandKind` here and no noise speaker. A voice is a moving
-/// sinusoid tracking one partial; white and pink noise have no frequency to
-/// track, so a noise voice would be a speaker whose pitch stream meant nothing.
-/// The consequence -- cymbals, sibilance and sub-bass are simply absent rather
-/// than folded onto a noise bed -- is a real cost of this mode and is documented
-/// on `voices::min_hz`.
-///
-/// # `PitchMultiplier` is wired, not baked
-///
-/// This is the one assumption this mode adds over the bank's, and it is
-/// UNVERIFIED IN GAME at the time of writing: `diag_5_pitch_ramp.brz` (see
-/// `examples/audio_diagnostics.rs`) is the save that settles whether a
-/// per-frame pitch write retunes a running voice or retriggers it. The baked
-/// `PitchMultiplier` is frame 0's value, so a paused chip holds the first note
-/// rather than an arbitrary one.
+/// UNVERIFIED IN GAME: `PitchMultiplier` is wired here, not baked, and it is
+/// unconfirmed whether a per-frame pitch write retunes a running voice or
+/// retriggers it (`diag_5_pitch_ramp.brz` in `examples/audio_diagnostics.rs`
+/// settles it). The baked value is frame 0's, so a paused chip holds the
+/// first note rather than an arbitrary one.
 pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<World, String> {
     if streams.frame_count == 0 {
         return Err("audio track has 0 frames -- nothing to render".to_string());
@@ -1010,10 +788,9 @@ pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<
             ));
         }
     }
-    // A pitch outside the emitter's legal range is CLAMPED in game, turning a
-    // wrong number into a wrong note rather than into silence. `analyze_voices`
-    // clamps already; this is the guard for any other caller, and for a stream
-    // built by hand.
+    // A pitch outside the emitter's legal range is clamped in game, turning a
+    // wrong number into a wrong note rather than silence. analyze_voices
+    // already clamps; this guards any other caller.
     for (v, row) in streams.pitches.iter().enumerate() {
         for (f, &p) in row.iter().enumerate() {
             if !p.is_finite() || p < PITCH_MIN as f64 || p > PITCH_MAX as f64 {
@@ -1045,7 +822,9 @@ pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<
         };
         speaker_ids.push(add_emitter(
             &mut world,
-            BA_SYNTH_BASIC_SINE.as_ref(),
+            // Voice mode is every-speaker tonal (peak-tracking, no noise
+            // bands), so the whole cluster plays the selected waveform.
+            opts.tonal_synth.asset().as_ref(),
             streams.pitches[v][0] as f32,
             position,
             opts,
@@ -1078,13 +857,9 @@ pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<
         .collect();
 
     // --- 4. Two streams per voice: its pitch and its volume -----------------
-    // Interleaved per voice rather than all pitches then all volumes, so a
-    // voice's two arrays sit next to each other in the chip and the layout can
-    // be read by eye.
-    //
-    // The pitch stream goes STRAIGHT into the emitter, with no multiply in
-    // between: the `Volume` pin scales levels, and scaling a pitch by it would
-    // transpose the whole render whenever a builder touched the volume.
+    // Interleaved per voice so the two arrays sit next to each other in the
+    // chip. Pitch goes straight into the emitter with no multiply in between:
+    // scaling it by Volume would transpose the render whenever volume changed.
     let mut frame_streams: Vec<FrameStream<'_>> = Vec::with_capacity(n_voices * 2);
     for v in 0..n_voices {
         frame_streams.push(FrameStream {
@@ -1105,8 +880,17 @@ pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<
         &frame_streams,
     );
 
+    // --- 5. Control buttons -------------------------------------------------
+    // Same as build_speaker_world: default-on buttons wired into the clock's
+    // control pins, before finish so its overlap check sees them.
+    if opts.control_buttons {
+        let (pause, restart, resume) = sc.control_pins;
+        let anchor = crate::anim::controls::control_anchor(&world);
+        crate::anim::controls::add_control_buttons(&mut world, pause, restart, resume, anchor);
+    }
+
     finish(&mut world, sc.chip)?;
-    // Must be LAST, after `finish` has published the chip's inner grid -- see
+    // Must be last, after finish publishes the chip's inner grid -- see
     // [`build_speaker_world`].
     world.register_used_components();
     Ok(world)
@@ -1114,24 +898,13 @@ pub fn build_voice_world(streams: &VoiceStreams, opts: &AudioOptions) -> Result<
 
 /// Resolve a synth asset name to the value `AudioDescriptor` expects.
 ///
-/// Verified against brdb 0.9.1 by Task 1 -- a `.brz` was written and read
-/// back, and `AudioDescriptor` decoded as `Asset(Some(0))` with the
-/// `("BrickAudioDescriptor", "BA_Synth_Basic_Sine")` pair intact in global
-/// data. See `docs/superpowers/notes/2026-07-28-audio-feasibility.md`.
+/// The schema type is a bare `object`, so the value is a [`BrdbValue::Asset`]
+/// carrying the reference's index -- not `WireVariant::Object` (the wire-graph
+/// union, a different encoding path; both compile).
 ///
-/// Factored out so the whole design has ONE place depending on this.
-///
-/// `AudioDescriptor`'s schema type is a bare `object`, so the value is a
-/// [`BrdbValue::Asset`] carrying the reference's index -- NOT a
-/// `WireVariant::Object`, which is the wire-graph value union and a different
-/// encoding path entirely. Both compile.
-///
-/// The `(type, name)` pair is checked against brdb's own `ASSET_TYPES`
-/// catalog first. Nothing on the write path does that -- `write_brdb`'s
-/// `"class" | "object"` arm writes the raw index without ever comparing the
-/// stored asset type to the schema's -- so a typo in either string encodes
-/// perfectly and fails only in game, with nothing to see at build time. This
-/// lookup is the only thing standing between a typo and a silent dud save.
+/// The `(type, name)` pair is checked against brdb's `ASSET_TYPES` catalog
+/// first: nothing on the write path does that otherwise, so a typo in either
+/// string would encode fine and fail only in game.
 fn audio_descriptor_value(
     world: &mut World,
     asset_name: &str,
@@ -1154,4 +927,127 @@ fn audio_descriptor_value(
         asset_name.to_string(),
     ));
     Ok(Box::new(BrdbValue::Asset(Some(asset_index))) as Box<dyn AsBrdbValue>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::track::{SynthWave, band_plan};
+    use crate::audio::voices::{VoiceStats, VoiceStreams};
+    use brdb::{Brz, IntoReader};
+
+    /// A bank-mode track with the plan `o` asks for, so the built world's
+    /// speakers and their descriptors describe the render `o` names.
+    fn bank_track(o: &AudioOptions, frames: usize) -> VoiceTrack {
+        let plan = band_plan(o).expect("valid plan");
+        let n = plan.len();
+        VoiceTrack {
+            plan,
+            volumes: vec![vec![0.5; frames]; n],
+            fps: o.fps,
+            frame_count: frames,
+        }
+    }
+
+    fn voice_streams(voices: usize, frames: usize, fps: f32) -> VoiceStreams {
+        VoiceStreams {
+            pitches: vec![vec![1.0; frames]; voices],
+            volumes: vec![vec![0.5; frames]; voices],
+            fps,
+            frame_count: frames,
+            stats: VoiceStats::default(),
+        }
+    }
+
+    /// Write the world to a `.brz` and read it back, returning every
+    /// audio-descriptor asset name the saved file carries. A genuine
+    /// round-trip, not an in-memory inspection: `.brz` bytes are not
+    /// reproducible, so a hash or size match would be meaningless.
+    fn written_audio_asset_names(w: &World) -> Vec<String> {
+        let bytes = w.to_brz_vec().expect("the world must encode to brz");
+        let global = Brz::read_slice(&bytes)
+            .expect("the written brz must parse")
+            .into_reader()
+            .read_global_data()
+            .expect("the written brz must carry global data");
+        global
+            .external_asset_references
+            .iter()
+            .filter(|(ty, _)| ty.as_str() == AUDIO_ASSET_TYPE)
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
+    fn bank_opts(synth: SynthWave, noise_bands: usize) -> AudioOptions {
+        AudioOptions {
+            bands: Some(4 + noise_bands),
+            noise_bands,
+            tonal_synth: synth,
+            ..Default::default()
+        }
+    }
+
+    /// `--synth square`: every tonal emitter carries the square descriptor,
+    /// noise bands keep their own descriptors, no sine leaks in.
+    #[test]
+    fn square_tonal_with_noise_bands_writes_square_plus_noise_and_no_sine() {
+        let o = bank_opts(SynthWave::Square, 2);
+        let world = build_speaker_world(&bank_track(&o, 8), &o).expect("build");
+        let names = written_audio_asset_names(&world);
+
+        assert!(names.contains(&"BA_Synth_Basic_Square".to_string()), "{names:?}");
+        assert!(names.contains(&"BA_Synth_Noise_White".to_string()), "{names:?}");
+        assert!(names.contains(&"BA_Synth_Noise_Pink".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"BA_Synth_Basic_Sine".to_string()),
+            "no sine may be registered once the tonal wave is square: {names:?}"
+        );
+        assert_eq!(names.len(), 3, "exactly one tonal + two noise assets: {names:?}");
+    }
+
+    /// The default (Sine) render is the same tonal-descriptor layout it was
+    /// before the flag: sine tonal, noise unchanged.
+    #[test]
+    fn default_sine_bank_is_the_pre_flag_layout() {
+        let o = bank_opts(SynthWave::Sine, 2);
+        assert_eq!(o.tonal_synth, SynthWave::default());
+        let world = build_speaker_world(&bank_track(&o, 8), &o).expect("build");
+        let names = written_audio_asset_names(&world);
+        assert!(names.contains(&"BA_Synth_Basic_Sine".to_string()), "{names:?}");
+        assert!(names.contains(&"BA_Synth_Noise_White".to_string()), "{names:?}");
+        assert!(names.contains(&"BA_Synth_Noise_Pink".to_string()), "{names:?}");
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
+
+    /// The noise assets are the same whatever the waveform is -- the choice is
+    /// for tonal bands only.
+    #[test]
+    fn the_waveform_choice_never_touches_the_noise_bands() {
+        for w in SynthWave::ALL {
+            let o = bank_opts(w, 2);
+            let world = build_speaker_world(&bank_track(&o, 8), &o).expect("build");
+            let names = written_audio_asset_names(&world);
+            assert!(
+                names.contains(&"BA_Synth_Noise_White".to_string())
+                    && names.contains(&"BA_Synth_Noise_Pink".to_string()),
+                "{w:?}: both noise assets must always be present: {names:?}"
+            );
+            assert!(
+                names.contains(&w.asset().as_ref().to_string()),
+                "{w:?}: its own tonal asset must be present: {names:?}"
+            );
+            assert_eq!(names.len(), 3, "{w:?}: one tonal + two noise: {names:?}");
+        }
+    }
+
+    /// Voice mode is all-tonal, so the whole cluster carries the selected
+    /// waveform and nothing else. Confirms `build_voice_world` honours
+    /// `tonal_synth` too (its own hardcoded sine is what this replaced).
+    #[test]
+    fn voice_mode_honours_the_selected_waveform() {
+        let o = AudioOptions { max_voices: 5, tonal_synth: SynthWave::Triangle, ..Default::default() };
+        let world = build_voice_world(&voice_streams(5, 8, o.fps), &o).expect("build");
+        let names = written_audio_asset_names(&world);
+        assert_eq!(names, vec!["BA_Synth_Basic_Triangle".to_string()], "{names:?}");
+    }
 }

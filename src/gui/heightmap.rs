@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables)]
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::{
@@ -590,7 +589,6 @@ impl HeightmapApp {
         &mut self,
         ui: &mut Ui,
         ctx: &Context,
-        _frame: &mut eframe::Frame,
         shared: &mut SharedOptions,
         img_only: bool,
     ) {

@@ -1,22 +1,15 @@
 //! Pulling a subtitle track out of a video container and handing it to the
 //! [`super::srt`] or [`super::ass`] parser.
 //!
-//! Native only: spawns `ffprobe` and `ffmpeg` subprocesses, so this module is
-//! gated `#[cfg(not(target_arch = "wasm32"))]` at its `mod extract;`
-//! declaration in `mod.rs`, the same way `video::ffmpeg` and
-//! `audio::ffmpeg_src` are gated -- `ffmpeg-sidecar` cannot build for wasm at
-//! all.
+//! Native only: spawns `ffprobe` and `ffmpeg` subprocesses, gated
+//! `#[cfg(not(target_arch = "wasm32"))]` at its `mod extract;` declaration
+//! in `mod.rs`, the same way `video::ffmpeg` and `audio::ffmpeg_src` are.
 //!
-//! **The PGS case is the point of this module.** `hdmv_pgs_subtitle`,
-//! `dvd_subtitle` and `dvb_subtitle` are bitmap (image sequence) subtitle
-//! formats -- there is no text in them to extract without OCR, which is out
-//! of scope. [`extract`] must never return an empty [`Subtitles`] for one of
-//! these: a silently empty track renders as a perfectly good video with no
-//! dialogue, indistinguishable from a correct render of a scene where nobody
-//! speaks. Instead [`extract`] fails loudly with [`bitmap_error`], which
-//! names the codec, says why (it's an image format), and points at the
-//! `--subtitles <file>` escape hatch (supplying an external text subtitle
-//! file bypasses extraction entirely).
+//! PGS/DVD/DVB subtitles are bitmap (image sequence) formats with no text to
+//! extract without OCR, which is out of scope. [`extract`] never returns an
+//! empty [`Subtitles`] for one of these -- it fails loudly with
+//! [`bitmap_error`], which names the codec and points at the
+//! `--subtitles <file>` escape hatch.
 
 use super::{ass, srt, Subtitles};
 use ffmpeg_sidecar::command::FfmpegCommand;
@@ -120,29 +113,12 @@ pub fn list_streams(path: &Path) -> Result<Vec<SubtitleStream>, String> {
     Ok(streams)
 }
 
-/// Whether `codec` (an ffprobe `codec_name`) is a BITMAP (image sequence)
+/// Whether `codec` (an ffprobe `codec_name`) is a bitmap (image sequence)
 /// subtitle format, which has no text in it to extract without OCR.
 ///
-/// A DENY-list, not an allow-list, and deliberately so. The two ways to be
-/// wrong here are not symmetric:
-///
-/// - wrongly calling a bitmap codec "text" costs one failed ffmpeg run and a
-///   clear error (ffmpeg refuses `-c:s srt` on a bitmap stream and exits
-///   non-zero, which `extract` reports verbatim);
-/// - wrongly calling a text codec "bitmap" tells the user, in
-///   [`bitmap_error`]'s own words, that their track needs OCR and sends them
-///   away from a track that would have extracted cleanly.
-///
-/// The previous allow-list (`ass|ssa|subrip|srt|webvtt|mov_text|text`) made
-/// the second, worse mistake for every other text subtitle codec ffmpeg can
-/// transcode with `-c:s srt`: `eia_608`, `eia_708`, `arib_caption`, `ttml`,
-/// `stl`, `microdvd`, `jacosub`, `sami`, `realtext`, `subviewer`,
-/// `subviewer1`, `vplayer`, `pjs`, `mpl2`, `hdmv_text_subtitle`. A broadcast
-/// MPEG-TS with EIA-608 closed captions was told it was an image format.
-///
-/// Matched case-insensitively, since ffprobe's own `codec_name` values are
-/// always lowercase in practice but nothing here should depend on that
-/// holding forever.
+/// Deny-list on purpose: a wrongly-"bitmap" text codec sends the user away
+/// from a track that would extract; a wrongly-"text" bitmap just fails one
+/// ffmpeg run. Case-insensitive.
 pub fn is_bitmap_codec(codec: &str) -> bool {
     matches!(
         codec.trim().to_lowercase().as_str(),
@@ -156,18 +132,6 @@ pub fn is_bitmap_codec(codec: &str) -> bool {
             | "dvbsub"
             | "xsub"
     )
-}
-
-/// Whether `codec` is a text-based subtitle format this crate can extract.
-///
-/// Everything that is not a known bitmap codec is treated as text -- see
-/// [`is_bitmap_codec`] for why the deny-list is the safe direction. An EMPTY
-/// codec name is neither: ffprobe reporting no codec at all is a "we do not
-/// know what this is" answer, and [`extract`] reports it as exactly that
-/// rather than as a bitmap (the old allow-list said `""` was a bitmap, and
-/// produced "subtitle track 0 is , an image-based (bitmap) subtitle format").
-pub fn is_text_codec(codec: &str) -> bool {
-    !codec.trim().is_empty() && !is_bitmap_codec(codec)
 }
 
 /// The error `extract` returns for a bitmap subtitle codec
@@ -311,45 +275,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_codecs_are_recognised() {
+    fn text_codecs_are_not_bitmaps() {
         for c in ["ass", "ssa", "subrip", "srt", "webvtt", "mov_text"] {
-            assert!(is_text_codec(c), "{c} is a text codec");
+            assert!(!is_bitmap_codec(c), "{c} is a text codec");
         }
     }
 
     #[test]
-    fn the_less_common_text_codecs_are_text_too_not_bitmaps() {
-        // Every one of these is a TEXT subtitle codec ffmpeg transcodes with
-        // `-c:s srt`. The old allow-list rejected all of them and then told
-        // the user, in `bitmap_error`'s words, that their track was an image
-        // format needing OCR -- factually false, and it sends the user away
-        // from a track that would have extracted cleanly.
+    fn the_less_common_text_codecs_are_not_bitmaps_either() {
+        // Every one of these is a text subtitle codec ffmpeg transcodes with
+        // `-c:s srt`. The old allow-list rejected all of them and told the
+        // user, in `bitmap_error`'s words, that their track needed OCR --
+        // factually false, and it sends the user away from a track that
+        // would have extracted cleanly.
         for c in [
             "eia_608", "eia_708", "arib_caption", "ttml", "stl", "microdvd", "jacosub",
             "sami", "realtext", "subviewer", "subviewer1", "vplayer", "pjs", "mpl2",
             "hdmv_text_subtitle",
         ] {
-            assert!(is_text_codec(c), "{c} is a text codec, not a bitmap");
             assert!(!is_bitmap_codec(c), "{c} must not be called an image format");
         }
     }
 
     #[test]
-    fn bitmap_codecs_are_not_text() {
+    fn bitmap_codecs_are_recognised() {
         for c in ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub", "pgssub",
                   "dvdsub", "dvbsub"] {
-            assert!(!is_text_codec(c), "{c} is a bitmap codec");
             assert!(is_bitmap_codec(c), "{c} is a bitmap codec");
         }
     }
 
     #[test]
-    fn an_unnamed_codec_is_neither_text_nor_a_bitmap() {
-        // ffprobe naming no codec is a "do not know" answer. Calling it a
-        // bitmap produced "subtitle track 0 is , an image-based (bitmap)
-        // subtitle format", which is both wrong and unactionable.
+    fn an_unnamed_codec_is_not_a_bitmap() {
+        // ffprobe naming no codec is a "do not know" answer, handled by
+        // `extract` before `is_bitmap_codec` is even consulted -- not a
+        // bitmap (the old allow-list said `""` was one, and produced
+        // "subtitle track 0 is , an image-based (bitmap) subtitle format").
         for c in ["", "   "] {
-            assert!(!is_text_codec(c), "an unnamed codec is not known-good text");
             assert!(!is_bitmap_codec(c), "an unnamed codec is not an image format either");
         }
         let err = unknown_codec_error(0, Path::new("clip.mkv"));
@@ -359,8 +321,7 @@ mod tests {
 
     #[test]
     fn codec_matching_is_case_insensitive() {
-        assert!(is_text_codec("ASS"));
-        assert!(!is_text_codec("HDMV_PGS_SUBTITLE"));
+        assert!(!is_bitmap_codec("ASS"));
         assert!(is_bitmap_codec("HDMV_PGS_SUBTITLE"));
     }
 

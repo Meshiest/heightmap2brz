@@ -104,12 +104,16 @@ fn count_component(world: &brdb::World, class: &str) -> usize {
 #[test]
 fn colour_array_mode_is_two_gates_per_pixel_and_emits_no_string_gates() {
     let clip = distinct_clip(4, 3, 5);
-    let world = build_color_array_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
+    // Buttons off: this counts display bricks + shell, not the default-on
+    // control buttons (3 more main-grid bricks). See `controls.rs` for their
+    // own coverage.
+    let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+    let world = build_color_array_world(&clip, &opts, &mut NoProgress).unwrap();
 
     // 12 display bricks + 1 microchip shell on the main grid.
     assert_eq!(world.bricks.len(), 13);
-    // inner grid: 12 ArrayVar + 12 Get + 1 detector + 4 clock + 5 clock pins.
-    assert_eq!(world.grids[0].1.len(), 24 + 1 + 4 + 5);
+    // inner grid: 12 ArrayVar + 12 Get + 1 detector + 6 clock + 7 clock pins.
+    assert_eq!(world.grids[0].1.len(), 24 + 1 + 6 + 7);
 
     assert_eq!(count_component(&world, ARRAY_VAR), 12, "one array per pixel");
     assert_eq!(count_component(&world, ARRAY_GET), 12, "one Get per pixel");
@@ -164,7 +168,9 @@ fn a_fully_transparent_pixel_emits_no_brick_and_no_gates() {
     let mut img = RgbaImage::from_pixel(3, 1, Rgba([255, 0, 0, 255]));
     img.put_pixel(1, 0, Rgba([0, 0, 0, 0]));
     let clip = Clip { width: 3, height: 1, fps: 10.0, frames: vec![img] };
-    let world = build_color_array_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
+    // Buttons off: this counts the surviving display bricks + shell.
+    let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+    let world = build_color_array_world(&clip, &opts, &mut NoProgress).unwrap();
 
     assert_eq!(world.bricks.len(), 3, "2 display bricks + 1 chip shell");
     assert_eq!(count_component(&world, ARRAY_VAR), 2, "the culled pixel gets no array");
@@ -186,7 +192,7 @@ fn a_zero_frame_clip_is_rejected() {
 
 // --- exec wiring: the point of the design -----------------------------------
 
-/// **The fan-out.** Every pixel's `Get.Exec` must be driven directly by the
+/// The fan-out: every pixel's `Get.Exec` must be driven directly by the
 /// change detector's `OnChanged`, not by another Get's `ExecOut`. A chain
 /// would work in a save file and would be thousands of gates deep in game,
 /// which is exactly what this design exists to avoid -- and nothing else in
@@ -243,7 +249,7 @@ fn every_pixels_get_exec_is_fed_directly_by_the_detector() {
     );
 }
 
-/// Exec **fan-in** is the unverified case, so the design must never produce
+/// Exec fan-in is the unverified case, so the design must never produce
 /// it: no exec input may ever have two sources, at any bank count.
 #[test]
 fn no_exec_input_ever_has_two_sources() {
@@ -293,7 +299,7 @@ fn every_display_brick_gets_exactly_one_colour_wire() {
 
 // --- content ----------------------------------------------------------------
 
-/// **The value test, read back out of a real save.** Each pixel's array must
+/// The value test, read back out of a real save: each pixel's array must
 /// hold that pixel's own source colour for every frame, converted sRGB ->
 /// linear -- the conversion nothing downstream of this renderer performs.
 #[test]
@@ -515,7 +521,7 @@ fn a_single_bank_render_emits_no_spillover_gates() {
     }
 }
 
-/// **The seam.** Each pixel's colours must split across banks at the real bank
+/// The seam: each pixel's colours must split across banks at the real bank
 /// size, with the last bank short rather than padded, and bank k's element 0
 /// must be global frame `k * bank_size` -- not a repeat of frame 0.
 #[test]
@@ -803,15 +809,15 @@ fn the_cost_estimate_matches_a_real_render() {
         let world = build_color_array_world(&clip, &opts, &mut NoProgress).expect("build");
         let est = cost::estimate_color_array(w, h, n, &opts);
 
-        // Gates are every inner-grid brick that is not one of the chip's five
-        // I/O pins (Pause, Restart, Resume, Rate, Done).
+        // Gates are every inner-grid brick that is not one of the chip's seven
+        // I/O pins (Pause, Restart, Resume, Rate, Done, Length, Progress).
         let inner = world.grids[0].1.len();
         assert_eq!(
-            inner - 5,
+            inner - 7,
             est.gates,
             "{w}x{h}x{n} bank {bank}: estimate said {} gates, the render emitted {}",
             est.gates,
-            inner - 5
+            inner - 7
         );
         assert_eq!(world.wires.len(), est.wires, "{w}x{h}x{n} bank {bank}: wire count");
         assert_eq!(world.bricks.len(), est.bricks, "{w}x{h}x{n} bank {bank}: brick count");

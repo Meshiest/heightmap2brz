@@ -1,5 +1,5 @@
-//! The subtitle display: one `Component_TextDisplay` laid across the BOTTOM OF
-//! THE PICTURE, fed a per-frame string out of its own `ArrayVar` by its own
+//! The subtitle display: one `Component_TextDisplay` laid across the bottom of
+//! the picture, fed a per-frame string out of its own `ArrayVar` by its own
 //! `ArrayVar_Get`.
 //!
 //! Two gates for a whole subtitle track. This is the same shape
@@ -20,7 +20,7 @@
 //!
 //! # Exec: fan-out, never fan-in
 //!
-//! The subtitle's `Get.Exec` hangs off the SAME per-bank exec entry the screen
+//! The subtitle's `Get.Exec` hangs off the same per-bank exec entry the screen
 //! already uses -- one more consumer of an output that already drives many.
 //! Exec fan-out is supported and free; exec fan-in (two sources into one exec
 //! input) is unverified, and nothing here produces it: the subtitle `Get` is a
@@ -43,29 +43,26 @@ pub use super::text_bricks::{TEXT_DISPLAY, TEXT_PORT};
 
 /// How much bigger a subtitle line is than one row of the screen, by default.
 ///
-/// **UNVERIFIED BY EYE.** Nobody has looked at this in game yet; it is an
-/// arithmetic guess and this constant is deliberately the single place to
-/// change it. The reasoning: at 192 px wide with `char_repeat` 2 the screen is
-/// 384 glyph cells across, while a subtitle line is 40-60 characters. At equal
-/// glyph size the text would occupy about a seventh of the width and be
-/// useless; at 6x it covers roughly half, which is what a subtitle normally
-/// looks like. `--subtitle-scale` (Task 5) exposes it, because the right value
-/// depends on the screen's width and the track's typical line length.
+/// Unverified by eye in game; an arithmetic guess, and this constant is
+/// deliberately the single place to change it. At 192 px wide with
+/// `char_repeat` 2 the screen is 384 glyph cells across, while a subtitle
+/// line is 40-60 characters: at equal glyph size the text would occupy about
+/// a seventh of the width and be useless, while at 6x it covers roughly
+/// half, which is what a subtitle normally looks like. `--subtitle-scale`
+/// exposes it, since the right value depends on the screen's width and the
+/// track's typical line length.
 pub const DEFAULT_SUBTITLE_SCALE: f32 = 6.0;
 
 /// How many world units the subtitle anchor is lifted "up the picture" -- off
 /// its bare bottom-centre baseline -- by default.
 ///
-/// **CALIBRATED BY EYE, IN ONE MODE, AT ONE CONFIGURATION.** The repository
-/// owner viewed a real render in game and reported the subtitle sitting about
-/// 8 units too low; that render was `--anim-mode text` at 192x108 with
-/// `--subtitle-scale 6`. This is the only configuration this number has ever
-/// been checked against -- a different resolution, scale, or `--anim-mode
-/// brick`/`color-array` render may want a different value, which is exactly
-/// why `--subtitle-lift` (mirroring `--subtitle-scale`) exposes it rather than
-/// leaving it a buried constant. See [`ScreenExtent`] and
-/// `bricks::subtitle_extent` for how each renderer applies it along whichever
-/// axis is "up the picture" for its own screen orientation.
+/// Calibrated by eye in one mode at one configuration only: `--anim-mode
+/// text` at 192x108 with `--subtitle-scale 6`. A different resolution,
+/// scale, or `--anim-mode brick`/`color-array` render may want a different
+/// value, which is why `--subtitle-lift` exposes it rather than leaving it a
+/// buried constant. See [`ScreenExtent`] and `bricks::subtitle_extent` for
+/// how each renderer applies it along whichever axis is "up the picture" for
+/// its own screen orientation.
 pub const DEFAULT_SUBTITLE_LIFT: f32 = 8.0;
 
 /// Rounds `--subtitle-lift`'s world-unit value to the nearest whole brick
@@ -80,13 +77,13 @@ pub fn lift_units(lift: f32) -> i32 {
     if lift.is_finite() { lift.round() as i32 } else { 0 }
 }
 
-/// The subtitle's `Component_TextDisplay` `Anchor`: horizontally CENTRED
-/// (X 0.5) and anchored at the text's BOTTOM edge (Y 1.0).
+/// The subtitle's `Component_TextDisplay` `Anchor`: horizontally centred
+/// (X 0.5) and anchored at the text's bottom edge (Y 1.0).
 ///
-/// This is what makes [`ScreenExtent::anchor`] a bottom-CENTRE position rather
+/// This is what makes [`ScreenExtent::anchor`] a bottom-centre position rather
 /// than a bottom-left one: the cube names the block's bottom-centre point, so a
 /// line of any length stays centred on the picture and a two-line cue grows
-/// UPWARD into the picture instead of downward out of it. Re-exported from
+/// upward into the picture instead of downward out of it. Re-exported from
 /// [`crate::text`] so the value and its explanation live next to each other.
 pub const SUBTITLE_ANCHOR: Vector2f = ANCHOR_BOTTOM_CENTRE;
 
@@ -94,69 +91,47 @@ pub const SUBTITLE_ANCHOR: Vector2f = ANCHOR_BOTTOM_CENTRE;
 /// around each glyph in the component's `OutlineColor` (opaque black), at
 /// [`SUBTITLE_OUTLINE_WIDTH`].
 ///
-/// A subtitle is the one text this crate draws over CONTENT rather than over
+/// A subtitle is the one text this crate draws over content rather than over
 /// empty world: white glyphs vanish against a white frame, and the outline is
 /// what makes a cue readable regardless of what the picture is doing behind it.
 pub const SUBTITLE_OUTLINE: u8 = OUTLINE_OUTLINED;
 
 /// The subtitle's `OutlineWidth` -- the crate-wide
-/// [`crate::text::DEFAULT_OUTLINE_WIDTH`].
-///
-/// This was briefly a subtitle-specific 4.0 against a default of 2.0, until the
-/// owner saw it and made 4.0 the default for everything. Kept as a named
-/// re-export rather than inlined so the subtitle's styling still reads as one
-/// block next to [`SUBTITLE_ANCHOR`] and [`SUBTITLE_OUTLINE`].
+/// [`crate::text::DEFAULT_OUTLINE_WIDTH`]. Kept as a named re-export rather
+/// than inlined so the subtitle's styling still reads as one block next to
+/// [`SUBTITLE_ANCHOR`] and [`SUBTITLE_OUTLINE`].
 pub const SUBTITLE_OUTLINE_WIDTH: f32 = crate::text::DEFAULT_OUTLINE_WIDTH;
 
-/// Where a renderer's screen ENDED, so the subtitle can be laid across it.
+/// Where a renderer's screen ended, so the subtitle can be laid across it.
 ///
-/// Each renderer fills this in from the geometry it has ALREADY computed --
-/// the display-brick pitch, or the text layout's world line height -- rather
-/// than from a second, independent derivation that could disagree with where
-/// the bricks actually went.
+/// Each renderer fills this in from geometry it has already computed (the
+/// display-brick pitch, or the text layout's world line height) rather than
+/// a second, independent derivation that could disagree with where the
+/// bricks actually went.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScreenExtent {
-    /// Main-grid position of the subtitle's anchor cube: the BOTTOM CENTRE of
-    /// the picture, one anchor-cube proud of the picture's own surface.
+    /// Main-grid position of the subtitle's anchor cube: the bottom centre
+    /// of the picture, one anchor-cube proud of the picture's own surface.
     ///
-    /// Two things are packed into one position, because both are properties of
-    /// where the picture ended and only the renderer knows them:
+    /// Bottom centre because the subtitle carries [`SUBTITLE_ANCHOR`]: the
+    /// cube names the text block's bottom-centre point, so the line spreads
+    /// either side of this position and grows upward from it. Proud of the
+    /// surface because a block drawn in the picture's own plane would
+    /// z-fight with it -- the cube rests flush on the picture's front face,
+    /// one [`crate::text::ANCHOR_CUBE_HALF`] past it. Which axis is "in
+    /// front" differs per renderer (world +X for text mode's upright wall,
+    /// +Z for a brick mode's ground screen), which is why this is a whole
+    /// position and not an offset.
     ///
-    /// * **Bottom centre**, because the subtitle carries
-    ///   [`SUBTITLE_ANCHOR`]: the cube names the text block's bottom-centre
-    ///   point, so the line spreads either side of this position and grows
-    ///   upward from it, overlaying the bottom of the picture. (The old
-    ///   behaviour anchored at the screen's bottom-LEFT with `Anchor (0, 0)`
-    ///   and hung the text below the picture entirely.)
-    /// * **Proud of the surface**, because a block drawn in the picture's own
-    ///   plane would z-fight with it. The cube rests FLUSH on the picture's
-    ///   front face -- centre one [`crate::text::ANCHOR_CUBE_HALF`] past it --
-    ///   which puts the glyph plane a full cube (2 units) in front. That is a
-    ///   real geometric separation rather than a render-order flag, so it does
-    ///   not depend on what `bForeground` turns out to mean in game. Which
-    ///   AXIS is "in front" differs per renderer -- world +X for text mode's
-    ///   upright wall, +Z for a brick mode's ground screen -- which is exactly
-    ///   why this is a whole position and not an offset.
-    ///
-    /// This is a MAIN-grid position, and it MAY be negative. The claim that
-    /// used to live here -- that `brdb`'s chunk encoding mishandles negative
-    /// brick coordinates -- is false: `Position::to_relative` splits with
-    /// `div_euclid`/`rem_euclid` and `from_relative` inverts it exactly, and
-    /// `World::add_brick_grid` already shifts every inner-grid brick by
-    /// `-CHUNK_HALF`, so every microchip gate this crate writes is stored at an
-    /// absolute coordinate near `-1024`, in chunk `(-1, -1, -1)`, and loads
-    /// fine. Both brick encodings place their chip shell at a negative
-    /// main-grid x in every render. `crate::anim::bricks::subtitle_extent`'s
-    /// doc carries the full disposition.
-    ///
-    /// TEXT mode nonetheless keeps its own main grid non-negative, because
-    /// [`crate::text::add_text_tiles`] translates the whole glyph grid to make
-    /// it so and a subtitle anchored outside that translation would be the one
-    /// brick breaking the mode's own rule. A picture whose centre would land
-    /// negative is therefore MOVED rather than have its subtitle anchored
-    /// outside it -- see `text_bricks`'s `subtitle_centre_shift`.
+    /// May be negative: brdb round-trips negative main-grid coordinates
+    /// exactly (see `bricks::subtitle_extent`'s doc for the concrete case
+    /// and the encoder-level proof). Text mode nonetheless keeps its own
+    /// main grid non-negative by construction
+    /// (`crate::text::add_text_tiles` translates the whole glyph grid),
+    /// moving the picture rather than anchoring a subtitle outside that
+    /// translation -- see `text_bricks::subtitle_centre_shift`.
     pub anchor: Position,
-    /// World units ONE image row of the screen occupies.
+    /// World units one image row of the screen occupies.
     ///
     /// This is what `subtitle_scale` multiplies, which is why it is a
     /// per-renderer input rather than a constant: a text-mode row is one line
@@ -166,17 +141,14 @@ pub struct ScreenExtent {
     pub row_height: f32,
     /// Which face of the anchor cube the glyphs are drawn on
     /// ([`crate::text::FACE_X_POSITIVE`] / [`crate::text::FACE_Z_POSITIVE`]),
-    /// i.e. WHICH PLANE the subtitle lies in.
+    /// i.e. which plane the subtitle lies in.
     ///
-    /// This is a per-renderer input because the three renderers do not build
-    /// the same kind of screen. Text mode's is a vertical wall facing world
-    /// +X, so its subtitle goes on the same upright face every glyph band
-    /// uses. Both brick encodings lay their screen FLAT on the ground and
-    /// present its top to the viewer, so a subtitle on the +X face would
-    /// stand edge-on to the picture -- a razor-thin line of glyphs seen from
-    /// above, unreadable at any scale. Those two pass
-    /// [`crate::text::FACE_Z_POSITIVE`] so the subtitle lies in the screen's
-    /// own plane.
+    /// A per-renderer input because the three renderers do not build the
+    /// same kind of screen: text mode's is a vertical wall facing world +X,
+    /// so its subtitle goes on the same upright face every glyph band uses.
+    /// Both brick encodings lay their screen flat and present its top to the
+    /// viewer, so a subtitle on the +X face would stand edge-on and
+    /// unreadable; those two pass [`crate::text::FACE_Z_POSITIVE`] instead.
     pub face: u8,
 }
 
@@ -184,7 +156,7 @@ pub struct ScreenExtent {
 /// subtitle can hang off it instead of duplicating it.
 ///
 /// All three slices are the renderers' own locals, and all three are indexed
-/// by BANK: `index_of_bank[k]` is the frame index rebased so bank `k`'s array
+/// by bank: `index_of_bank[k]` is the frame index rebased so bank `k`'s array
 /// is addressed from zero, `entry_of_bank[k]` is the exec source that fires
 /// while bank `k` is live, and `ge[k - 1]` is true once the frame index has
 /// reached bank `k` (which is `Select`'s `bSelectB` sense). Reusing them is
@@ -195,30 +167,17 @@ pub struct FrameIndex<'a> {
     /// Per-bank frame index. One entry per bank.
     pub index_of_bank: &'a [WirePort],
     /// Per-bank exec entry. One entry per bank. The subtitle's `Get.Exec`
-    /// FANS OUT from this; it never joins an existing exec input.
+    /// fans out from this; it never joins an existing exec input.
     pub entry_of_bank: &'a [WirePort],
     /// Boundary comparators, `n_banks - 1` of them: `ge[k - 1]` is true from
     /// the first frame of bank `k` onward.
     pub ge: &'a [WirePort],
 }
 
-// There is deliberately no `subtitle_headroom` here any more.
-//
-// It existed because the subtitle used to be anchored with `Anchor (0, 0)` and
-// a `TextDisplay` draws DOWNWARD from a top anchor: a cue hung under the
-// picture's bottom edge and would have rendered into (and under) the ground
-// unless the picture was lifted by a subtitle line's height first. The subtitle
-// now carries [`SUBTITLE_ANCHOR`], whose Y of 1.0 anchors the text at its own
-// BOTTOM edge, so every line grows UPWARD from the anchor and nothing is ever
-// drawn below it. The strip of ground it reserved has no occupant, so it was
-// removed rather than left as a lift nobody needs. What text mode does still
-// need is a HORIZONTAL shift, for a different reason -- see
-// `text_bricks::subtitle_centre_shift`.
-
 /// Errors if any frame's subtitle exceeds a `TextDisplay`'s character limit,
 /// naming the offending frame's timestamp.
 ///
-/// The game truncates past [`MAX_COMPONENT_CHARS`] **silently**: the save
+/// The game truncates past [`MAX_COMPONENT_CHARS`] silently: the save
 /// writes, the render plays, and the only symptom is a line that stops
 /// mid-word -- invisible until a human happens to look at that one frame. So
 /// this is a hard error and never a truncation. `fps` is used for nothing but
@@ -251,7 +210,7 @@ pub fn check_char_limit(per_frame: &[String], fps: f32) -> Result<(), String> {
 /// `Select` per bank boundary -- the same cost as a single text band, and two
 /// gates flat for any clip short of [`pack::BANK_FRAMES`] frames.
 ///
-/// **Call this LAST**, after every other gate is in the chip and immediately
+/// Call this last, after every other gate is in the chip and immediately
 /// before [`super::chip::finish`]. The subtitle's gates are placed a clear
 /// cell beyond the chip's current x extent, which is only collision-free
 /// against bricks that already exist -- a gate added afterwards at a deeper
@@ -296,7 +255,7 @@ pub fn add_subtitle_display(
     let scale = glyph_scale(opts, screen.row_height);
     let text_opts = TextOptions {
         // LineOffset and the glyph-fit Offsets are world-unit nudges sized for
-        // the SCREEN's glyphs; a subtitle glyph `scale` times bigger needs
+        // the screen's glyphs; a subtitle glyph `scale` times bigger needs
         // them `scale` times bigger too, or the nudge that centres a screen
         // pixel becomes a rounding error on a subtitle line.
         line_offset: opts.text.line_offset * scale,
@@ -314,11 +273,10 @@ pub fn add_subtitle_display(
             // Out-of-plane, not in-plane: this pushes the glyphs off the
             // anchor's face rather than sizing them, so it does not scale.
             //
-            // It is NOT what puts the subtitle in front of the picture --
-            // `ScreenExtent::anchor` already places the whole cube proud of the
-            // picture's surface, on whichever axis that renderer's "in front"
-            // happens to be. This stays the font preset's own glyph-fit nudge,
-            // exactly as it is for every other block.
+            // Not what puts the subtitle in front of the picture --
+            // `ScreenExtent::anchor` already places the whole cube proud of
+            // the picture's surface. This stays the font preset's own
+            // glyph-fit nudge, exactly as it is for every other block.
             z: opts.text.offset_z,
         },
         false,
@@ -385,7 +343,7 @@ pub fn add_subtitle_display(
             frame_index.index_of_bank[k].clone(),
             WirePort::new(get, ARRAY_GET, "Index"),
         );
-        // THE FAN-OUT: one more consumer of an exec output the screen already
+        // The fan-out: one more consumer of an exec output the screen already
         // drives. This `Get.Exec` gains exactly one source, so no fan-in.
         world.add_wire_connection(
             frame_index.entry_of_bank[k].clone(),
@@ -428,7 +386,7 @@ pub fn add_subtitle_display(
 /// How much bigger the subtitle's glyphs are than the screen's own, given the
 /// world height of one screen row.
 ///
-/// `subtitle_scale` is defined against ONE SCREEN ROW, not against the text
+/// `subtitle_scale` is defined against one screen row, not against the text
 /// options' line height, so a mode whose row is not a line of text -- both
 /// brick encodings, where a row is a display-brick pitch -- picks up that
 /// ratio too and one `subtitle_scale` means the same thing everywhere.
@@ -468,10 +426,10 @@ mod tests {
     /// on grid 1"), and the microchip's inner grid is a later id.
     const MAIN_GRID: usize = 1;
 
-    /// Bricks carrying `class`, across BOTH grids.
+    /// Bricks carrying `class`, across both grids.
     ///
-    /// The subtitle spans them: its `TextDisplay` is a MAIN-grid brick and its
-    /// gates are INNER-grid bricks, so a counter that looked at one grid only
+    /// The subtitle spans them: its `TextDisplay` is a main-grid brick and its
+    /// gates are inner-grid bricks, so a counter that looked at one grid only
     /// would silently pass whichever assertion it could not see.
     fn count_components(world: &World, class: &str) -> usize {
         world
@@ -498,7 +456,7 @@ mod tests {
     }
 
     /// A bare harness: a chip holding the frame-index plumbing a renderer
-    /// would build, and NOTHING else, so every component this counts belongs
+    /// would build, and nothing else, so every component this counts belongs
     /// to the subtitle. A real render would drown the subtitle's one
     /// `ArrayVar` in the screen's own.
     ///
@@ -633,11 +591,15 @@ mod tests {
             .expect("the banked subtitle display must build")
     }
 
-    /// A REAL render with `subtitles: None`. Unlike the harness above, this
+    /// A real render with `subtitles: None`. Unlike the harness above, this
     /// exercises the gate the renderers put the whole feature behind, so the
     /// "adds no components at all" assertion has something to be wrong about.
     fn render_without_subs(frames: usize) -> World {
-        build_brick_world(&clip(2, 2, frames), &AnimOptions::default(), &mut NoProgress)
+        // `control_buttons: false`: this test asserts a subtitle-free render adds
+        // no `Component_TextDisplay`, and the default-on control-button labels
+        // are TextDisplays that have nothing to do with subtitles.
+        let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+        build_brick_world(&clip(2, 2, frames), &opts, &mut NoProgress)
             .expect("a subtitle-free render must build")
     }
 
@@ -656,11 +618,11 @@ mod tests {
 
     /// Every string in every `ArrayVar` the save actually persisted.
     ///
-    /// Component DATA is only reachable through a written file --
+    /// Component data is only reachable through a written file --
     /// `BrdbComponent` exposes `component_type()` and nothing else -- so this
     /// round-trips through a `.brz`, the same way `text_bricks`' tests read
     /// their band strings. The bytes are not reproducible run to run, so the
-    /// round-trip is for READING structure and never for comparing files.
+    /// round-trip is for reading structure and never for comparing files.
     fn subtitle_strings(world: &World) -> Vec<String> {
         let path = std::env::temp_dir().join(format!(
             "h2b_subs_{}_{:?}.brz",
@@ -699,7 +661,7 @@ mod tests {
 
     /// What one persisted `Component_TextDisplay` says about how it is drawn.
     ///
-    /// `outline` alone is not enough to know a subtitle will actually SHOW an
+    /// `outline` alone is not enough to know a subtitle will actually show an
     /// outline: the enum only selects a style, and the colour, width and the
     /// two "yes, really use them" booleans have to reach the save with it.
     /// They are written unconditionally by `text_display_component`, which is
@@ -717,10 +679,10 @@ mod tests {
         sharp_outlines: bool,
     }
 
-    /// Every MAIN-grid `Component_TextDisplay` the save actually persisted.
+    /// Every main-grid `Component_TextDisplay` the save actually persisted.
     ///
     /// Round-trips through a written `.brz` for the same reason
-    /// [`subtitle_strings`] does: component property VALUES are unreachable
+    /// [`subtitle_strings`] does: component property values are unreachable
     /// from an in-memory `World`, which exposes only `component_type()`. So an
     /// assertion about `Anchor` or `Outline` that did not write a file would be
     /// asserting about the constant it was written from, not about the save.
@@ -756,7 +718,7 @@ mod tests {
                 };
                 // `Outline` is typed as `EBRTextOutline` in the save schema, so
                 // it comes back as an enum; the `u8` fallback is there so a
-                // schema that ever stops calling it one fails LOUDLY on the
+                // schema that ever stops calling it one fails loudly on the
                 // value rather than on the shape.
                 let outline = match s.get("Outline") {
                     Some(BrdbValue::Enum(e)) => e.value,
@@ -854,7 +816,7 @@ mod tests {
         }]))
     }
 
-    /// Inner-grid bricks: every gate plus the chip's I/O pins. The DELTA
+    /// Inner-grid bricks: every gate plus the chip's I/O pins. The delta
     /// between two renders of the same clip is what matters, and the pin count
     /// is identical on both sides of it.
     fn inner_bricks(world: &World) -> usize {
@@ -898,7 +860,7 @@ mod tests {
                 1,
                 "{name}: exactly one extra main-grid brick, the subtitle's anchor cube"
             );
-            // A `Component_TextDisplay` on a BRICK-mode world is genuinely new
+            // A `Component_TextDisplay` on a brick-mode world is genuinely new
             // -- neither brick encoding has ever placed one -- so the
             // component type, its `Text` port and the font asset reference all
             // have to survive `register_used_components`. Encoding is where
@@ -944,10 +906,10 @@ mod tests {
         }
     }
 
-    /// Every main-grid brick a subtitled TEXT render places must stay
-    /// non-negative: `brdb`'s chunk encoding mishandles negative brick
-    /// coordinates, and the subtitle is placed BELOW everything else, which is
-    /// the one thing that could push the stack under zero.
+    /// Every main-grid brick a subtitled text render places must stay
+    /// non-negative -- text mode keeps its whole main grid non-negative by
+    /// construction, and the subtitle is placed below everything else, which
+    /// is the one thing that could push the stack under zero.
     #[test]
     fn a_subtitled_text_render_keeps_every_main_grid_brick_non_negative() {
         let opts = AnimOptions {
@@ -964,7 +926,7 @@ mod tests {
         }
     }
 
-    /// `subtitle_scale` is defined against one SCREEN ROW, so the same scale
+    /// `subtitle_scale` is defined against one screen row, so the same scale
     /// yields a bigger `LineHeight` on a screen whose rows are bigger.
     #[test]
     fn the_glyph_scale_tracks_the_screen_row_height() {
@@ -972,7 +934,7 @@ mod tests {
         let one_row = opts.text.line_world_height * opts.text.pitch_y;
         assert!(
             (glyph_scale(&opts, one_row) - opts.subtitle_scale).abs() < 1e-6,
-            "a screen whose row IS one text line scales by exactly subtitle_scale"
+            "a screen whose row is one text line scales by exactly subtitle_scale"
         );
         assert!(
             glyph_scale(&opts, one_row * 4.0) > glyph_scale(&opts, one_row),
@@ -997,27 +959,22 @@ mod tests {
         assert_eq!(lift_units(f32::NEG_INFINITY), 0);
     }
 
-    // `subtitle_headroom` used to be tested here -- zero without subtitles,
-    // positive with them. It is gone, not renamed: the cue is anchored at its
-    // own BOTTOM edge now and grows upward, so no strip of ground below the
-    // picture is reserved for it. Its successor in spirit is text mode's
-    // `subtitle_centre_shift` (a SIDEWAYS shift, for the centre anchor's
-    // coordinate to be legal), which
-    // `the_picture_only_moves_sideways_when_there_are_subtitles` covers.
-
-    /// **The style the whole change is about.** Read back out of a written
-    /// save, because component property values are unreachable from an
-    /// in-memory `World`.
+    /// Read back out of a written save, because component property values
+    /// are unreachable from an in-memory `World`.
     ///
     /// The subtitle must be centred (Anchor.X 0.5) and anchored at its own
     /// bottom edge (Anchor.Y 1.0) with `EBRTextOutline::Outlined` (2) -- and,
-    /// just as importantly, the glyph BANDS sharing the same world must still
+    /// just as importantly, the glyph bands sharing the same world must still
     /// be top-left anchored with no outline, or the styled variant leaked into
     /// the pixel art and every frame of the picture is now outlined.
     #[test]
     fn the_subtitle_is_centred_bottom_anchored_and_outlined_and_the_bands_are_not() {
         let opts = AnimOptions {
             subtitles: Some(track()),
+            // Buttons off: their labels are TextDisplays too, and this test
+            // partitions the world's TextDisplays into the subtitle and the
+            // glyph bands.
+            control_buttons: false,
             ..AnimOptions::default()
         };
         let world = build_text_world(&clip(32, 8, 3), &opts, &mut NoProgress).expect("build");
@@ -1032,7 +989,7 @@ mod tests {
         let cue = &subtitle[0];
         assert_eq!(cue.anchor, (0.5, 1.0), "Anchor.X 0.5, Anchor.Y 1.0");
         assert_eq!(cue.outline, u64::from(SUBTITLE_OUTLINE), "EBRTextOutline::Outlined");
-        // The enum only picks a STYLE; these are what make it visible, and
+        // The enum only picks a style; these are what make it visible, and
         // they have to survive the write for the outline to appear in game.
         assert_eq!(cue.outline_color, (0, 0, 0, 255), "opaque black outline");
         assert_eq!(cue.outline_width, SUBTITLE_OUTLINE_WIDTH, "4.0, not the 2.0 every other block uses");
@@ -1060,7 +1017,7 @@ mod tests {
             ("colour-array", |c, o, p| build_color_array_world(c, o, p)),
         ];
         for (name, build) in renderers {
-            // 1x1 as well as a real screen: the subtitle now sits OVER the
+            // 1x1 as well as a real screen: the subtitle sits over the
             // picture rather than a row past it, so a screen with nothing to
             // one side of it is where an off-by-one in the centring would put
             // the anchor cube inside a display brick -- which `chip::finish`
@@ -1068,14 +1025,16 @@ mod tests {
             for (w, h) in [(16u32, 8u32), (1, 1)] {
                 let opts = AnimOptions {
                     subtitles: Some(track()),
-                    // The default lift is calibrated against a real TEXT mode
+                    // The default lift is calibrated against a real text mode
                     // render (see `DEFAULT_SUBTITLE_LIFT`'s doc) and, applied
-                    // to brick mode's `-y`, overshoots a 1-row picture -- see
-                    // `a_brick_mode_lift_too_big_for_the_picture_is_rejected`.
+                    // to brick mode's `-y`, overshoots a 1-row picture.
                     // Zeroed here because this test is about styling and
                     // centring, not the lift, at every size including that
                     // one-row edge case.
                     subtitle_lift: 0.0,
+                    // Buttons off: their labels are TextDisplays, and this test
+                    // asserts a brick screen's only TextDisplay is the subtitle.
+                    control_buttons: false,
                     ..AnimOptions::default()
                 };
                 let world = build(&clip(w, h, 3), &opts, &mut NoProgress)
@@ -1096,9 +1055,8 @@ mod tests {
 
     /// The subtitle overlays the picture and stands clear of it: its anchor
     /// cube sits at the screen's horizontal centre, at the bottom row, and one
-    /// cube ABOVE the display bricks' top face -- not level with them (it would
-    /// z-fight and the overlap check would reject it) and not a row past the
-    /// last (which is where it used to hang).
+    /// cube above the display bricks' top face -- not level with them, which
+    /// would z-fight and the overlap check would reject.
     #[test]
     fn a_brick_screens_subtitle_anchors_bottom_centre_in_front_of_the_screen() {
         let geometry = ScreenGeometry {
@@ -1121,13 +1079,13 @@ mod tests {
         );
     }
 
-    /// **Brick mode's up-the-picture axis is -Y, not +Z.** A display-brick
-    /// screen lies flat: the image's rows run along y, increasing toward the
+    /// Brick mode's up-the-picture axis is -y, not +z. A display-brick screen
+    /// lies flat: the image's rows run along y, increasing toward the
     /// picture's bottom (see `subtitle_extent`'s doc), so lifting the anchor
-    /// toward the picture's TOP moves it toward smaller y -- exactly the
-    /// opposite of text mode's +z. This is UNVERIFIED BY EYE (see
-    /// `subtitle_extent`'s doc on the still-unknown in-plane orientation); it
-    /// is only asserted to move along the axis the geometry says is "up".
+    /// toward the picture's top moves it toward smaller y -- the opposite of
+    /// text mode's +z. Unverified by eye (see `subtitle_extent`'s doc on the
+    /// still-unknown in-plane orientation); only asserted to move along the
+    /// axis the geometry says is "up".
     #[test]
     fn subtitle_lift_moves_the_brick_anchor_up_the_picture_along_minus_y() {
         let geometry = ScreenGeometry {
@@ -1146,19 +1104,14 @@ mod tests {
         assert_eq!(lifted.z, base.z, "the lift must not move the anchor off the screen's surface");
     }
 
-    /// **`brdb` encodes negative brick coordinates exactly.**
-    ///
-    /// Three places in this module used to refuse a negative main-grid
-    /// coordinate on the stated grounds that "`brdb`'s chunk encoding
-    /// mishandles" them, while `bricks::new_screen_chip` placed the chip shell
-    /// at a negative x in every single brick-mode render. Both could not be
-    /// right. This settles the `brdb` half by exercising the encoder itself:
-    /// `Position::to_relative` splits a coordinate into a chunk index and an
-    /// in-chunk offset with `div_euclid`/`rem_euclid`, and `from_relative` is
-    /// its exact inverse -- for negatives as much as positives.
+    /// `brdb` encodes negative brick coordinates exactly, by exercising the
+    /// encoder itself: `Position::to_relative` splits a coordinate into a
+    /// chunk index and an in-chunk offset with `div_euclid`/`rem_euclid`, and
+    /// `from_relative` is its exact inverse -- for negatives as much as
+    /// positives.
     ///
     /// Swept across the origin, across a chunk boundary, and across the
-    /// `-CHUNK_HALF` shift `World::add_brick_grid` applies to EVERY inner-grid
+    /// `-CHUNK_HALF` shift `World::add_brick_grid` applies to every inner-grid
     /// brick -- which is the strongest evidence available without loading a
     /// save, because it means every microchip gate this crate has ever written
     /// is already stored at an absolute coordinate near -1024, in chunk
@@ -1198,15 +1151,9 @@ mod tests {
         );
     }
 
-    /// The other half of the same question: a `--subtitle-lift` bigger than a
-    /// brick-mode picture is now ALLOWED, and produces the negative `y` it
-    /// implies, because that renderer already writes a negative main-grid `x`
-    /// for its chip shell in every render.
-    ///
-    /// This used to be `a_brick_mode_lift_too_big_for_the_picture_is_rejected`,
-    /// and the rejection turned a default `--subtitles` on any picture four
-    /// rows or shorter into a hard error, on a reason
-    /// `brdb_round_trips_negative_brick_coordinates_exactly` disproves.
+    /// A `--subtitle-lift` bigger than a brick-mode picture is allowed, and
+    /// produces the negative `y` it implies, because that renderer already
+    /// writes a negative main-grid `x` for its chip shell in every render.
     #[test]
     fn a_brick_mode_lift_bigger_than_the_picture_is_applied_not_refused() {
         let geometry = ScreenGeometry {
@@ -1220,8 +1167,8 @@ mod tests {
             .expect("a lift bigger than the picture must be applied, not refused");
         assert_eq!(extent.anchor.y, -1, "the lift must be applied exactly as asked");
 
-        // And a real render of a picture too short for the DEFAULT lift must
-        // build -- that is the case the old error made unrenderable.
+        // And a real render of a picture too short for the default lift must
+        // build.
         let opts = AnimOptions {
             subtitles: Some(track()),
             ..AnimOptions::default()
@@ -1242,7 +1189,7 @@ mod tests {
         );
     }
 
-    /// Text mode's picture moves sideways ONLY for a subtitle, by half its own
+    /// Text mode's picture moves sideways only for a subtitle, by half its own
     /// width, so the centre the subtitle anchors at is a legal coordinate.
     #[test]
     fn the_picture_only_moves_sideways_when_there_are_subtitles() {
@@ -1268,7 +1215,7 @@ mod tests {
         assert_eq!(subtitle_centre_shift(&broken, 192), 0);
     }
 
-    /// The subtitle's anchor cube must land INSIDE the picture's horizontal
+    /// The subtitle's anchor cube must land inside the picture's horizontal
     /// span (that is what "centred on it" means) and still be non-negative,
     /// across widths whose half-width rounds either way.
     #[test]
@@ -1276,6 +1223,10 @@ mod tests {
         for w in [16u32, 32, 33, 64, 65] {
             let opts = AnimOptions {
                 subtitles: Some(track()),
+                // Buttons off: their labels are TextDisplays placed at the
+                // greatest main-grid x, which would be picked as "the frontmost
+                // text cube" instead of the subtitle by the isolation below.
+                control_buttons: false,
                 ..AnimOptions::default()
             };
             let world = build_text_world(&clip(w, 8, 2), &opts, &mut NoProgress)
@@ -1302,7 +1253,7 @@ mod tests {
             assert!(!bands.is_empty(), "{w}px: the picture must have bands");
             assert!(
                 bands.iter().all(|b| b.position.x < sub.position.x),
-                "{w}px: the subtitle must sit IN FRONT of every glyph band, not in their plane"
+                "{w}px: the subtitle must sit in front of every glyph band, not in their plane"
             );
             let left = bands.iter().map(|b| b.position.y).max().unwrap();
             let width =
@@ -1346,18 +1297,22 @@ mod tests {
             .position
     }
 
-    /// **The anchor this whole change is about.** Text mode's screen is the
-    /// vertical wall `DEFAULT_SUBTITLE_LIFT`'s doc says was actually checked
-    /// by eye, and there `z` genuinely is the image row -- so "up the
-    /// picture" is `+z` (see `text_bricks::build_text_world`'s `subtitle_z`).
-    /// A real end-to-end render, driven twice with only the lift changed,
-    /// must move the anchor by EXACTLY the difference along that one axis.
+    /// Text mode's screen is the vertical wall `DEFAULT_SUBTITLE_LIFT`'s doc
+    /// says was actually checked by eye, and there `z` genuinely is the
+    /// image row -- so "up the picture" is `+z` (see
+    /// `text_bricks::build_text_world`'s `subtitle_z`). A real end-to-end
+    /// render, driven twice with only the lift changed, must move the
+    /// anchor by exactly the difference along that one axis.
     #[test]
     fn a_text_mode_lift_moves_the_subtitle_anchor_up_by_exactly_itself_along_plus_z() {
+        // Buttons off: `text_subtitle_anchor` isolates the subtitle as the
+        // frontmost text cube, which the control-button labels (also
+        // TextDisplays, placed further out on x) would otherwise displace.
         let base = text_subtitle_anchor(
             &AnimOptions {
                 subtitles: Some(track()),
                 subtitle_lift: 0.0,
+                control_buttons: false,
                 ..AnimOptions::default()
             },
             32,
@@ -1368,6 +1323,7 @@ mod tests {
             &AnimOptions {
                 subtitles: Some(track()),
                 subtitle_lift: 20.0,
+                control_buttons: false,
                 ..AnimOptions::default()
             },
             32,
@@ -1390,6 +1346,9 @@ mod tests {
     fn the_default_lift_applies_when_the_flag_is_absent() {
         let opts = AnimOptions {
             subtitles: Some(track()),
+            // Buttons off so `text_subtitle_anchor`'s frontmost-x isolation
+            // finds the subtitle, not a control-button label.
+            control_buttons: false,
             ..AnimOptions::default()
         };
         assert_eq!(

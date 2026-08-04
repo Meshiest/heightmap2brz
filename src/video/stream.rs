@@ -1,33 +1,17 @@
 //! Streaming frames instead of holding them.
 //!
 //! Every frame of a clip used to be decoded up front into a `Vec<RgbaImage>`
-//! and held for the whole render. Measured over 3 reps against a worktree
-//! build of the pre-streaming baseline, a 128x72 clip of 65 392 frames fell
-//! from 556 MB to 459 MB (~97 MB, ~17.5%) after this change -- not the 2.41 GB
-//! reduction an earlier draft of this comment claimed, which was never
-//! measured and is not achievable yet: [`crate::video::Clip`] is still the
-//! only [`FrameSource`], and it is still fully eager (`Clip::frames` is a
-//! plain `Vec<RgbaImage>` populated up front by its decoder). The larger
-//! figure needs a genuinely lazy `FrameSource` -- one that decodes a frame
-//! from disk/pipe on demand inside `FrameStream::next` rather than holding
-//! them all -- which does not exist yet. `ResizeStream`/`FpsStream` (below)
-//! are already lazy adapters over whatever they're given, so the win lands
-//! automatically the day a lazy source is added; nothing here needs to
-//! change for that.
+//! and held for the whole render. Measured, a 128x72 clip of 65 392 frames
+//! fell from 556 MB to 459 MB (~17.5%) after this change; [`crate::video::Clip`]
+//! is still the only [`FrameSource`] and is still fully eager, so a bigger
+//! win needs a genuinely lazy source that decodes on demand inside
+//! `FrameStream::next` -- `ResizeStream`/`FpsStream` (below) are already
+//! lazy adapters, so that win lands automatically once such a source exists.
 //!
 //! The trait is split in two on purpose: a [`FrameSource`] is a cheap
 //! re-openable handle and a [`FrameStream`] is a one-shot cursor, so a second
 //! traversal is available to any consumer that needs one without a `rewind()`
 //! that every backend would have to implement correctly.
-//!
-//! HISTORICAL NOTE, since this split was originally justified by a requirement
-//! that no longer exists: text mode was expected to need TWO passes, measuring
-//! each row's worst case across the whole clip before packing anything. It does
-//! not. A row's worst case is closed-form -- `width * (tag_chars + char_repeat)`,
-//! since the worst case is every pixel starting a new colour run -- so the band
-//! layout is decided from the width alone and text mode streams in one pass like
-//! everything else. The split is still the right shape; it just is not
-//! load-bearing for the reason it was built.
 use image::RgbaImage;
 
 /// What a source knows about itself before decoding anything.
@@ -58,28 +42,10 @@ pub trait FrameSource {
     fn info(&self) -> SourceInfo;
     fn open(&self) -> Result<Box<dyn FrameStream + '_>, String>;
 
-    /// A best-effort frame count for sizing a PROGRESS BAR, which may be
-    /// approximate.
-    ///
-    /// Deliberately separate from [`SourceInfo::frame_count_hint`], which must
-    /// never be guessed: that one decides whether the CLI refuses an
-    /// over-budget render before printing anything, so a number one too high
-    /// there would refuse a render the stream would have completed. Nothing
-    /// may refuse, truncate, or allocate off THIS one. It exists because the
-    /// honest `None` that a Matroska file gets from `frame_count_hint` (the
-    /// container stores no frame count, and ffmpeg's own frame-rate
-    /// conformance can duplicate frames, so `nb_frames` cannot be trusted
-    /// either) rendered as an indeterminate spinner that sat there for minutes
-    /// looking stalled -- while the file's DURATION was known the whole time
-    /// and `duration * fps` is a perfectly good denominator for a bar.
-    ///
-    /// Callers must treat it as an estimate that can overshoot or undershoot:
-    /// see `progress::FrameTotal`, which labels a bar built on this one as
-    /// estimated and grows it rather than overflowing if the render runs past
-    /// it.
-    ///
-    /// The default is the exact hint, so a source with nothing better to say
-    /// is neither worse nor more optimistic than it was.
+    /// Progress-bar estimate only; may over- or undershoot. Separate from
+    /// [`SourceInfo::frame_count_hint`], which must be exact -- nothing may
+    /// refuse, truncate, or allocate off this one. The default is the exact
+    /// hint.
     fn frame_count_estimate(&self) -> Option<usize> {
         self.info().frame_count_hint
     }
@@ -102,30 +68,13 @@ pub trait FrameStream {
     /// discover it.
     fn next(&mut self) -> Result<Option<RgbaImage>, String>;
 
-    /// Pull up to `n` frames, discarding all but the last, which is returned
-    /// alongside how many were actually pulled. Fewer than `n` means the
-    /// stream drained partway; `0` means it was already drained.
-    ///
-    /// This exists because [`super::scale::FpsStream`] spends most of a
-    /// downsampling render *passing over* frames: 30fps → 10fps reads every
-    /// source frame but keeps one in three. The default body below is
-    /// literally `n` calls to [`FrameStream::next`], so a stream that
-    /// overrides nothing behaves exactly as it always did -- but a stream that
-    /// can produce a frame more cheaply when nobody will look at it (the
-    /// builtin backend's per-pixel YUV→RGBA conversion; a Lanczos resize)
-    /// overrides this and skips that work for the `n - 1` frames it is merely
-    /// passing over. Measured on a 1080p30 clip resampled to 10fps, that is
-    /// two thirds of both.
-    ///
-    /// The contract is deliberately "keep the last", not "skip `n`": that is
-    /// exactly what `FpsStream::advance_to` needs -- the frame it lands on,
-    /// and, when the source drains early, the last frame actually read, which
-    /// it repeats. A "skip" shaped API would let an override discard a frame
-    /// the caller still needed and be silently, visibly wrong.
-    ///
-    /// An override MUST report the same count and the same final frame the
-    /// default body would, and MUST surface the same errors. This is a
-    /// performance override, never a semantic one.
+    /// Pull `n` frames, keep the last -- returned alongside how many were
+    /// actually pulled (fewer than `n` means the stream drained partway; `0`
+    /// means it already had). A stream can override this to skip per-frame
+    /// work on the frames it's merely passing over (e.g. a downsampling
+    /// [`super::scale::FpsStream`] reading every source frame but keeping
+    /// one in three), but MUST match the default's count, final frame, and
+    /// errors -- a performance override, never a semantic one.
     fn advance(&mut self, n: usize) -> Result<(usize, Option<RgbaImage>), String> {
         let mut got = 0;
         let mut last = None;

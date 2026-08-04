@@ -2,7 +2,7 @@
 //! per-pixel colour arrays a Brickadia microchip reads in colour-array mode.
 //!
 //! This is the sibling of [`super::pack`], and the two are laid out along
-//! OPPOSITE axes. Hex mode is **frame-major**: one array entry per frame,
+//! opposite axes. Hex mode is **frame-major**: one array entry per frame,
 //! each holding every pixel's colour as text, tiled into
 //! [`super::pack::PIXELS_PER_CHUNK`]-pixel chunks so an entry fits the
 //! component character limit. Colour-array mode is **pixel-major**: one array
@@ -14,13 +14,14 @@
 //! ## Colour space
 //!
 //! `WireArrayVariant::LinearColorArray` is documented in `brdb` as `(R, G, B,
-//! A)` f32 elements, **linear 0-1**. Video frames are sRGB. Unlike the hex
-//! path -- where the in-game `MakeColorHex` gate does its own conversion from
-//! whatever bytes it is handed -- nothing downstream of this module transforms
-//! colour, so the sRGB -> linear transfer MUST happen here or the whole render
-//! comes out a gamma step too bright. That is [`crate::util::to_linear_rgb_f32`],
-//! the float version: `to_linear_rgb` quantizes back to `u8` and would
-//! collapse every linear value below `1/255` to zero, crushing shadows.
+//! A)` f32 elements, linear 0-1. Video frames are sRGB. Unlike the hex path
+//! -- where the in-game `MakeColorHex` gate does its own conversion from
+//! whatever bytes it is handed -- nothing downstream of this module
+//! transforms colour, so the sRGB -> linear transfer must happen here or the
+//! whole render comes out a gamma step too bright. That is
+//! [`crate::util::to_linear_rgb_f32`], the float version: `to_linear_rgb`
+//! quantizes back to `u8` and would collapse every linear value below
+//! `1/255` to zero, crushing shadows.
 //!
 //! Because the conversion is mandatory rather than optional here, this path
 //! ignores `AnimOptions::srgb_to_linear` (which exists for the hex path, where
@@ -28,37 +29,19 @@
 //!
 //! ## Memory
 //!
-//! **This mode's accumulator retains 16 bytes per pixel per frame** -- four
-//! `f32` -- against hex mode's 6 (one `RRGGBB` per pixel per frame). Both are
-//! streaming, in the sense that no *image* is ever retained, but the encoded
-//! form is what dominates a long render and colour-array mode's is ~2.7x
-//! larger. A 128x72 clip of 65 535 frames is ~9.7 GB here versus ~3.6 GB in
-//! hex mode. That raises the memory floor on long renders and is the main
-//! cost of the encoding; the gate-count and per-frame-work savings are what
-//! it buys.
+//! This mode's accumulator retains 16 bytes per pixel per frame (four `f32`)
+//! against hex mode's 6 (one `RRGGBB` per pixel per frame), ~2.7x larger. A
+//! 128x72 clip of 65 535 frames is ~9.7 GB here versus ~3.6 GB in hex mode.
+//! That raises the memory floor on long renders; the gate-count and
+//! per-frame-work savings are what it buys.
 //!
-//! That 16-bytes-per-pixel-per-frame figure is only true because
-//! [`ColorPacker::new`] **reserves each pixel's `Vec` exactly**. It did not
-//! always: with a plain `Vec::new()` grown one `push` per frame, Rust's
-//! amortized doubling leaves every inner `Vec` at a capacity of
-//! `next_power_of_two(frames)` (minimum 4), so the process really held
-//! `pixels * next_power_of_two(frames) * 16`. At 128x72 over 40,000 frames
-//! that is 9.66 GB actually retained against the 5.90 GB this figure -- and
-//! the CLI readout built on it -- reported, and the worst case, one frame past
-//! a power of two, is just over 2x. An under-reported memory figure is how a
-//! user starts an hour-long render that then gets OOM-killed, so the
-//! reservation is load-bearing rather than a micro-optimisation (it also
-//! removes the reallocation churn: a 65 535-frame render otherwise re-copies
-//! every pixel's array 16 times).
-//!
-//! [`super::color_bricks::unreserved_accumulator_bytes`] is what the figure
-//! would be without the reservation, and
+//! Exact, not a bound, only because [`ColorPacker::new`] reserves each
+//! pixel's `Vec` exactly: an unreserved `Vec` grown one push per frame
+//! instead doubles to `next_power_of_two(frames)` capacity (minimum 4), up
+//! to 2x over -- an under-reported figure is how a user starts an hour-long
+//! render that then gets OOM-killed.
+//! [`super::color_bricks::unreserved_accumulator_bytes`] is that figure;
 //! `the_reservation_is_what_makes_the_memory_figure_true` pins the two apart.
-//!
-//! The headline example above happens to be accurate under EITHER scheme:
-//! 65 535 is one *under* a power of two, so its doubling slack was 0.0015%.
-//! Every other frame count was worse, which is exactly why the example never
-//! showed the problem.
 use image::RgbaImage;
 
 /// One array element: linear `(R, G, B, A)`, matching
@@ -88,7 +71,7 @@ pub struct ColorPacker {
     width: usize,
     height: usize,
     alpha_threshold: u8,
-    /// `pixels[pixel_index][frame]`. Pixel-major: the inner `Vec` IS what one
+    /// `pixels[pixel_index][frame]`. Pixel-major: the inner `Vec` is what one
     /// `ArrayVar` will hold, so no transposition happens later.
     pixels: Vec<Vec<LinearColor>>,
     visible: Vec<bool>,
@@ -98,7 +81,7 @@ pub struct ColorPacker {
 impl ColorPacker {
     /// `frame_count_hint` is the source's own `SourceInfo::frame_count_hint`,
     /// and it is what keeps this mode's memory figure honest -- see the
-    /// module's Memory section. Each pixel's array is reserved EXACTLY that
+    /// module's Memory section. Each pixel's array is reserved exactly that
     /// long, so the accumulator holds `pixels * frames * 16` bytes and not the
     /// `pixels * next_power_of_two(frames) * 16` that one `push` per frame
     /// into an unreserved `Vec` would leave it at.
@@ -108,7 +91,7 @@ impl ColorPacker {
     /// length -- [`super::color_bricks::unreserved_accumulator_bytes`] is the
     /// figure for that case.
     ///
-    /// A hint that turns out to be WRONG is safe either way: too small and the
+    /// A hint that turns out to be wrong is safe either way: too small and the
     /// tail doubles from there, too large and the excess is capacity that was
     /// never touched. It is a reservation, not a limit -- `push_frame` still
     /// accepts as many frames as the source produces, up to
@@ -125,9 +108,9 @@ impl ColorPacker {
             width: width as usize,
             height: height as usize,
             alpha_threshold,
-            // Built one at a time, NOT `vec![Vec::with_capacity(n); total]`:
+            // Built one at a time, not `vec![Vec::with_capacity(n); total]`:
             // that clones the prototype, and `Vec::clone` allocates for its
-            // LENGTH, not its capacity -- so the macro form would hand back
+            // length, not its capacity -- so the macro form would hand back
             // `total` empty, capacity-0 vectors and silently undo the whole
             // reservation. `with_capacity(0)` does not allocate, so the
             // no-hint case costs nothing.
@@ -139,7 +122,7 @@ impl ColorPacker {
 
     /// Push one frame's contribution to every pixel's colour array.
     ///
-    /// `frame` MUST be exactly `width x height` -- the dimensions `new` was
+    /// `frame` must be exactly `width x height` -- the dimensions `new` was
     /// built with, which are the ones the caller's `SourceInfo` reported (see
     /// [`crate::video::stream::FrameStream::next`]'s contract). Checked here,
     /// before any pixel is read, for the same reason
@@ -164,9 +147,8 @@ impl ColorPacker {
             ));
         }
         // Pixel `idx` is `raw[idx * 4..][..4]`: `RgbaImage`'s buffer is
-        // row-major RGBA with no padding, which is the same order `pixels` is
-        // in. Walking the two together replaces the `%`, the `/` and the
-        // bounds-checked `get_pixel` this used to do per pixel per frame with
+        // row-major RGBA with no padding, the same order `pixels` is in.
+        // Walking the two together replaces bounds-checked `get_pixel` with
         // a plain zip. The dimension check above is what makes the two
         // lengths agree.
         let raw = frame.as_raw();
@@ -200,17 +182,14 @@ impl ColorPacker {
 /// `the_f32_linear_table_is_exactly_the_function`), so this is a speed change
 /// and never a colour change.
 ///
-/// **Deliberately serial, unlike [`super::pack::Packer`]'s per-chunk fan-out.**
-/// It was written parallel first and measured: a rayon walk over these same
-/// three zipped slices was **11% SLOWER** at 192x108 (0.107s against 0.096s
-/// for 400 frames) and only won at sizes this mode cannot reach anyway -- 2.2x
-/// at 640x360, which at 16 bytes per pixel per frame is 3.7 MB of accumulator
-/// *per frame* and blows the memory ceiling in the module doc long before the
-/// speed matters. The reason the hex packer's fan-out pays and this one does
-/// not is the access pattern: a hex chunk is ~1 666 pixels of contiguous
-/// string building, while this scatters one 16-byte push into each of tens of
-/// thousands of separate heap allocations, where the limit is memory latency
-/// rather than CPU and extra threads buy nothing. So it is not here.
+/// Deliberately serial, unlike [`super::pack::Packer`]'s per-chunk fan-out:
+/// measured 11% slower with a rayon walk over these same slices at 192x108,
+/// and only won at sizes this mode cannot reach anyway before the memory
+/// ceiling in the module doc bites. The reason the hex packer's fan-out pays
+/// and this one does not is the access pattern: a hex chunk is contiguous
+/// string building, while this scatters one 16-byte push into each of tens
+/// of thousands of separate heap allocations -- memory-latency bound, where
+/// extra threads buy nothing.
 fn push_pixels(
     pixels: &mut [Vec<LinearColor>],
     visible: &mut [bool],
@@ -274,11 +253,11 @@ mod tests {
         assert_eq!(visible, vec![false; 12]);
     }
 
-    /// **The value test.** Pixel p at frame f must hold exactly that pixel's
-    /// own source colour, converted -- not a neighbour's, not a different
-    /// frame's, and not the raw sRGB bytes. Every pixel and every frame gets a
-    /// distinct colour so a transposition, an off-by-one or a missing
-    /// conversion all show up as a mismatch.
+    /// Pixel p at frame f must hold exactly that pixel's own source colour,
+    /// converted -- not a neighbour's, not a different frame's, and not the
+    /// raw sRGB bytes. Every pixel and every frame gets a distinct colour so
+    /// a transposition, an off-by-one or a missing conversion all show up as
+    /// a mismatch.
     #[test]
     fn pixel_p_at_frame_f_holds_that_pixels_own_converted_colour() {
         let (w, h, n) = (5u32, 3u32, 4u32);
@@ -327,7 +306,7 @@ mod tests {
         );
     }
 
-    /// Row-major indexing, checked on a NON-square screen so the two
+    /// Row-major indexing, checked on a non-square screen so the two
     /// candidate formulas actually differ: `row * width + col` puts (col 2,
     /// row 1) of a 5-wide screen at index 7, while the column-major
     /// transposition would put it at 5.
@@ -422,7 +401,7 @@ mod tests {
         );
         let flat: Vec<LinearColor> = banks.iter().flat_map(|b| b.iter().copied()).collect();
         assert_eq!(flat, pixels[0], "the banks must reassemble into the original list");
-        // The seam itself: bank 1 must START at frame 3, not repeat frame 0.
+        // The seam itself: bank 1 must start at frame 3, not repeat frame 0.
         assert_eq!(banks[1][0], pixels[0][3], "bank 1 element 0 is global frame 3");
         assert_eq!(banks[2][0], pixels[0][6], "bank 2 element 0 is global frame 6");
     }

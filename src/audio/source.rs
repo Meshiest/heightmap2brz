@@ -7,13 +7,13 @@
 
 /// File extensions the audio path accepts as a bare audio file.
 ///
-/// Exactly the five the BUILTIN (`symphonia`) decoder is built for -- mp3,
+/// Exactly the five the builtin (`symphonia`) decoder is built for -- mp3,
 /// wav/pcm, flac, vorbis-in-ogg and aac-in-mp4 -- so a file offered by a
 /// picker filtered on this list is one every build can open, with or without
 /// ffmpeg. A picker that accepts a file the tool then refuses is worse than
 /// one that never offered it.
 ///
-/// A VIDEO container is equally valid input (the pipeline pulls its audio
+/// A video container is equally valid input (the pipeline pulls its audio
 /// track out, and `--audio-track` picks which), but those extensions live in
 /// [`crate::video::source::VIDEO_EXTENSIONS`] and are not duplicated here.
 pub const AUDIO_EXTENSIONS: [&str; 5] = ["mp3", "wav", "flac", "ogg", "m4a"];
@@ -44,11 +44,27 @@ pub trait AudioSource {
 pub trait AudioStream {
     /// The next block of mono f32 samples, or `None` once drained.
     ///
-    /// An error is FATAL to the render. A stream that fails halfway must not
-    /// be treated as a short track -- that would silently write a save missing
-    /// its tail, the exact failure the video side documents on
-    /// `FrameStream::next`.
+    /// An error is fatal to the render. A stream that fails halfway must not
+    /// be treated as a short track -- that would silently write a save
+    /// missing its tail.
     fn next(&mut self) -> Result<Option<Vec<f32>>, String>;
+}
+
+/// The global index and value of the first non-finite sample in `block`,
+/// where `base` is `block[0]`'s index in the whole decoded stream.
+///
+/// Shared by every decode backend ([`crate::audio::symphonia_src`] and
+/// [`crate::audio::ffmpeg_src`]): both decoders must reject a NaN or
+/// infinity at the source rather than let it reach `track::analyze`'s
+/// `min(1.0)` clamp, where `f32::NAN.min(1.0)` is `1.0` and a single corrupt
+/// sample would launder into a whole bank of speakers at maximum volume.
+/// Split out as a free function so the rejection rule can be tested directly
+/// against a NaN a decoder would only ever produce on a corrupt file.
+pub(crate) fn first_non_finite(block: &[f32], base: u64) -> Option<(u64, f32)> {
+    block
+        .iter()
+        .position(|s| !s.is_finite())
+        .map(|i| (base + i as u64, block[i]))
 }
 
 /// In-memory source. Used by every test, and by the GUI for short previews.
@@ -108,9 +124,8 @@ mod tests {
         SampleClip::new(48_000, (0..n).map(|i| i as f32 / n as f32).collect())
     }
 
-    /// The property the two-pass consumers depend on, mirroring
-    /// `video::stream`'s equivalent: opening the same source twice must
-    /// yield identical samples.
+    /// The property the two-pass consumers depend on: opening the same
+    /// source twice must yield identical samples.
     #[test]
     fn two_streams_over_one_source_agree() {
         let c = clip(1000);

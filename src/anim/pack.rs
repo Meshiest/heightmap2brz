@@ -12,7 +12,7 @@
 //! A pixel below `alpha_threshold` in a given frame gets no brick and no
 //! gates elsewhere in the pipeline. In production that decision is made by
 //! [`Packer`], which folds visibility into the very same per-frame traversal
-//! that builds these strings (see its own doc comment) -- NOT independently by
+//! that builds these strings (see its own doc comment), not independently by
 //! whatever renderer calls [`pack`], which has no production caller left (see
 //! `pack`'s own doc note). Either way, a culled pixel still contributes
 //! exactly [`HEX_STRIDE`] characters to *that* frame's string, so every
@@ -34,8 +34,8 @@ pub const PIXELS_PER_CHUNK: usize = MAX_COMPONENT_CHARS / HEX_STRIDE;
 
 /// Entries one wire array holds.
 ///
-/// INFERRED, NOT MEASURED: the array index is a `u16`, which addresses
-/// `0..=65535` -- that is 65 536 entries, so this cap is one conservative. The
+/// Inferred, not measured: the array index is a `u16`, which addresses
+/// `0..=65535` -- 65 536 entries, so this cap is one conservative. The
 /// largest array actually loaded in-game to date is 63 340. If a multi-bank
 /// render plays correctly and then breaks exactly at a bank seam, this
 /// constant is the first thing to change.
@@ -48,9 +48,9 @@ pub const MAX_BANKS: usize = 16;
 /// Largest frame count a render may carry, across all banks.
 ///
 /// Kept under this name because `main.rs` (the `--max-frames` cap) and
-/// `gui/video.rs` (the frame slider bound) both reference it. Its MEANING
-/// widened with spillover: it used to be what one array holds, which is now
-/// [`BANK_FRAMES`].
+/// `gui/video.rs` (the frame slider bound) both reference it, though its
+/// meaning widened with spillover: it once meant what one array holds, which
+/// is now [`BANK_FRAMES`].
 pub const MAX_FRAMES: usize = BANK_FRAMES * MAX_BANKS;
 
 /// Split a frame list into per-array banks of at most `bank_size` entries.
@@ -107,16 +107,15 @@ pub struct Chunk {
 /// -- the overall cap across all [`MAX_BANKS`] banks of [`BANK_FRAMES`]
 /// entries each; never truncates.
 ///
-/// RETAINED DELIBERATELY, though it has no production caller any more (that
+/// Retained deliberately, though it has no production caller any more (that
 /// role now belongs to [`Packer`], which fuses this same encoding with
 /// visibility in one pass instead of two): this whole-clip, two-pass
 /// implementation is the byte-identity oracle every `Packer` test diffs
 /// against (see `tests/anim_pack.rs`'s differential sweep, and
-/// `the_fused_packer_matches_the_two_pass_result_exactly`). `pub` on purpose
-/// so it stays reachable from the integration tests without a `#[cfg(test)]`
-/// carve-out. Do not remove this function, and do not delete it as "dead
-/// code" -- doing so would delete the only independent check that `Packer`
-/// still encodes frames exactly the way this crate always has.
+/// `the_fused_packer_matches_the_two_pass_result_exactly`). `pub` so it stays
+/// reachable from the integration tests without a `#[cfg(test)]` carve-out.
+/// Do not delete this as dead code -- doing so removes the only independent
+/// check that `Packer` still encodes frames the way this crate always has.
 pub fn pack(clip: &Clip, alpha_threshold: u8) -> Result<Vec<Chunk>, String> {
     if clip.frames.len() > MAX_FRAMES {
         return Err(format!(
@@ -200,7 +199,7 @@ pub struct Packer {
     per_chunk: usize,
     /// What one culled pixel contributes: `stride` `'0'`s, built once instead
     /// of pushed one character at a time per culled pixel per frame. Its
-    /// length IS the stride this packer was built with -- it is all-ASCII, so
+    /// length is the stride this packer was built with -- it is all-ASCII, so
     /// `culled.len()` and the character stride are the same number.
     culled: String,
     chunks: Vec<Chunk>,
@@ -211,10 +210,10 @@ pub struct Packer {
     ///
     /// Decoded video frames are sRGB-encoded, which is what every image and
     /// video format stores. Whether that is also what the in-game
-    /// `MakeColorHex` gate wants is a property of the GAME, not of this
+    /// `MakeColorHex` gate wants is a property of the game, not of this
     /// crate -- nothing here or in `brdb` transforms colour on the animation
     /// path, so the hex written below reaches that gate byte for byte. If
-    /// the gate treats its hex as LINEAR, feeding it sRGB renders roughly one
+    /// the gate treats its hex as linear, feeding it sRGB renders roughly one
     /// gamma step too bright, and this converts to compensate.
     ///
     /// `None` by default so existing renders are unchanged; `--srgb-to-linear`
@@ -265,18 +264,17 @@ impl Packer {
 
     /// Push one frame's contribution to every chunk's per-frame string.
     ///
-    /// `frame` MUST be exactly `width x height` (the dimensions `new` was
+    /// `frame` must be exactly `width x height` (the dimensions `new` was
     /// built with -- the same ones a caller's `SourceInfo` reported, per the
     /// contract documented on [`crate::video::stream::FrameStream::next`]).
     /// Nothing upstream of this call enforces that: `build_brick_world` sizes
     /// this `Packer` from `source.info()` once and then reads every subsequent
-    /// frame at those dimensions -- an undersized frame would panic deeper in
-    /// (originally inside `get_pixel`; now on the raw-buffer slice below), and
-    /// an oversized one would encode silently with its excess pixels ignored,
-    /// no error at all. Checking here, before any pixel is read, turns both
-    /// into one descriptive `Err` naming both the expected and the actual
-    /// size -- and is also what makes the flat slicing below in-bounds by
-    /// construction.
+    /// frame at those dimensions -- an undersized frame would panic on the
+    /// raw-buffer slice below, and an oversized one would encode silently
+    /// with its excess pixels ignored, no error at all. Checking here, before
+    /// any pixel is read, turns both into one descriptive `Err` naming both
+    /// the expected and the actual size, and is also what makes the flat
+    /// slicing below in-bounds by construction.
     pub fn push_frame(&mut self, frame: &RgbaImage) -> Result<(), String> {
         if self.frames_pushed >= MAX_FRAMES {
             return Err(format!(
@@ -293,10 +291,10 @@ impl Packer {
         }
         // A chunk's pixels are a contiguous run of row-major indices, and
         // row-major RGBA is exactly the layout of `RgbaImage`'s raw buffer --
-        // so a chunk IS one flat slice of it. Walking that slice replaces a
-        // `%`, a `/` and a bounds-checked `get_pixel` per pixel with one
-        // offset computed per chunk. The dimension check above is what makes
-        // the slicing below in-bounds by construction.
+        // so a chunk is one flat slice of it. Walking that slice replaces a
+        // bounds-checked `get_pixel` per pixel with one offset computed per
+        // chunk. The dimension check above is what makes the slicing below
+        // in-bounds by construction.
         let raw = frame.as_raw();
         debug_assert_eq!(
             raw.len(),
@@ -367,17 +365,16 @@ fn encode_chunk(
 
 /// Fewest chunks rayon may put in one job.
 ///
-/// MEASURED, not guessed. Without it, `par_iter_mut` splits down to a single
-/// chunk per job, and one chunk is only ~1 666 pixels of work -- so on a
-/// 192x108 screen (13 chunks) the parallel version came out **slower than the
-/// serial one**: 101 Mpx/s against 209, because each frame paid a full
-/// fan-out/join across the pool for jobs that finish in microseconds. Bounding
-/// the split at 8 chunks per job makes the small case a wash (228 vs 209
-/// Mpx/s) while keeping the large one, where the fan-out is amortized: at
+/// Measured, not guessed: without it, `par_iter_mut` splits down to a single
+/// chunk per job (~1 666 pixels of work), and on a 192x108 screen (13 chunks)
+/// the parallel version came out slower than serial -- 101 Mpx/s against 209,
+/// each frame paying a full fan-out/join for jobs that finish in
+/// microseconds. Bounding the split at 8 chunks per job makes the small case
+/// a wash while keeping the large one, where the fan-out is amortized: at
 /// 640x360 (139 chunks) it is 600 Mpx/s against the serial 227.
 ///
 /// (400 frames, `--release`, 32 logical cores. Frames are pushed one at a
-/// time by a streaming decoder, so this fan-out happens once PER FRAME and
+/// time by a streaming decoder, so this fan-out happens once per frame, and
 /// its fixed cost is what the bound is protecting against.)
 #[cfg(not(target_arch = "wasm32"))]
 const MIN_CHUNKS_PER_JOB: usize = 8;

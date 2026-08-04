@@ -32,7 +32,7 @@ use brdb::{
 pub const MICROCHIP_INPUT: &str = "BrickComponentType_Internal_MicrochipInput";
 pub const MICROCHIP_OUTPUT: &str = "BrickComponentType_Internal_MicrochipOutput";
 
-/// A quarter turn clockwise about the world **up (Z)** axis, yawing the whole
+/// A quarter turn clockwise about the world up (Z) axis, yawing the whole
 /// interaction plane so it faces the other way round.
 ///
 /// `World::add_microchip` leaves the grid entity's rotation at identity, so
@@ -65,7 +65,7 @@ pub struct Chip {
     /// `recompute_plane_extent` so the two can never drift apart.
     collapsed: bool,
     /// The inner grid's bricks, and every one of their (center, half-size)
-    /// bounds. These two MUST stay in lockstep -- `finish`'s overlap check
+    /// bounds. These two must stay in lockstep -- `finish`'s overlap check
     /// and `plane_extent_for` are both blind to a brick missing from
     /// `placed`, and a brick they can't see is one the game silently drops
     /// at load (taking its wires with it). They are private, and
@@ -79,7 +79,7 @@ impl Chip {
     /// Add a brick to the chip's inner grid, minting and returning its brick
     /// id (the id used to name a wire endpoint).
     ///
-    /// This is the ONLY way to put a brick in a chip. `half` is the brick's
+    /// This is the only way to put a brick in a chip. `half` is the brick's
     /// half-size, which the caller must supply: it cannot be derived
     /// reliably, because `Brick::local_bounds` guesses `(5, 5, 6)` for any
     /// basic brick, and every gate this crate emits is actually
@@ -111,19 +111,10 @@ impl Chip {
     /// surviving into the published extent would silently reintroduce an
     /// oversized plane.
     fn recompute_plane_extent(&mut self) {
-        // DO NOT translate the bricks. The gate lattice is origin-anchored
-        // (`layout::lattice_pos` emits only non-negative coordinates) and it
-        // must stay that way: **negative inner-grid coordinates break bricks
-        // in-game**.
-        //
-        // Centring the content on the origin was tried twice, and both times
-        // the *display* gates vanished while the clock survived. That split
-        // is the tell: `lattice_pos` puts `x = (h-1-row)*CELL + half.x`, so
-        // pixel gates occupy the LOW x end of the lattice and the service
-        // gates the HIGH end -- centring pushes exactly the pixel gates
-        // negative and leaves the service gates positive.
-        //
-        // So the plane is moved onto the content instead, via `PlaneCenter`.
+        // Do not translate the bricks: the gate lattice is origin-anchored
+        // (`layout::lattice_pos` emits only non-negative coordinates), and
+        // negative inner-grid coordinates delete bricks in game (verified).
+        // The plane is moved onto the content instead, via `PlaneCenter`.
         let (center, extent) = plane_bounds_for(&self.placed);
         debug_assert!(
             self.placed
@@ -133,20 +124,13 @@ impl Chip {
         );
         self.entity.data = entities::microchip_grid_entity(self.collapsed, center, extent);
 
-        // Centre the plane over the display.
-        //
-        // The lattice is origin-anchored (0..N), so its midpoint sits half a
-        // plane-width away from the grid origin and the plane hangs off the
-        // anchor instead of straddling it. The bricks themselves cannot be
-        // moved to fix that -- shifting them toward the origin drives the
-        // low-x pixel gates negative, which deletes them in-game -- so the
-        // correction goes on the entity.
-        //
-        // It has to account for `PLANE_SPIN`, a -90 degree yaw about world Z,
-        // which maps a grid-local (x, y) onto world (y, -x). So the x-extent
-        // corrects world Y and the y-extent corrects world X, with the sign
-        // flip on one of them. Applying them unswapped (as this did before)
-        // pushes the plane along the wrong axes.
+        // Centre the plane over the display: the lattice is origin-anchored
+        // (0..N), so its midpoint sits half a plane-width from the grid
+        // origin and the correction goes on the entity, not the bricks
+        // (moving them toward the origin would drive the low-x pixel gates
+        // negative). Accounts for `PLANE_SPIN`, a -90 degree yaw about world
+        // Z mapping grid-local (x, y) onto world (y, -x): the x-extent
+        // corrects world Y and the y-extent corrects world X.
         self.entity.location.x -= extent.y as f32;
         self.entity.location.y += extent.x as f32;
     }
@@ -264,34 +248,15 @@ pub fn pin_target(brick_id: usize, is_input: bool) -> WirePort {
 ///
 /// Recomputes and applies the entity's `PlaneExtent` (see
 /// [`Chip::recompute_plane_extent`]) from every brick's position -- deferred
-/// to here, rather than trusted from whatever `new_chip` was given, because
-/// no caller can know the true extent before every gate and pin exists.
+/// to here because no caller can know the true extent before every gate and
+/// pin exists. Do not translate inner bricks to the origin to tighten the
+/// plane: negative inner-grid coordinates delete bricks in game (verified);
+/// see `recompute_plane_extent`.
 ///
-/// A prior version of this function also translated every inner brick so its
-/// bounding box straddled the origin before recomputing the extent, on the
-/// theory that `layout::lattice_pos`'s positive-octant-only placement was
-/// wasting half of `PlaneExtent`'s span (since `PlaneCenter` is always
-/// `(0,0,0)`). That centering shipped, the plane got roughly 2x tighter as
-/// predicted, and several display gates (`MakeColorHex`, `Substring`, the
-/// array-index `ArrayVar_Get`) went missing in-game. A follow-up margin fix
-/// to `plane_extent_for` (see its doc comment) didn't bring them back, which
-/// rules out boundary clipping as the cause -- the remaining difference from
-/// the last known-working state is that centering put inner bricks at
-/// negative grid coordinates, which `layout::lattice_pos` never produces on
-/// its own. So the centering call was removed here and inner bricks are once
-/// again left exactly where `lattice_pos` puts them: non-negative, origin-anchored,
-/// with `PlaneExtent` consequently ~2x the content's half-span. That bloat is
-/// cosmetic and accepted for now. Do not reintroduce centering (or otherwise
-/// let inner bricks land at negative coordinates) without first verifying
-/// in-game that negative inner-grid coordinates are actually safe -- this is
-/// exactly the kind of thing that looks like free tightening and quietly
-/// breaks gates again.
-///
-/// Checks BOTH grids for overlap before publishing. The inner check alone is
-/// not enough: the first in-game failure was on the main grid, where the
-/// microchip shell was stacked inside a display brick's z span and the game
-/// silently dropped one of them. Doing this here rather than leaving it to
-/// callers means a renderer cannot forget it.
+/// Checks both grids for overlap before publishing: the inner check alone is
+/// not enough, since a shell brick stacked inside a display brick's z span
+/// is a main-grid collision the game silently drops one side of. Doing this
+/// here rather than leaving it to callers means a renderer cannot forget it.
 pub fn finish(world: &mut World, mut chip: Chip) -> Result<(), String> {
     chip.recompute_plane_extent();
     assert_no_overlap(&chip.placed)?;
@@ -303,34 +268,17 @@ pub fn finish(world: &mut World, mut chip: Chip) -> Result<(), String> {
 }
 
 /// The half-size `PlaneExtent` needs to contain every placed brick, with a
-/// full cell of clearance so no brick's outer face lands exactly on the
-/// plane boundary.
+/// full cell of clearance past the farthest outer face -- a brick whose face
+/// lands exactly on the plane boundary still gets clipped in-game (the save
+/// file itself is unaffected; this is purely how the game's
+/// `BrickGridMicrochipActor` bounds interaction with the plane).
 ///
 /// `PlaneExtent` is a half-size measured from `PlaneCenter`, which
-/// `World::add_microchip` always sets to `(0, 0, 0)` (in-game default is
-/// `(14, 14, 2)`). So, per axis, the extent must reach past the *outer face*
-/// of the farthest brick -- `|center| + half-size` -- not just its center.
-///
-/// An earlier draft of this function computed `max(|coord|) / 2 + 5`. That
-/// halving is wrong for this crate's lattice: `layout::lattice_pos` places
-/// every brick at a non-negative coordinate starting at `half` and growing
-/// outward from the origin, so the lattice is never centered around
-/// `PlaneCenter` -- the extent has to cover the full span, not half of it.
-/// Halving would under-size the plane for any chip with more than a couple
-/// of pins/gates, silently clipping bricks past `extent - half-size` at
-/// in-game placement (the save file is unaffected -- clipping is purely a
-/// property of how the game's `BrickGridMicrochipActor` bounds interaction
-/// with the plane -- but a clipped brick's wires still dangle).
-///
-/// A later regression made the outer-face reach *exactly* equal the
-/// published extent, with no margin at all: an edge gate's outer face sat
-/// precisely on the plane boundary, and the game clipped it in-game (the
-/// save file itself looked fine -- this is purely an in-game placement
-/// interaction, same as the halving bug above). So every axis gets a flat
-/// [`CELL`] (one gate cell, 10 units) of headroom added past the farthest
-/// outer face, giving an edge gate a full cell of clearance rather than
-/// landing on the line. The `.max(5)` floor is kept underneath that for a
-/// degenerate (empty) chip, though `CELL` alone already exceeds it.
+/// `World::add_microchip` always sets to `(0, 0, 0)`. So the extent must
+/// reach past the outer face of the farthest brick (`|center| + half-size`),
+/// not just its center: halving the span under-sizes the plane for any chip
+/// with more than a couple of pins/gates, clipping bricks and dangling their
+/// wires. The `.max(5)` floor guards a degenerate (empty) chip.
 pub fn plane_extent_for(placed: &[(Position, IntVector)]) -> IntVector {
     plane_bounds_for(placed).1
 }
@@ -338,26 +286,18 @@ pub fn plane_extent_for(placed: &[(Position, IntVector)]) -> IntVector {
 /// The `(PlaneCenter, PlaneExtent)` pair that tightly wraps `placed`.
 ///
 /// `PlaneExtent` is a half-size measured from `PlaneCenter`, so a plane that
-/// contains content is `center ± extent`. The gate lattice
-/// ([`super::layout::lattice_pos`]) is **origin-anchored**: every coordinate
-/// is non-negative, running `0..N`. Pinning `PlaneCenter` to `(0,0,0)` and
-/// solving for an extent that reaches `N` therefore describes a plane
-/// spanning `-N..N` -- twice as large as the content on every axis, with the
-/// content crammed into a single quadrant. That is exactly what a user
-/// reported seeing in-game.
+/// contains content is `center +/- extent`. The gate lattice
+/// ([`super::layout::lattice_pos`]) is origin-anchored: every coordinate is
+/// non-negative, running `0..N`. Pinning `PlaneCenter` to `(0,0,0)` and
+/// solving for an extent that reaches `N` would describe a plane spanning
+/// `-N..N`, twice the content's size on every axis, with the content crammed
+/// into a single quadrant. This instead moves the plane onto the content via
+/// `PlaneCenter`, leaving the bricks where `lattice_pos` puts them (see
+/// `recompute_plane_extent` for why they aren't translated).
 ///
-/// Centering the *bricks* on the origin was tried first and reverted: it made
-/// every inner coordinate negative and coincided with gates disappearing
-/// in-game (see [`finish`]). This function fixes the same problem without
-/// moving a single brick -- it leaves the verified-working origin-anchored
-/// placement alone and instead moves the *plane* onto the content, which is
-/// what `PlaneCenter` is for.
-///
-/// The plane is measured in the inner grid's own unshifted coordinates, i.e.
-/// the same space `placed` is recorded in -- NOT the `-CHUNK_HALF`-shifted
-/// space bricks are stored in by `World::add_brick_grid`. The working spike
-/// establishes this: its content sat at `0..60` with `PlaneCenter (0,0,0)`
-/// and an extent of 60, which contains the content only in unshifted space.
+/// Measured in the inner grid's own unshifted coordinates, i.e. the same
+/// space `placed` is recorded in -- not the `-CHUNK_HALF`-shifted space
+/// bricks are stored in by `World::add_brick_grid`.
 pub fn plane_bounds_for(placed: &[(Position, IntVector)]) -> (IntVector, IntVector) {
     let axis = |pf: fn(&Position) -> i32, hf: fn(&IntVector) -> i32| -> (i32, i32) {
         let lo = placed.iter().map(|(p, h)| pf(p) - hf(h)).min().unwrap_or(0);
@@ -373,15 +313,10 @@ pub fn plane_bounds_for(placed: &[(Position, IntVector)]) -> (IntVector, IntVect
     };
     let (cx, ex) = axis(|p| p.x, |h| h.x);
     let (cy, ey) = axis(|p| p.y, |h| h.y);
-    // z is PINNED, not derived from the content.
-    //
-    // Local Z is up inside the chip, and the plane is a flat surface the
-    // gates sit ON -- not a volume they live inside. Deriving z from the
-    // content did both of the wrong things at once: `extent.z` grew to
-    // swallow every gate (so they rendered buried inside the chip), and
-    // `center.z` tracked them, so raising the whole lattice raised the plane
-    // with it and moved nothing on screen. Pinning z means
-    // `layout::STAGE_BASE_Z` actually lifts the gates clear of the surface.
+    // z is pinned, not derived from content: local Z is up inside the chip
+    // and the plane is a flat surface gates sit on, not a volume they live
+    // inside. Pinning it lets `layout::STAGE_BASE_Z` lift gates clear of the
+    // surface instead of both extent and center tracking them.
     (
         IntVector { x: cx, y: cy, z: 0 },
         IntVector { x: ex, y: ey, z: PLANE_HALF_THICKNESS },
@@ -435,9 +370,8 @@ mod tests {
             (20, 25 + CELL),
             "x driven by its own axis alone"
         );
-        // z is pinned, NOT derived: the plane is a flat surface at z=0 that
-        // the gates sit on top of, so it deliberately does not stretch to
-        // contain them.
+        // z is pinned, not derived: the plane is a flat surface at z=0 that
+        // the gates sit on top of, so it does not stretch to contain them.
         assert_eq!(
             (center.z, extent.z),
             (0, PLANE_HALF_THICKNESS),
@@ -488,22 +422,9 @@ mod tests {
         );
     }
 
-    // A prior version of this module also centered every inner brick's
-    // bounding box on the origin before recomputing `PlaneExtent` (tightening
-    // it roughly 2x, since `layout::lattice_pos` otherwise leaves the whole
-    // lattice in the positive octant and `PlaneCenter` is always `(0,0,0)`).
-    // That was reverted -- see `finish`'s doc comment for the full story --
-    // because it put inner bricks at negative grid coordinates and display
-    // gates went missing in-game. The tests that exercised `center_on_origin`
-    // and `Chip::translate` were removed along with the methods themselves;
-    // `plane_extent_for` is still exercised directly above against
-    // non-negative, origin-anchored coordinates, which is what `finish` now
-    // always publishes against.
-
     // The full guarantee -- that `finish` actually publishes an extent that
-    // contains every brick for a real render, not just that `plane_extent_for`'s
-    // math is right in isolation -- needs to be checked against the entity
-    // `finish` actually writes. That requires decoding a real save (the
+    // contains every brick in a real render, not just that `plane_extent_for`'s
+    // math is right in isolation -- requires decoding a real save (the
     // entity's `PlaneExtent` lives behind an opaque `Arc<Box<dyn
     // BrdbComponent>>` this module has no reason to downcast), so it lives in
     // `tests/anim_world.rs` as `chip_plane_extent_contains_every_brick_in_a_real_render`,

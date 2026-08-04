@@ -4,37 +4,24 @@
 //!
 //! [`Auto`]: AudioBackend::Auto
 //!
-//! Deliberately smaller than [`crate::video::backend`]'s counterpart: there
-//! is no guard here comparable to the video side's CAVLC/BT.2020 checks --
-//! `symphonia` either decodes a file correctly or errors, it does not
-//! silently produce wrong SAMPLES the way `rust_h264` silently produces
-//! wrong PIXELS. So `Auto` here is a plain try-then-fallback, not a
+//! Smaller than [`crate::video::backend`]'s counterpart: `symphonia` either
+//! decodes a file correctly or errors, it never silently produces wrong
+//! samples, so `Auto` here is a plain try-then-fallback rather than a
 //! route-around-a-known-bad-path.
 //!
-//! **On wasm there is no ffmpeg backend at all** (`audio::ffmpeg_src` is
-//! `#[cfg(not(target_arch = "wasm32"))]`, mirroring `video::ffmpeg`'s own
-//! gate). [`AudioBackend::Ffmpeg`] there fails with a clear message rather
-//! than failing to compile.
+//! On wasm there is no ffmpeg backend at all (`audio::ffmpeg_src` is
+//! `#[cfg(not(target_arch = "wasm32"))]`); [`AudioBackend::Ffmpeg`] there
+//! fails with a clear message rather than failing to compile.
 //!
-//! **`DownloadConsent` cannot simply be imported from
-//! [`crate::video::ffmpeg`] here**, even though that is conceptually the
-//! right type to reuse: that whole module is `#[cfg(not(target_arch =
-//! "wasm32"))]` (it spawns a subprocess), so it does not exist to import
-//! from when this crate is built for wasm -- and [`open_audio`] must
-//! compile there regardless. On native, [`DownloadConsent`] here IS
-//! literally `video::ffmpeg`'s type (a `pub use`), so a caller wiring one
-//! CLI flag to both `video::open_video_ensuring` and this module's
-//! [`open_audio`] passes the same value to both with no conversion. On
-//! wasm it is a local mirror with identical variants, existing only so this
-//! module's signature does not change per target -- nothing on wasm ever
-//! has a real ffmpeg decision to make with it, since there is no ffmpeg
-//! backend there to ask.
+//! [`DownloadConsent`] is `video::ffmpeg`'s type on native (a `pub use`, so
+//! one CLI flag drives both `video::open_video_ensuring` and this module's
+//! [`open_audio`] with no conversion) and a local mirror on wasm, where that
+//! module does not exist to import from.
 //!
 //! [`ensure_ffmpeg`] is injected into the private [`open_audio_with`]
-//! rather than called directly, for the same reason
-//! `video::backend::open_video_ensuring` injects it: so a test can simulate
-//! "ffmpeg is unavailable and consent was denied" deterministically,
-//! without mutating the process-wide `PATH` a parallel test suite shares.
+//! rather than called directly, so a test can simulate "ffmpeg unavailable,
+//! consent denied" deterministically without mutating the process-wide
+//! `PATH`.
 
 use crate::audio::source::AudioSource;
 use crate::audio::symphonia_src::SymphoniaSource;
@@ -62,7 +49,7 @@ pub enum DownloadConsent {
 pub enum AudioBackend {
     /// Try the builtin (`symphonia`) path first; fall back to ffmpeg only if
     /// it is already available or consent permits fetching it. If ffmpeg is
-    /// unavailable, the ORIGINAL symphonia error is what the user sees --
+    /// unavailable, the original symphonia error is what the user sees --
     /// their file is the actual problem, not ffmpeg.
     #[default]
     Auto,
@@ -108,17 +95,18 @@ pub fn open_audio(
 
 /// [`open_audio`], selecting which audio stream to decode.
 ///
-/// `track` is an index among the container's AUDIO streams, so 0 is the first
-/// audio track regardless of how many video or subtitle streams precede it.
-/// Dual-audio releases commonly carry the original language first and the dub
-/// second, so which one is "first" is a container-ordering accident.
+/// `track` is an index among the container's audio streams, so 0 is the
+/// first audio track regardless of how many video or subtitle streams
+/// precede it. Dual-audio releases commonly carry the original language
+/// first and the dub second, so which one is "first" is a
+/// container-ordering accident.
 ///
 /// Honoured by the ffmpeg backend (`-map 0:a:<track>`). The builtin
-/// (symphonia) backend currently always decodes the container's default
-/// track, so a non-zero `track` is reported rather than silently ignored --
-/// under EVERY backend, including [`AudioBackend::Auto`], where it takes
-/// symphonia out of the running entirely rather than letting the fallback
-/// quietly hand back the wrong stream.
+/// (symphonia) backend always decodes the container's default track, so a
+/// non-zero `track` is reported rather than silently ignored -- under every
+/// backend, including [`AudioBackend::Auto`], where it takes symphonia out
+/// of the running entirely rather than letting the fallback quietly hand
+/// back the wrong stream.
 pub fn open_audio_track(
     path: &Path,
     backend: AudioBackend,
@@ -132,16 +120,14 @@ pub fn open_audio_track(
 /// [`open_audio_track`], with [`ensure_ffmpeg`]'s role played by a caller's
 /// closure.
 ///
-/// The public form of the injection this module already uses internally, and
-/// the audio counterpart of [`crate::video::backend::open_video_ensuring`].
-/// It exists for one caller shape: a GUI, which cannot answer
+/// The public form of the injection this module already uses internally,
+/// and the audio counterpart of [`crate::video::backend::open_video_ensuring`].
+/// Exists for one caller shape: a GUI, which cannot answer
 /// [`DownloadConsent::Ask`] because that prompt reads stdin and a window has
-/// no terminal. Passing a closure that RECORDS the request and refuses lets
-/// the UI thread discover that a download is needed, ask in a modal, and try
-/// again -- without this, a GUI's only options are to download silently or to
-/// never download at all.
+/// no terminal. A closure that records the request and refuses lets the UI
+/// thread discover a download is needed, ask in a modal, and try again.
 ///
-/// The resolution order, the fallbacks and the error precedence are
+/// The resolution order, fallbacks and error precedence are
 /// [`open_audio_track`]'s exactly; only who answers the ffmpeg question
 /// changes.
 ///
@@ -195,18 +181,10 @@ fn open_audio_with_track(
             ensure_ffmpeg(consent)?;
             open_ffmpeg_source_track(path, track)
         }
-        // A non-zero `--audio-track` names something ONLY ffmpeg can do, so
-        // symphonia is not a candidate on this path at all: not as the first
-        // try, and not as the fallback either. Both of those used to reach
-        // `SymphoniaSource::open_path`, which takes no track parameter and
-        // decodes the container's default stream -- so `--audio-track 1` on a
-        // dual-audio release rendered the FIRST language, successfully, with
-        // no warning anywhere. The user got the wrong dub and a build that
-        // looked perfect.
-        //
-        // Honoured where it can be, refused by name where it cannot. Refusing
-        // is the same policy `Builtin` above already has, and it is what
-        // `open_audio_track`'s doc has always claimed for every backend.
+        // A non-zero `--audio-track` names something only ffmpeg can do, so
+        // symphonia is never a candidate on this path -- not as the first
+        // try, not as the fallback. Honoured where it can be, refused by
+        // name where it cannot, the same policy `Builtin` above has.
         AudioBackend::Auto if track != 0 => {
             ensure_ffmpeg(consent).map_err(|e| {
                 format!(
@@ -217,31 +195,25 @@ fn open_audio_with_track(
             })?;
             open_ffmpeg_source_track(path, track)
         }
-        // BUILTIN FIRST, and ffmpeg only when symphonia has actually failed.
+        // Builtin first, ffmpeg only when symphonia has actually failed.
         //
-        // Deliberately NOT `video::backend`'s "prefer ffmpeg when present"
-        // policy, and this module's own doc says why: that one routes around a
-        // decoder known to produce silently WRONG pixels, where symphonia
-        // either decodes correctly or errors. There is no wrong-output class to
-        // route around here, so preferring ffmpeg would buy nothing and cost
-        // three things -- a subprocess per open on the common path, the
-        // documented error precedence below (it inverts: the user's undecodable
-        // file starts reporting "ffprobe failed" instead of what symphonia
-        // said), and a suite whose result depends on whether the developer has
-        // ffmpeg on PATH. It was tried; all three happened.
+        // Deliberately not `video::backend`'s "prefer ffmpeg when present"
+        // policy: that one routes around a decoder known to produce silently
+        // wrong pixels, where symphonia either decodes correctly or errors.
+        // Preferring ffmpeg here would buy nothing and cost a subprocess per
+        // open, an inverted error precedence (an undecodable file reporting
+        // "ffprobe failed" instead of what symphonia said), and a suite
+        // whose result depends on whether the developer has ffmpeg on PATH.
         //
-        // The codec coverage that motivated it is not lost: an Ogg/Opus file
-        // still opens under `Auto`, via the fallback immediately below -- see
-        // `auto_really_falls_back_to_ffmpeg_when_symphonia_cannot_decode_the_format`.
+        // An Ogg/Opus file still opens under `Auto`, via the fallback
+        // immediately below.
         AudioBackend::Auto => match SymphoniaSource::open_path(path) {
             Ok(source) => Ok(Box::new(source)),
             Err(symphonia_err) => {
-                // `ensure_ffmpeg`'s real implementation already encodes
-                // "already available OR consent permits fetching it" --
-                // see `video::ffmpeg::ensure_ffmpeg`'s own doc. Its `Err`
-                // here means neither held, so ffmpeg was never a genuine
-                // option and the user's real problem is the one symphonia
-                // already named.
+                // `ensure_ffmpeg` already encodes "available, or consent
+                // permits fetching it." Its `Err` here means neither held,
+                // so ffmpeg was never a genuine option and the user's real
+                // problem is the one symphonia already named.
                 if ensure_ffmpeg(consent).is_err() {
                     return Err(symphonia_err);
                 }
@@ -280,12 +252,6 @@ fn open_ffmpeg_source_track(path: &Path, _track: usize) -> Result<Box<dyn AudioS
     open_ffmpeg_source(path)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn open_ffmpeg_source(path: &Path) -> Result<Box<dyn AudioSource>, String> {
-    let source = crate::audio::ffmpeg_src::FfmpegAudioSource::open_path(path)?;
-    Ok(Box::new(source))
-}
-
 /// On wasm there is no `audio::ffmpeg_src` module at all (it is
 /// `#[cfg(not(target_arch = "wasm32"))]`, since it spawns a subprocess) --
 /// so this errors with a clear message rather than failing to compile.
@@ -302,19 +268,9 @@ fn open_ffmpeg_source(path: &Path) -> Result<Box<dyn AudioSource>, String> {
 mod tests {
     use super::*;
 
-    /// **This test used to assert nothing.** Its whole body was
-    /// `assert_eq!(AudioBackend::default(), AudioBackend::Auto)` -- true, and
-    /// silent about the preference its name claims. Meanwhile the code had
-    /// grown an "ffmpeg first when it is on PATH" arm, so on a developer
-    /// machine with ffmpeg installed the thing this is named for was not
-    /// happening at all and nothing said so.
-    ///
-    /// The real assertion is that a decodable file opens under `Auto` with an
-    /// `ensure_ffmpeg` that PANICS if it is called: `ensure_ffmpeg` is the only
-    /// route from `Auto` to ffmpeg, so a shut door there is the preference.
-    /// [`auto_reports_symphonias_error_when_ffmpeg_is_unavailable_and_consent_refuses`]
-    /// is the other half of the pin -- it fails if an ffmpeg-first arm comes
-    /// back, because the error precedence inverts with it.
+    /// A decodable file must open under `Auto` with an `ensure_ffmpeg` that
+    /// panics if called: `ensure_ffmpeg` is the only route from `Auto` to
+    /// ffmpeg, so a shut door there is the preference proven.
     #[test]
     fn auto_prefers_the_builtin_backend_for_a_decodable_file() {
         assert_eq!(AudioBackend::default(), AudioBackend::Auto, "Auto is what a user gets");
@@ -346,13 +302,9 @@ mod tests {
         assert!("nonsense".parse::<AudioBackend>().is_err());
     }
 
-    // --- Tests added beyond the brief's three. A mutation campaign (see
-    // --- this task's report) proved several real properties of `Auto`'s
-    // --- fallback policy were completely unprotected by the brief's tests,
-    // --- which never exercise the fallback branch at all (their one
-    // --- decodable file never fails symphonia, and their one failing file
-    // --- is a plain missing path, which errors identically under every
-    // --- backend before the fallback logic is ever reached).
+    // --- The tests below exercise `Auto`'s fallback branch specifically --
+    // --- a garbage (undecodable) file rather than a merely missing path, so
+    // --- the fallback logic is actually reached.
 
     fn garbage_file(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("h2b_audio_backend_{name}_{}.wav", std::process::id()));
@@ -384,18 +336,17 @@ mod tests {
         path
     }
 
-    /// **THE regression test for this fallback policy.** With ffmpeg
-    /// simulated unavailable and consent refused, `Auto` on a file
-    /// symphonia cannot decode must surface symphonia's OWN error, never an
-    /// ffmpeg-shaped complaint -- the user's real problem is the file.
+    /// With ffmpeg simulated unavailable and consent refused, `Auto` on a
+    /// file symphonia cannot decode must surface symphonia's own error,
+    /// never an ffmpeg-shaped complaint -- the user's real problem is the
+    /// file.
     #[test]
     fn auto_reports_symphonias_error_when_ffmpeg_is_unavailable_and_consent_refuses() {
-        // Deliberately NOT named e.g. "no_ffmpeg" -- symphonia's own error
+        // Deliberately not named e.g. "no_ffmpeg" -- symphonia's own error
         // message embeds the file's path, and a fixture name containing the
         // substring "ffmpeg" would make the assertion below pass for the
         // wrong reason (a path collision, not an actually ffmpeg-free
-        // error). Caught by running this test: it failed against exactly
-        // that fixture name before this fix.
+        // error).
         let path = garbage_file("unavailable");
         // Not `.expect_err(...)`: that requires the `Ok` side (`Box<dyn
         // AudioSource>`) to be `Debug`, which it is not (the trait has no
@@ -412,11 +363,9 @@ mod tests {
             "the fallback's ffmpeg-shaped error must not replace symphonia's own: {err}"
         );
         // ...and it is not merely ffmpeg-free, it is symphonia's own message,
-        // verbatim. The substring check above is not enough on its own: while
-        // `Auto` had an ffmpeg-FIRST arm this test passed on a machine with
-        // ffmpeg installed for entirely the wrong reason, returning
-        // `probe_audio`'s "ffprobe failed for {path}: ..." -- which is an
-        // ffmpeg complaint that happens not to contain the letters "ffmpeg".
+        // verbatim -- the substring check above alone cannot tell that from
+        // an unrelated ffmpeg-shaped error that happens not to contain the
+        // letters "ffmpeg".
         let symphonias_own = match SymphoniaSource::open_path(&path) {
             Err(e) => e,
             Ok(_) => panic!("the fixture must be undecodable for this test to mean anything"),
@@ -431,13 +380,6 @@ mod tests {
 
     /// `Auto` must consult `ensure_ffmpeg` exactly once, and only after
     /// symphonia has already failed -- never speculatively, and never twice.
-    ///
-    /// **This is the test that was red on every machine with ffmpeg on PATH**,
-    /// and it was not flaky: `Auto` had an arm that took ffmpeg FIRST whenever
-    /// `ffmpeg_present()`, which reaches ffmpeg without going through
-    /// `ensure_ffmpeg` at all, so the count came back 0. A suite whose result
-    /// depends on the developer's PATH is worth as much as no suite, and the
-    /// arm is gone -- see `open_audio_with_track`.
     #[test]
     fn auto_consults_ffmpeg_only_once_after_symphonia_fails() {
         let path = garbage_file("consult_once");
@@ -453,8 +395,7 @@ mod tests {
 
     /// The complementary case: when symphonia already succeeds, `Auto` must
     /// never so much as ask about ffmpeg. The closure panics if called, so
-    /// a regression here is unmissable -- mirrors
-    /// `video::backend::tests::auto_decodes_a_cabac_file_without_ever_consulting_ffmpeg`.
+    /// a regression here is unmissable.
     #[test]
     fn auto_never_consults_ffmpeg_when_symphonia_already_succeeds() {
         let path = decodable_wav("ok");
@@ -470,18 +411,12 @@ mod tests {
 
     // -- `--audio-track` under every backend --------------------------------
 
-    /// **M2.** `--audio-track N` must never be silently dropped.
+    /// `--audio-track N` must never be silently dropped, on the default
+    /// backend with no ffmpeg available.
     ///
-    /// The refusal used to name `Builtin` alone, and both of `Auto`'s paths
-    /// reached `SymphoniaSource::open_path`, which takes no track parameter
-    /// and decodes the container's default stream. So on the default backend
-    /// with no ffmpeg available, `--audio-track 1` on a dual-audio release --
-    /// the exact case the flag was added for -- rendered the FIRST language,
-    /// returned `Ok`, and said nothing. The user got the wrong dub and a build
-    /// that looked perfect.
-    ///
-    /// A DECODABLE fixture on purpose: with a garbage one every backend errors
-    /// for its own reasons and the silent-success path is never taken.
+    /// A decodable fixture on purpose: with a garbage one every backend
+    /// errors for its own reasons and the silent-success path is never
+    /// taken.
     #[test]
     fn a_non_zero_track_is_never_silently_dropped_under_auto() {
         let path = decodable_wav("auto_track");
@@ -505,7 +440,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The same flag under `Auto` when ffmpeg IS available: honoured, not
+    /// The same flag under `Auto` when ffmpeg is available: honoured, not
     /// refused. Refusing whenever the builtin decoder cannot do the job would
     /// be no better than ignoring it -- the point is that the flag works
     /// wherever it can and says so where it cannot.
@@ -550,7 +485,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `Builtin` must NEVER consult ffmpeg, on any file -- including one it
+    /// `Builtin` must never consult ffmpeg, on any file -- including one it
     /// refuses. The closure panics if called, so a silent fallback is
     /// unmissable.
     #[test]
@@ -583,17 +518,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // --- End-to-end tests exercising the REAL ffmpeg fallback, not a
-    // --- simulated one. Ogg/Opus is chosen deliberately: this crate's
-    // --- `symphonia` feature list (mp3, aac, isomp4, mkv, flac, vorbis,
-    // --- wav, pcm -- see Cargo.toml) has neither the `ogg` container nor
-    // --- an `opus` decoder, so `SymphoniaSource::open_path` genuinely
-    // --- cannot open one -- while a real installed ffmpeg (built with
-    // --- `--enable-libopus`) decodes it without trouble. This is the one
-    // --- real file format gap between the two backends available on this
-    // --- project's dependency list, which is exactly what `Auto`'s
-    // --- fallback and `Builtin`'s refusal need a genuine (not simulated)
-    // --- case to prove against.
+    // --- End-to-end tests exercising the real ffmpeg fallback, not a
+    // --- simulated one. Ogg/Opus is chosen because this crate's `symphonia`
+    // --- feature list (mp3, aac, isomp4, mkv, flac, vorbis, wav, pcm -- see
+    // --- Cargo.toml) has neither the `ogg` container nor an `opus` decoder,
+    // --- while a real installed ffmpeg decodes it without trouble -- the
+    // --- one real file format gap between the two backends.
 
     fn ffmpeg_available() -> bool {
         crate::video::ffmpeg::ffmpeg_available()
@@ -644,10 +574,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **The mutation this pins directly:** if `Builtin` were changed to
-    /// silently fall back to ffmpeg (one of this task's required
-    /// mutations), THIS test would start passing when it must fail --
-    /// asking for `Builtin` by name on a format only ffmpeg can decode must
+    /// Asking for `Builtin` by name on a format only ffmpeg can decode must
     /// error, never quietly succeed via the other backend.
     #[test]
     fn builtin_refuses_the_opus_fixture_rather_than_silently_using_ffmpeg() {

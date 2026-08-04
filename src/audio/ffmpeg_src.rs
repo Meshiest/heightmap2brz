@@ -12,7 +12,7 @@
 //! ffmpeg_src;` declaration in `mod.rs`, mirroring `video::ffmpeg`'s own
 //! gate.
 
-use crate::audio::source::{AudioInfo, AudioSource, AudioStream};
+use crate::audio::source::{AudioInfo, AudioSource, AudioStream, first_non_finite};
 use crate::audio::symphonia_src::TARGET_RATE;
 use ffmpeg_sidecar::command::FfmpegCommand;
 use std::io::Read;
@@ -67,16 +67,12 @@ impl FfmpegAudioSource {
         self.track = track;
         self
     }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl AudioSource for FfmpegAudioSource {
     fn info(&self) -> AudioInfo {
         AudioInfo {
-            // Always the ADAPTED rate, never whatever the source natively
+            // Always the adapted rate, never whatever the source natively
             // was -- ffmpeg is asked for exactly this via `-ar` below, the
             // same contract `SymphoniaSource` upholds via its own resampler.
             sample_rate: TARGET_RATE,
@@ -194,16 +190,12 @@ impl Drop for FfmpegAudioStream {
     /// Best-effort cleanup for a stream dropped before it drained -- e.g. a
     /// caller that errors out elsewhere mid-render.
     ///
-    /// `kill()` alone only SIGNALS the child -- `ffmpeg-sidecar`'s `kill`
-    /// forwards straight to `std::process::Child::kill`, which does not
-    /// reap. Without the `wait()` below the process is never collected: a
-    /// zombie on Unix, and on Windows a race against the input file's handle
-    /// being released, since nothing confirms the process actually exited.
-    /// `wait()` cannot deadlock here: stderr is drained by its own thread
-    /// from `open`, so there is no full pipe for the child to block on. The
-    /// result is ignored because the process is being torn down and a
-    /// failure to reap is not actionable. Identical reasoning to
-    /// `video::ffmpeg::FfmpegFrameStream`'s `Drop`.
+    /// `kill()` alone only signals the child; without also calling `wait()`
+    /// it is never reaped -- a zombie process that still holds the input
+    /// file's handle open. `wait()` cannot deadlock here: stderr is drained
+    /// by its own thread from `open`, so there is no full pipe for the child
+    /// to block on. The result is ignored because the process is being torn
+    /// down and a failure to reap is not actionable.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -212,9 +204,7 @@ impl Drop for FfmpegAudioStream {
 
 /// The byte-level reading and sample-validation logic, generic over the
 /// underlying reader so it can be unit tested against an in-memory buffer
-/// without ever spawning `ffmpeg` -- the same reasoning
-/// `video::ffmpeg::resolve_consent` gives for being split out of
-/// `ensure_ffmpeg` as its own pure-ish function.
+/// without ever spawning `ffmpeg`.
 struct SampleReader<R> {
     reader: R,
     /// Samples handed out so far, so a rejected sample can be named by its
@@ -235,10 +225,9 @@ impl<R: Read> SampleReader<R> {
     /// remainder before the pipe closed) -- `read_fully` alone cannot make
     /// this distinction, and collapsing them would silently drop a partial
     /// trailing `f32` instead of erroring on it. Also rejects any non-finite
-    /// sample, naming its global index -- the same rule
-    /// `symphonia_src::SymphoniaStream` enforces, and for the same reason:
-    /// `f32::NAN.min(1.0)` is `1.0`, so a single NaN launders into a whole
-    /// bank of speakers at maximum volume with nothing having errored.
+    /// sample, naming its global index: `f32::NAN.min(1.0)` is `1.0`, so an
+    /// unrejected NaN launders into a whole bank of speakers at maximum
+    /// volume.
     fn next_block(&mut self) -> Result<Option<Vec<f32>>, String> {
         if self.done {
             return Ok(None);
@@ -302,18 +291,6 @@ fn bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The global index and value of the first non-finite sample in `block`,
-/// where `base` is `block[0]`'s index in the whole decoded stream. Split out
-/// as a free function, same as `symphonia_src::first_non_finite`, so the
-/// rejection rule can be tested directly against a NaN ffmpeg would only
-/// ever produce on a corrupt file.
-fn first_non_finite(block: &[f32], base: u64) -> Option<(u64, f32)> {
-    block
-        .iter()
-        .position(|s| !s.is_finite())
-        .map(|i| (base + i as u64, block[i]))
-}
-
 /// Metadata read from `ffprobe`, before this source is ever opened.
 struct ProbedAudio {
     duration: Option<f64>,
@@ -323,16 +300,14 @@ struct ProbedAudio {
 /// without decoding, its duration.
 ///
 /// A missing file or a file `ffprobe` cannot parse at all surfaces as the
-/// command's own non-zero exit here -- the same way
-/// `video::ffmpeg::probe_metadata` reports it -- so `FfmpegAudioSource::
-/// open_path` never has to spawn a real decode just to discover the file
-/// does not exist.
+/// command's own non-zero exit here, so `FfmpegAudioSource::open_path` never
+/// has to spawn a real decode just to discover the file does not exist.
 fn probe_audio(path: &Path) -> Result<ProbedAudio, String> {
     let ffprobe_bin = ffmpeg_sidecar::ffprobe::ffprobe_path();
     let mut cmd = std::process::Command::new(&ffprobe_bin);
-    // No console window: see `crate::video::ffmpeg::hide_console`. This probe
-    // is the one the GUI runs the moment a file is picked, so it is the spawn
-    // a user is most likely to SEE flash.
+    // No console window: see `crate::video::ffmpeg::hide_console`. This is
+    // the probe the GUI runs the moment a file is picked, so it is the spawn
+    // a user is most likely to see flash.
     crate::video::ffmpeg::hide_console(&mut cmd);
     let output = cmd
         .args([
@@ -366,7 +341,7 @@ fn probe_audio(path: &Path) -> Result<ProbedAudio, String> {
         let value = value.trim();
         match key {
             // `-select_streams a:0` means this only ever appears for an
-            // actual audio stream at index 0 -- its mere presence IS the
+            // actual audio stream at index 0 -- its mere presence is the
             // check, not just its value.
             "codec_type" => has_audio = true,
             "duration" => duration = value.parse::<f64>().ok(),
@@ -428,10 +403,9 @@ mod tests {
         );
     }
 
-    /// **The partial-trailing-f32 regression test.** A reader that ends with
-    /// 1-3 leftover bytes after some whole samples must be a hard error
-    /// naming the sample index it was truncated at -- not a silently
-    /// shortened block.
+    /// A reader that ends with 1-3 leftover bytes after some whole samples
+    /// must be a hard error naming the sample index it was truncated at --
+    /// not a silently shortened block.
     #[test]
     fn a_partial_trailing_sample_is_rejected_naming_its_index() {
         let samples = vec![0.25f32; 10];
@@ -452,7 +426,7 @@ mod tests {
 
     /// The complementary case: a byte count that is an exact multiple of 4,
     /// but shorter than a full block (a legitimate final partial block),
-    /// must NOT be treated as truncation.
+    /// must not be treated as truncation.
     #[test]
     fn a_short_but_whole_final_block_is_not_an_error() {
         let samples = vec![0.1f32, 0.2, 0.3];
@@ -463,10 +437,8 @@ mod tests {
         assert!(reader.next_block().expect("clean end").is_none());
     }
 
-    /// A NaN (or infinity) must die at the reader, naming the sample index,
-    /// the same contract `symphonia_src`'s decoder enforces -- see that
-    /// module's doc for why: `f32::NAN.min(1.0)` is `1.0`, so an unrejected
-    /// NaN launders into a whole speaker bank at maximum volume.
+    /// A NaN (or infinity) must die at the reader, naming the sample index --
+    /// the same contract `symphonia_src`'s decoder enforces.
     #[test]
     fn a_non_finite_sample_is_rejected_naming_its_index() {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
@@ -497,7 +469,7 @@ mod tests {
 
     /// Generates a mono sine-tone WAV with `ffmpeg` itself, at an arbitrary
     /// sample rate, so this module's own resample-to-48k behaviour can be
-    /// exercised against a source that is NOT already 48 kHz.
+    /// exercised against a source that is not already 48 kHz.
     fn sample_tone(name: &str, secs: f32, freq: u32, sr: u32) -> Option<PathBuf> {
         if !ffmpeg_available() {
             eprintln!("SKIPPING {name}: ffmpeg not on PATH");
@@ -537,9 +509,9 @@ mod tests {
         ok.then_some(path)
     }
 
-    /// A clip with BOTH a video and an audio track -- exercises `-map
+    /// A clip with both a video and an audio track -- exercises `-map
     /// 0:a:0` + `-vn` actually pulling just the audio out of a multiplexed
-    /// container, the mirror of `video::ffmpeg`'s own `-map 0:v:0` + `-an`.
+    /// container.
     fn sample_av(name: &str, secs: f32, freq: u32, sr: u32) -> Option<PathBuf> {
         if !ffmpeg_available() {
             eprintln!("SKIPPING {name}: ffmpeg not on PATH");
@@ -642,14 +614,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **The `Drop` regression test.** Dropping a stream before it has
-    /// drained must both `kill` AND reap (`wait`) the child. `kill()` alone
-    /// only signals; on Windows the input file's handle is not guaranteed
-    /// released until the process is actually reaped, so a `kill`-only
-    /// `Drop` can race an immediate delete of the source file. A 3s clip
-    /// (long enough that the process is still very much alive when dropped)
-    /// makes that race exercised rather than won by a process that happened
-    /// to exit before the check ran anyway.
+    /// Dropping a stream before it has drained must both `kill` and reap
+    /// (`wait`) the child, or the input file's handle is not guaranteed
+    /// released. A 3s clip (long enough that the process is still very much
+    /// alive when dropped) makes that race exercised rather than won by a
+    /// process that happened to exit before the check ran anyway.
     #[test]
     fn dropping_before_drain_releases_the_input_file() {
         let Some(path) = sample_tone("droprelease", 3.0, 220, 48_000) else { return };
@@ -664,12 +633,11 @@ mod tests {
     }
 
     /// The same NaN-rejection contract as `symphonia_src`'s decoder, proven
-    /// through a REAL ffmpeg process this time (the unit tests above prove
-    /// the logic; this proves the wiring). ffmpeg's own `-af volume` filter
-    /// can be pushed to produce a `-inf` sample is unreliable across
+    /// through a real ffmpeg process this time (the unit tests above prove
+    /// the logic; this proves the wiring). Whether ffmpeg's own `-af volume`
+    /// filter can be pushed to produce a `-inf` sample is unreliable across
     /// builds, so this instead confirms the wiring the cheap way: a real
-    /// decode of ordinary audio produces no non-finite rejection at all,
-    /// i.e. the check does not false-positive on real ffmpeg output.
+    /// decode of ordinary audio must produce no non-finite rejection at all.
     #[test]
     fn real_ffmpeg_output_never_false_positives_the_non_finite_check() {
         let Some(path) = sample_tone("nofalsepositive", 0.3, 300, 48_000) else { return };

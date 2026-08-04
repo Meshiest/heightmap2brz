@@ -542,12 +542,9 @@ fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
 /// A minimal big-endian, MSB-first bitstream reader for H.264's Exp-Golomb
 /// and fixed-width fields.
 ///
-/// `pub(crate)` rather than private because [`crate::video::builtin`] walks
-/// an SPS RBSP with it to read the VUI colour-description fields (which
-/// decide the YUV→RGB matrix). That is a longer walk than the two `ue(v)`s
-/// this file needs, hence [`BitReader::read_bits`] and [`BitReader::read_se`]
-/// below, which nothing in this file calls -- they exist so there is ONE
-/// bitstream reader in the crate rather than a second copy over there.
+/// `pub(crate)`: [`crate::video::builtin`]'s SPS walk uses
+/// [`BitReader::read_bits`] and [`BitReader::read_se`] too, so nothing in
+/// this file calling them is not dead code.
 pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
