@@ -19,8 +19,8 @@ use crate::{
         SharedOptions,
         util::{
             self, PickedImage, RenderMsg, bound_pane_width, deliver_world_unless_cancelled,
-            draw_out_file_warnings, draw_progress_bar, note, pick_animated_bytes, pick_images,
-            pick_subtitle_bytes, refuse_bad_out_file, section, settings_grid, thumb,
+            draw_progress_bar, note, out_file_warning_row, pick_animated_bytes, pick_images,
+            pick_subtitle_bytes, refuse_bad_out_file, save_destination_row, section, thumb,
         },
     },
     progress::Progress,
@@ -33,7 +33,8 @@ use crate::{
         stream::{AdaptedSource, FrameSource},
     },
 };
-use egui::{Button, Color32, Ui};
+use crate::gui::theme::{icons, widgets};
+use egui::{Color32, Ui};
 use image::RgbaImage;
 use log::{error, info};
 use poll_promise::Promise;
@@ -844,91 +845,98 @@ impl VideoApp {
     /// they are what the cost readout below is mostly made of. Everything that
     /// only tunes the picture lives in [`Self::draw_advanced_sections`].
     fn draw_settings(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
-        ui.heading("Settings");
         ui.label(
             "Convert an animated image or frame sequence into wired, animated display bricks.",
         );
 
-        settings_grid(ui, "video_settings_grid").show(ui, |ui| {
-            ui.label("Save Destination")
-                .on_hover_text("The save will be created relative to the location of the exe.");
-            ui.horizontal(|ui| {
-                // the clipboard flag is meaningless on web (saves are
-                // delivered as browser downloads)
-                #[cfg(not(target_arch = "wasm32"))]
-                ui.checkbox(&mut shared.out_clipboard, "Copy to clipboard")
-                    .on_hover_text("Copy the save file path to clipboard after generation");
-                ui.add(egui::TextEdit::singleline(&mut shared.out_file).hint_text("File Name"));
-            });
-            ui.end_row();
-            draw_out_file_warnings(ui, &shared.out_file);
+        widgets::settings_table(ui, |ui, t| {
+            save_destination_row(t, ui, shared);
+            out_file_warning_row(t, ui, &shared.out_file);
 
-            ui.label("Render Mode").on_hover_text(
-                "Bricks: one display brick per pixel -- dense, and the most expensive at \
-                 large screen sizes. Text: a stack of animated TextDisplay bricks, ~2 gates \
-                 per BAND of image rows instead of per pixel -- two-plus orders of magnitude \
-                 cheaper on gates at typical sizes. \"Brick Style\"/\"Pixel Extent\"/\"Glow\" \
-                 in the sections below only apply to Bricks; the Text Options/Colours \
-                 controls there only apply to Text.",
+            t.row_hover(
+                ui,
+                "Render Mode",
+                Some(
+                    "Bricks: one display brick per pixel -- dense, and the most expensive at \
+                     large screen sizes. Text: a stack of animated TextDisplay bricks, ~2 gates \
+                     per BAND of image rows instead of per pixel -- two-plus orders of magnitude \
+                     cheaper on gates at typical sizes. \"Brick Style\"/\"Pixel Extent\"/\"Glow\" \
+                     in the sections below only apply to Bricks; the Text Options/Colours \
+                     controls there only apply to Text.",
+                ),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        widgets::radio(ui,&mut self.mode, AnimMode::Brick(AnimEncoding::Hex), "Bricks");
+                        widgets::radio(ui,&mut self.mode, AnimMode::Text, "Text");
+                    });
+                },
             );
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut self.mode, AnimMode::Brick(AnimEncoding::Hex), "Bricks");
-                ui.radio_value(&mut self.mode, AnimMode::Text, "Text");
-            });
-            ui.end_row();
 
-            ui.label("Resize")
-                .on_hover_text("Override the source resolution; otherwise the clip's own size is used");
-            ui.checkbox(&mut self.resize, "Override size");
-            ui.end_row();
+            t.row_hover(
+                ui,
+                "Resize",
+                Some("Override the source resolution; otherwise the clip's own size is used"),
+                |ui| {
+                    widgets::toggle(ui,&mut self.resize, "Override size");
+                },
+            );
 
             // The two sliders get a ROW OF THEIR OWN rather than sharing one
             // with the checkbox: a checkbox plus two labelled sliders is wider
             // than the pane at the default 600px window, and a cell that
             // overflows widens the whole grid, which is what was dragging a
             // horizontal scrollbar across the pane.
-            ui.label("Size");
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(self.resize, |ui| {
-                    ui.label("W");
-                    ui.add(egui::Slider::new(&mut self.width, 1..=2048));
-                    ui.label("H");
-                    ui.add(egui::Slider::new(&mut self.height, 1..=2048));
+            t.row(ui, "Size", |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(self.resize, |ui| {
+                        ui.label("W");
+                        widgets::slider(ui, egui::Slider::new(&mut self.width, 1..=2048));
+                        ui.label("H");
+                        widgets::slider(ui, egui::Slider::new(&mut self.height, 1..=2048));
+                    });
                 });
             });
-            ui.end_row();
             // Also its own row: beside the sliders there is less width left
             // than this sentence's longest word, and that is the one case
             // where egui breaks text mid-word instead of at a space.
             if !self.resize {
-                ui.label("");
-                note(ui, "(using source size)");
-                ui.end_row();
+                t.row(ui, "", |ui| {
+                    note(ui, "(using source size)");
+                });
             }
 
-            ui.label("FPS")
-                .on_hover_text("Output frame rate; also the fallback rate for frame sequences");
-            ui.add(
-                egui::DragValue::new(&mut self.fps)
-                    .speed(0.1)
-                    .range(0.01..=240.0),
+            t.row_hover(
+                ui,
+                "FPS",
+                Some("Output frame rate; also the fallback rate for frame sequences"),
+                |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.fps)
+                            .speed(0.1)
+                            .range(0.01..=240.0),
+                    );
+                },
             );
-            ui.end_row();
 
             // Playback lives on the always-visible critical path, not in an
             // advanced section: whether a clip loops is a decision every render
             // makes, alongside the mode and the frame rate, not an advanced
             // tuning knob a user hunts for behind a header.
-            ui.label("Playback").on_hover_text(
-                "Loop: repeat the clip forever (the default). Off: play through once and \
-                 stop on the last frame -- the timer is given a limit of \
-                 (frames - 0.5) / fps, which expires halfway through the final frame. \
-                 Costs nothing either way, and does nothing with an external clock.",
+            t.row_hover(
+                ui,
+                "Playback",
+                Some(
+                    "Loop: repeat the clip forever (the default). Off: play through once and \
+                     stop on the last frame -- the timer is given a limit of \
+                     (frames - 0.5) / fps, which expires halfway through the final frame. \
+                     Costs nothing either way, and does nothing with an external clock.",
+                ),
+                |ui| {
+                    ui.add_enabled_ui(!self.external_clock, |ui| {
+                        widgets::toggle(ui,&mut self.loop_playback, "Loop");
+                    });
+                },
             );
-            ui.add_enabled_ui(!self.external_clock, |ui| {
-                ui.checkbox(&mut self.loop_playback, "Loop");
-            });
-            ui.end_row();
         });
 
         self.draw_advanced_sections(ui);
@@ -950,12 +958,12 @@ impl VideoApp {
     fn draw_advanced_sections(&mut self, ui: &mut Ui) {
         let (chips, open) = (self.text_chips(), self.text_is_tuned());
         section(ui, "video_text_section", "Text options", &chips, open, |ui| {
-            settings_grid(ui, "video_text_grid").show(ui, |ui| self.draw_text_rows(ui));
+            widgets::settings_table(ui, |ui, t| self.draw_text_rows(t, ui));
         });
 
         let (chips, open) = (self.subtitle_chips(), self.subtitles.is_some());
         section(ui, "video_subtitle_section", "Subtitles", &chips, open, |ui| {
-            settings_grid(ui, "video_subtitle_grid").show(ui, |ui| self.draw_subtitle_rows(ui));
+            widgets::settings_table(ui, |ui, t| self.draw_subtitle_rows(t, ui));
         });
 
         let (chips, open) = (self.timing_chips(), self.timing_is_tuned());
@@ -966,13 +974,13 @@ impl VideoApp {
             &chips,
             open,
             |ui| {
-                settings_grid(ui, "video_timing_grid").show(ui, |ui| self.draw_timing_rows(ui));
+                widgets::settings_table(ui, |ui, t| self.draw_timing_rows(t, ui));
             },
         );
 
         let (chips, open) = (self.picture_chips(), self.picture_is_tuned());
         section(ui, "video_picture_section", "Picture", &chips, open, |ui| {
-            settings_grid(ui, "video_picture_grid").show(ui, |ui| self.draw_picture_rows(ui));
+            widgets::settings_table(ui, |ui, t| self.draw_picture_rows(t, ui));
         });
     }
 
@@ -1082,138 +1090,172 @@ impl VideoApp {
     /// column, which is what put a horizontal scrollbar across the pane. Each
     /// control, its range and its tooltip is unchanged; only which row it sits
     /// on moved.
-    fn draw_text_rows(&mut self, ui: &mut Ui) {
+    fn draw_text_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
         let text_mode = matches!(self.mode, AnimMode::Text);
 
-        ui.label("Font").on_hover_text(
-            "Text mode only. Reuses the Image2Text pane's font, glyph and geometry \
-             controls -- see the Image2Text tab for the full calibration set.",
-        );
-        if text_mode {
-            let mut preset_changed = false;
-            egui::ComboBox::from_id_salt("video_text_font_preset")
-                .selected_text(self.text_preset.name())
-                .show_ui(ui, |ui| {
-                    for p in FontPreset::ALL {
-                        preset_changed |= ui
-                            .selectable_value(&mut self.text_preset, p, p.name())
-                            .changed();
+        t.row_hover(
+            ui,
+            "Font",
+            Some(
+                "Text mode only. Reuses the Image2Text pane's font, glyph and geometry \
+                 controls -- see the Image2Text tab for the full calibration set.",
+            ),
+            |ui| {
+                if text_mode {
+                    let mut preset_changed = false;
+                    widgets::combo(
+                        ui,
+                        "video_text_font_preset",
+                        self.text_preset.name(),
+                        160.0,
+                        |ui| {
+                            for p in FontPreset::ALL {
+                                preset_changed |= widgets::combo_item(ui, &mut self.text_preset, p, p.name())
+                                    .changed();
+                            }
+                        },
+                    );
+                    if preset_changed {
+                        self.load_text_preset();
                     }
-                });
-            if preset_changed {
-                self.load_text_preset();
-            }
-        } else {
-            note(ui, "(switch Render Mode to Text to configure)");
-        }
-        ui.end_row();
+                } else {
+                    note(ui, "(switch Render Mode to Text to configure)");
+                }
+            },
+        );
 
         if text_mode {
-            ui.label("Glyphs")
-                .on_hover_text("Which characters stand for an opaque and a transparent pixel");
-            ui.horizontal(|ui| {
-                ui.label("Fill");
-                ui.add(egui::TextEdit::singleline(&mut self.text_fill_char).desired_width(24.0))
-                    .on_hover_text("Glyph for opaque pixels (first character is used)");
-                ui.label("Empty");
-                ui.add(egui::TextEdit::singleline(&mut self.text_empty_char).desired_width(24.0))
-                    .on_hover_text("Glyph for transparent pixels (first character is used)");
-                ui.label("Repeat");
-                ui.add(egui::Slider::new(&mut self.text_char_repeat, 1..=4))
-                    .on_hover_text("Glyphs per pixel; also sets the band layout's row width bound");
-            });
-            ui.end_row();
+            t.row_hover(
+                ui,
+                "Glyphs",
+                Some("Which characters stand for an opaque and a transparent pixel"),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Fill");
+                        ui.add(egui::TextEdit::singleline(&mut self.text_fill_char).desired_width(24.0))
+                            .on_hover_text("Glyph for opaque pixels (first character is used)");
+                        ui.label("Empty");
+                        ui.add(egui::TextEdit::singleline(&mut self.text_empty_char).desired_width(24.0))
+                            .on_hover_text("Glyph for transparent pixels (first character is used)");
+                        ui.label("Repeat");
+                        widgets::slider(ui, egui::Slider::new(&mut self.text_char_repeat, 1..=4))
+                            .on_hover_text("Glyphs per pixel; also sets the band layout's row width bound");
+                    });
+                },
+            );
 
-            ui.label("Line Height")
-                .on_hover_text("Component LineHeight (font size)");
-            ui.add(egui::DragValue::new(&mut self.text_line_height).speed(0.01));
-            ui.end_row();
+            t.row_hover(
+                ui,
+                "Line Height",
+                Some("Component LineHeight (font size)"),
+                |ui| {
+                    ui.add(egui::DragValue::new(&mut self.text_line_height).speed(0.01));
+                },
+            );
         }
 
-        ui.label("Colours").on_hover_text(
-            "Text mode only: quantize to at most N colours with a median-cut palette \
-             before encoding (0 = full 24-bit colour, no quantization). Text mode writes \
-             a 16-character <color=\"RRGGBB\"> tag at the start of every colour run, so \
-             collapsing the palette lengthens runs and shrinks the render; useful values \
-             are 16-64.",
+        t.row_hover(
+            ui,
+            "Colours",
+            Some(
+                "Text mode only: quantize to at most N colours with a median-cut palette \
+                 before encoding (0 = full 24-bit colour, no quantization). Text mode writes \
+                 a 16-character <color=\"RRGGBB\"> tag at the start of every colour run, so \
+                 collapsing the palette lengthens runs and shrinks the render; useful values \
+                 are 16-64.",
+            ),
+            |ui| {
+                if self.shows_colours_control() {
+                    widgets::slider(ui, egui::Slider::new(&mut self.colors, 0..=256));
+                } else {
+                    note(ui, "(Text mode only)");
+                }
+            },
         );
-        if self.shows_colours_control() {
-            ui.add(egui::Slider::new(&mut self.colors, 0..=256));
-        } else {
-            note(ui, "(Text mode only)");
-        }
-        ui.end_row();
     }
 
-    fn draw_subtitle_rows(&mut self, ui: &mut Ui) {
-        ui.label("Subtitles").on_hover_text(
-            "Render an .srt/.ass subtitle file as ONE wired TextDisplay overlaying \
-             the bottom of the screen -- 2 gates for the whole track, centred and \
-             outlined, drawn as vector glyphs at their own size rather than on the \
-             screen's pixel grid. The file is read in SOURCE time, so the Start \
-             control is honoured. Works in every render mode; over Bricks the \
-             subtitle lies flat in the screen's plane (the screen is on the ground), \
-             which is unverified by eye -- Text mode is the one it was designed \
-             against.",
+    fn draw_subtitle_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
+        t.row_hover(
+            ui,
+            "Subtitles",
+            Some(
+                "Render an .srt/.ass subtitle file as ONE wired TextDisplay overlaying \
+                 the bottom of the screen -- 2 gates for the whole track, centred and \
+                 outlined, drawn as vector glyphs at their own size rather than on the \
+                 screen's pixel grid. The file is read in SOURCE time, so the Start \
+                 control is honoured. Works in every render mode; over Bricks the \
+                 subtitle lies flat in the screen's plane (the screen is on the ground), \
+                 which is unverified by eye -- Text mode is the one it was designed \
+                 against.",
+            ),
+            |ui| {
+                // Wrapped: the picked track's file name is arbitrarily long.
+                ui.horizontal(|ui| {
+                    if widgets::info(ui, format!("{}  Pick subtitle file", icons::FONT)).clicked()
+                        && self.pending_pick_subtitles.is_none()
+                    {
+                        self.pending_pick_subtitles = Some(pick_subtitle_bytes());
+                    }
+                    // The "clear" decision is taken while the track is
+                    // borrowed for its label, so it is applied afterwards
+                    // rather than assigned through the borrow.
+                    let mut clear = false;
+                    match &self.subtitles {
+                        Some((name, track)) => {
+                            clear = widgets::danger_icon(ui, icons::XMARK).clicked();
+                            ui.label(format!("{name} -- {} cue(s)", track.len()));
+                        }
+                        None => {
+                            note(ui, "(none)");
+                        }
+                    }
+                    if clear {
+                        self.subtitles = None;
+                    }
+                });
+            },
         );
-        // Wrapped: the picked track's file name is arbitrarily long.
-        ui.horizontal(|ui| {
-            if ui
-                .add(Button::new("Pick subtitle file").fill(Color32::from_rgb(60, 60, 120)))
-                .clicked()
-                && self.pending_pick_subtitles.is_none()
-            {
-                self.pending_pick_subtitles = Some(pick_subtitle_bytes());
-            }
-            // The "clear" decision is taken while the track is
-            // borrowed for its label, so it is applied afterwards
-            // rather than assigned through the borrow.
-            let mut clear = false;
-            match &self.subtitles {
-                Some((name, track)) => {
-                    clear = ui.button("✖").clicked();
-                    ui.label(format!("{name} -- {} cue(s)", track.len()));
-                }
-                None => {
-                    note(ui, "(none)");
-                }
-            }
-            if clear {
-                self.subtitles = None;
-            }
-        });
-        ui.end_row();
 
-        ui.label("Subtitle Scale").on_hover_text(
-            "How much bigger a subtitle line is than one row of the screen. At 192 px \
-             wide the screen is hundreds of glyph cells across while a subtitle line \
-             is 40-60 characters, so at equal size the text would occupy a seventh of \
-             the width; the default 6 covers about half. Unverified by eye in game.",
+        t.row_hover(
+            ui,
+            "Subtitle Scale",
+            Some(
+                "How much bigger a subtitle line is than one row of the screen. At 192 px \
+                 wide the screen is hundreds of glyph cells across while a subtitle line \
+                 is 40-60 characters, so at equal size the text would occupy a seventh of \
+                 the width; the default 6 covers about half. Unverified by eye in game.",
+            ),
+            |ui| {
+                // Hidden without a track for the same reason the Colours
+                // slider is hidden under brick mode: a control that provably
+                // does nothing is worse than no control.
+                if self.subtitles.is_some() {
+                    widgets::slider(ui, egui::Slider::new(&mut self.subtitle_scale, 1.0..=24.0));
+                } else {
+                    note(ui, "(pick a subtitle file to configure)");
+                }
+            },
         );
-        // Hidden without a track for the same reason the Colours
-        // slider is hidden under brick mode: a control that provably
-        // does nothing is worse than no control.
-        if self.subtitles.is_some() {
-            ui.add(egui::Slider::new(&mut self.subtitle_scale, 1.0..=24.0));
-        } else {
-            note(ui, "(pick a subtitle file to configure)");
-        }
-        ui.end_row();
 
-        ui.label("Subtitle Lift").on_hover_text(
-            "World units to lift the subtitle anchor toward the top of the picture \
-             (default 8). Measured by eye against Text mode at 192x108 with Subtitle \
-             Scale 6 -- Bricks/Color Array lay their screen flat, so the lift there \
-             moves the opposite horizontal axis and is unverified by eye. A lift too \
-             big for the picture's own height is refused rather than silently clamped.",
+        t.row_hover(
+            ui,
+            "Subtitle Lift",
+            Some(
+                "World units to lift the subtitle anchor toward the top of the picture \
+                 (default 8). Measured by eye against Text mode at 192x108 with Subtitle \
+                 Scale 6 -- Bricks/Color Array lay their screen flat, so the lift there \
+                 moves the opposite horizontal axis and is unverified by eye. A lift too \
+                 big for the picture's own height is refused rather than silently clamped.",
+            ),
+            |ui| {
+                // Same gating as Subtitle Scale, for the same reason.
+                if self.subtitles.is_some() {
+                    widgets::slider(ui, egui::Slider::new(&mut self.subtitle_lift, 0.0..=64.0));
+                } else {
+                    note(ui, "(pick a subtitle file to configure)");
+                }
+            },
         );
-        // Same gating as Subtitle Scale, for the same reason.
-        if self.subtitles.is_some() {
-            ui.add(egui::Slider::new(&mut self.subtitle_lift, 0.0..=64.0));
-        } else {
-            note(ui, "(pick a subtitle file to configure)");
-        }
-        ui.end_row();
     }
 
     /// How the source is resampled and how much of it is used.
@@ -1222,71 +1264,84 @@ impl VideoApp {
     /// the Resize checkbox they follow is in the always-visible grid above, so
     /// the two are no longer adjacent, but nothing about when they are live
     /// has changed.
-    fn draw_timing_rows(&mut self, ui: &mut Ui) {
-        // ONE `add_enabled_ui` PER CELL, not one wrapped around the pair.
-        // `add_enabled_ui` builds a child `Ui`, and a grid counts a child `Ui`
-        // as a SINGLE cell -- so a label and its control inside one scope both
-        // land in column 1, and the control starts at a different x from every
-        // other row in the section. Two scopes, two cells, same geometry as
-        // the rows below. The greying is unchanged: both halves still follow
-        // `self.resize`.
-        ui.add_enabled_ui(self.resize, |ui| {
-            ui.label("Fit Mode").on_hover_text(
+    fn draw_timing_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
+        // Fit Mode and Filter stay greyed while Resize is off: the control is
+        // wrapped in `add_enabled_ui(self.resize, ..)` inside the row so it
+        // follows the Resize toggle exactly as before. (The table draws the
+        // label itself, so only the control greys now.)
+        t.row_hover(
+            ui,
+            "Fit Mode",
+            Some(
                 "Exact: stretch to fit. Contain: letterbox, preserving aspect. Cover: fill and crop, preserving aspect.",
-            );
-        });
-        ui.add_enabled_ui(self.resize, |ui| {
-            ui.horizontal(|ui| {
-                for f in [FitMode::Exact, FitMode::Contain, FitMode::Cover] {
-                    ui.radio_value(&mut self.fit, f, fit_name(f));
-                }
-            });
-        });
-        ui.end_row();
-
-        ui.add_enabled_ui(self.resize, |ui| {
-            ui.label("Filter")
-                .on_hover_text("Resample filter used when resizing frames");
-        });
-        ui.add_enabled_ui(self.resize, |ui| {
-            ui.horizontal(|ui| {
-                for f in [Filter::Lanczos, Filter::Nearest] {
-                    ui.radio_value(&mut self.filter, f, filter_name(f));
-                }
-            });
-        });
-        ui.end_row();
-
-        ui.label("Start")
-            .on_hover_text("Seconds into the source to start from");
-        ui.add(
-            egui::DragValue::new(&mut self.start)
-                .speed(0.1)
-                .suffix("s")
-                .range(0.0..=f32::INFINITY),
+            ),
+            |ui| {
+                ui.add_enabled_ui(self.resize, |ui| {
+                    ui.horizontal(|ui| {
+                        for f in [FitMode::Exact, FitMode::Contain, FitMode::Cover] {
+                            widgets::radio(ui,&mut self.fit, f, fit_name(f));
+                        }
+                    });
+                });
+            },
         );
-        ui.end_row();
 
-        ui.label("Duration")
-            .on_hover_text("Limit how much of the source (from Start) is used; unlimited runs to the end");
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.limit_duration, "Limit");
-            ui.add_enabled_ui(self.limit_duration, |ui| {
+        t.row_hover(
+            ui,
+            "Filter",
+            Some("Resample filter used when resizing frames"),
+            |ui| {
+                ui.add_enabled_ui(self.resize, |ui| {
+                    ui.horizontal(|ui| {
+                        for f in [Filter::Lanczos, Filter::Nearest] {
+                            widgets::radio(ui,&mut self.filter, f, filter_name(f));
+                        }
+                    });
+                });
+            },
+        );
+
+        t.row_hover(
+            ui,
+            "Start",
+            Some("Seconds into the source to start from"),
+            |ui| {
                 ui.add(
-                    egui::DragValue::new(&mut self.duration)
+                    egui::DragValue::new(&mut self.start)
                         .speed(0.1)
                         .suffix("s")
                         .range(0.0..=f32::INFINITY),
                 );
-            });
-        });
-        ui.end_row();
-
-        ui.label("Max Frames").on_hover_text(
-            "Hard cap on emitted frames -- frames past 65535 spill into extra wire arrays",
+            },
         );
-        ui.add(egui::Slider::new(&mut self.max_frames, 1..=MAX_FRAMES as u32).logarithmic(true));
-        ui.end_row();
+
+        t.row_hover(
+            ui,
+            "Duration",
+            Some("Limit how much of the source (from Start) is used; unlimited runs to the end"),
+            |ui| {
+                ui.horizontal(|ui| {
+                    widgets::toggle(ui,&mut self.limit_duration, "Limit");
+                    ui.add_enabled_ui(self.limit_duration, |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.duration)
+                                .speed(0.1)
+                                .suffix("s")
+                                .range(0.0..=f32::INFINITY),
+                        );
+                    });
+                });
+            },
+        );
+
+        t.row_hover(
+            ui,
+            "Max Frames",
+            Some("Hard cap on emitted frames -- frames past 65535 spill into extra wire arrays"),
+            |ui| {
+                widgets::slider(ui, egui::Slider::new(&mut self.max_frames, 1..=MAX_FRAMES as u32).logarithmic(true));
+            },
+        );
     }
 
     /// What the screen itself is made of.
@@ -1294,60 +1349,84 @@ impl VideoApp {
     /// Alpha Threshold and Clock apply in both render modes; Brick Style,
     /// Pixel Extent and Material are read by the brick renderer only, as the
     /// Render Mode tooltip says.
-    fn draw_picture_rows(&mut self, ui: &mut Ui) {
-        ui.label("Alpha Threshold")
-            .on_hover_text("Pixels below this alpha, in every frame, are culled entirely");
-        ui.add(egui::Slider::new(&mut self.alpha_threshold, 0..=255));
-        ui.end_row();
-
-        ui.label("Brick Style").on_hover_text(
-            "Micro: small cube bricks (smallest at extent 1: 2 units wide). Smooth \
-             Tile: flat tiles, always 4 units tall regardless of extent.",
+    fn draw_picture_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
+        t.row_hover(
+            ui,
+            "Alpha Threshold",
+            Some("Pixels below this alpha, in every frame, are culled entirely"),
+            |ui| {
+                widgets::slider(ui, egui::Slider::new(&mut self.alpha_threshold, 0..=255));
+            },
         );
-        ui.horizontal(|ui| {
-            for s in [DisplayBrickStyle::Micro, DisplayBrickStyle::SmoothTile] {
-                ui.radio_value(&mut self.brick_style, s, brick_style_name(s));
-            }
-        });
-        ui.end_row();
 
-        ui.label("Pixel Extent").on_hover_text(
-            "Half-extent of each display pixel, in units (1 = smallest: a 2-unit-wide \
-             brick). Adjacent pixels always tile flush at twice this value, so every \
-             value here is legal -- no size/style combination can overlap.",
+        t.row_hover(
+            ui,
+            "Brick Style",
+            Some(
+                "Micro: small cube bricks (smallest at extent 1: 2 units wide). Smooth \
+                 Tile: flat tiles, always 4 units tall regardless of extent.",
+            ),
+            |ui| {
+                ui.horizontal(|ui| {
+                    for s in [DisplayBrickStyle::Micro, DisplayBrickStyle::SmoothTile] {
+                        widgets::radio(ui,&mut self.brick_style, s, brick_style_name(s));
+                    }
+                });
+            },
         );
-        ui.add(egui::Slider::new(&mut self.pixel_extent, MIN_PIXEL_EXTENT..=50).text("units"));
-        ui.end_row();
 
-        ui.label("Clock").on_hover_text(
-            "External: expose Frame as a chip input instead of running a built-in timer",
+        t.row_hover(
+            ui,
+            "Pixel Extent",
+            Some(
+                "Half-extent of each display pixel, in units (1 = smallest: a 2-unit-wide \
+                 brick). Adjacent pixels always tile flush at twice this value, so every \
+                 value here is legal -- no size/style combination can overlap.",
+            ),
+            |ui| {
+                widgets::slider(ui, egui::Slider::new(&mut self.pixel_extent, MIN_PIXEL_EXTENT..=50).text("units"));
+            },
         );
-        ui.checkbox(&mut self.external_clock, "External clock");
-        ui.end_row();
 
-        ui.label("Controls").on_hover_text(
-            "Pre-generate three physical Pause/Restart/Resume buttons on the main grid, \
-             wired into the clock so the render is controllable out of the box. Off means \
-             you wire the clock's control pins yourself. Inert with an external clock, \
-             which exposes no control pins.",
+        t.row_hover(
+            ui,
+            "Clock",
+            Some("External: expose Frame as a chip input instead of running a built-in timer"),
+            |ui| {
+                widgets::toggle(ui,&mut self.external_clock, "External clock");
+            },
         );
-        ui.add_enabled_ui(!self.external_clock, |ui| {
-            ui.checkbox(&mut self.control_buttons, "Control buttons");
-        });
-        ui.end_row();
 
-        ui.label("Material").on_hover_text(
-            "Glow at intensity 0: the screen lights itself instead of being lit by \
-             the world, so its colours stay true at night",
+        t.row_hover(
+            ui,
+            "Controls",
+            Some(
+                "Pre-generate three physical Pause/Restart/Resume buttons on the main grid, \
+                 wired into the clock so the render is controllable out of the box. Off means \
+                 you wire the clock's control pins yourself. Inert with an external clock, \
+                 which exposes no control pins.",
+            ),
+            |ui| {
+                ui.add_enabled_ui(!self.external_clock, |ui| {
+                    widgets::toggle(ui,&mut self.control_buttons, "Control buttons");
+                });
+            },
         );
-        ui.checkbox(&mut self.glow, "Glow");
-        ui.end_row();
+
+        t.row_hover(
+            ui,
+            "Material",
+            Some(
+                "Glow at intensity 0: the screen lights itself instead of being lit by \
+                 the world, so its colours stay true at night",
+            ),
+            |ui| {
+                widgets::toggle(ui,&mut self.glow, "Glow");
+            },
+        );
     }
 
     fn draw_input(&mut self, ui: &mut Ui) {
-        ui.add_space(8.0);
-        ui.separator();
-        ui.heading("Source");
         ui.label(
             "Pick a single animated file (GIF/APNG/WebP), a numbered frame sequence (PNG/JPG), \
              or a video file (mp4/mov/mkv/webm/avi/m4v).",
@@ -1363,23 +1442,17 @@ impl VideoApp {
             || self.pending_pick_sequence.is_some()
             || self.pending_pick_video.is_some();
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add(Button::new("Pick animated file").fill(Color32::from_rgb(60, 60, 120)))
-                .clicked()
+            if widgets::info(ui, format!("{}  Pick animated file", icons::FILM)).clicked()
                 && !picking
             {
                 self.pending_pick_animated = Some(pick_animated_bytes());
             }
-            if ui
-                .add(Button::new("Pick frame sequence").fill(Color32::from_rgb(60, 60, 120)))
-                .clicked()
+            if widgets::info(ui, format!("{}  Pick frame sequence", icons::IMAGE)).clicked()
                 && !picking
             {
                 self.pending_pick_sequence = Some(pick_images(true));
             }
-            if ui
-                .add(Button::new("Pick video file").fill(Color32::from_rgb(60, 60, 120)))
-                .clicked()
+            if widgets::info(ui, format!("{}  Pick video file", icons::FILM)).clicked()
                 && !picking
             {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -1402,7 +1475,7 @@ impl VideoApp {
                  Only applies to a picked video file.",
             );
             for b in [Backend::Auto, Backend::Builtin, Backend::Ffmpeg] {
-                ui.radio_value(&mut self.backend, b, backend_name(b));
+                widgets::radio(ui,&mut self.backend, b, backend_name(b));
             }
         });
 
@@ -1424,7 +1497,7 @@ impl VideoApp {
                     .min_col_width(4.0)
                     .max_col_width(name_width)
                     .show(ui, |ui| {
-                        if ui.button("✖").clicked() {
+                        if widgets::danger_icon(ui, icons::XMARK).clicked() {
                             clear_input = true;
                         }
                         thumb(ui, preview);
@@ -1453,7 +1526,7 @@ impl VideoApp {
                             ui.end_row();
                         }
                     });
-                if ui.button("✖ Clear sequence").clicked() {
+                if widgets::danger(ui, format!("{}  Clear sequence", icons::XMARK)).clicked() {
                     clear_input = true;
                 }
             }
@@ -1461,7 +1534,7 @@ impl VideoApp {
             Input::Video { path, name } => {
                 // Wrapped: a full filesystem path is easily wider than the pane.
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("✖").clicked() {
+                    if widgets::danger_icon(ui, icons::XMARK).clicked() {
                         clear_input = true;
                     }
                     ui.label(format!("{name} -- video source ({})", path.display()));
@@ -1470,7 +1543,7 @@ impl VideoApp {
             #[cfg(target_arch = "wasm32")]
             Input::Video { name, .. } => {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("✖").clicked() {
+                    if widgets::danger_icon(ui, icons::XMARK).clicked() {
                         clear_input = true;
                     }
                     ui.label(format!("{name} -- video source"));
@@ -1622,10 +1695,7 @@ impl VideoApp {
         }
 
         if has_input {
-            if ui
-                .add(Button::new("Generate video2brick save").fill(Color32::from_rgb(50, 90, 50)))
-                .clicked()
-            {
+            if widgets::primary(ui, format!("{}  Generate video2brick save", icons::DOWNLOAD)).clicked() {
                 self.generate(shared);
             }
         } else {
@@ -1881,12 +1951,16 @@ impl VideoApp {
             self.modal
                 .draw(ui.ctx(), "video", &prompt, "video was not converted");
         }
-        self.draw_settings(ui, shared);
-        self.draw_input(ui);
-        ui.add_space(8.0);
-        ui.separator();
+        // File selection above the settings, each in its own card.
+        widgets::section(ui, "Source", |ui| self.draw_input(ui));
+        ui.add_space(10.0);
+        widgets::section(ui, "Settings", |ui| self.draw_settings(ui, shared));
+    }
+
+    /// The fixed footer: the cost readout and the Generate button.
+    pub fn draw_footer(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
+        bound_pane_width(ui);
         self.draw_cost(ui);
-        ui.separator();
         self.draw_submit(ui, shared);
     }
 }

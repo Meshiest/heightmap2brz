@@ -1,6 +1,6 @@
 [package]
 name = "heightmap"
-version = "0.12.0"
+version = "0.13.0"
 authors = ["Isaac <gpg@reheatedcake.io>"]
 edition = "2024"
 rust-version = "1.88"
@@ -138,3 +138,10 @@ required-features = ["gui"]
 name = "text_probe"
 path = "examples/text_probe.rs"
 test = true
+
+# A live gallery of the Brickadia egui theme (palette, semantic buttons, Font
+# Awesome icons). GUI-only, so it needs the same feature set as the GUI binary.
+[[example]]
+name = "theme_sandbox"
+path = "examples/theme_sandbox.rs"
+required-features = ["gui"]

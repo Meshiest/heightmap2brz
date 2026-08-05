@@ -127,19 +127,25 @@ pub fn speaker_position(index: usize, total: usize) -> Position {
     }
 }
 
-/// Low-x face of the in-chip speaker block, in inner-grid units. Service gates
-/// occupy rows 0..-10, mapped by [`service`] onto x in `[0, 110]`; starting the
-/// block at 120 leaves a full gate cell of clearance. Growing the band count
-/// lengthens the service rows along y, never x, so the margin holds for any render.
-const SPEAKER_BLOCK_X: i32 = 120;
+/// Z (inner-grid units) of the in-chip speaker block's floor. Every gate this
+/// crate places in a chip -- the clock, its pins, the pause-mute detector and
+/// the per-speaker MIDI playhead -- sits at lattice stage 0, so the whole gate
+/// layer tops out at `STAGE_BASE_Z + 2 * GATE_HALF.z`. The speaker cluster
+/// stacks ABOVE that plane, so it clears the gates however far they spread
+/// across the grid: unlike the audio bank (whose service rows grow only along
+/// y), the MIDI playhead grows the lattice along BOTH x (rows) and y (columns),
+/// so a fixed sideways offset could not stay clear of a large score. One full
+/// [`STAGE_PITCH`] of lift leaves air between the gate tops and the speakers.
+const SPEAKER_BLOCK_Z: i32 = STAGE_BASE_Z + STAGE_PITCH;
 
 /// Where in-chip speaker `index` of `total` sits on the chip's inner grid, for
 /// [`AudioOptions::speakers_in_chip`]. Same [`cluster_dims`] packing as
-/// [`speaker_position`], offset past the service rows ([`SPEAKER_BLOCK_X`]) and
-/// lifted onto [`STAGE_BASE_Z`]. Coordinates stay non-negative: negative
-/// inner-grid coordinates delete bricks in-game. An emitter on the inner grid
-/// plays from the chip's world position, so this shape buys no near-field
-/// geometry -- it only needs to be non-overlapping.
+/// [`speaker_position`], stacked on the [`SPEAKER_BLOCK_Z`] plane ABOVE the gate
+/// layer so the cluster never overlaps the gates -- whatever their x/y spread.
+/// Coordinates stay non-negative: negative inner-grid coordinates delete bricks
+/// in-game. An emitter on the inner grid plays from the chip's world position,
+/// so this shape buys no near-field geometry -- it only needs to be
+/// non-overlapping.
 pub fn speaker_inner_position(index: usize, total: usize) -> Position {
     let (nx, ny, _) = cluster_dims(total);
     let half = speaker_half();
@@ -147,9 +153,9 @@ pub fn speaker_inner_position(index: usize, total: usize) -> Position {
     let iy = ((index / nx) % ny) as i32;
     let iz = (index / (nx * ny)) as i32;
     Position {
-        x: SPEAKER_BLOCK_X + half.x + ix * half.x * 2,
+        x: half.x + ix * half.x * 2,
         y: half.y + iy * half.y * 2,
-        z: STAGE_BASE_Z + half.z + iz * half.z * 2,
+        z: SPEAKER_BLOCK_Z + half.z + iz * half.z * 2,
     }
 }
 
@@ -887,16 +893,17 @@ pub fn build_midi_event_world(
         sc.chip.add_brick(brick, speaker_half());
     }
 
-    // Playhead gates pack onto a dense grid on the rows just below the
-    // scaffold's own (clock 0, pins -2, pause-mute -3) and the per-speaker
-    // master-volume multiplies, which this build places at -4 (there is no audio
-    // select cascade to clear). Starting the playhead at -5 keeps the whole
-    // thing one compact block instead of the tall empty bands a far-below start
-    // left between sections.
-    let mut slot = 0i32;
-    let mut next_pos = || {
-        let p = service(slot % 48, -5 - slot / 48);
-        slot += 1;
+    // Layout below the scaffold (clock 0, pins -2, pause-mute -3) and the
+    // per-voice master-volume multiplies (row -4): the SHARED playhead gates
+    // (time scaling, the loop wrap and the backward-jump detector) fill one row,
+    // then every voice gets its OWN row below. So each voice reads as the same
+    // left-to-right strip, stacked one per row -- a clean repeating pattern
+    // rather than every voice's gates splooted end-to-end down a serpentine.
+    const SHARED_ROW: i32 = -5;
+    let mut shared_col = 0i32;
+    let mut shared_pos = || {
+        let p = service(shared_col, SHARED_ROW);
+        shared_col += 1;
         p
     };
 
@@ -907,7 +914,7 @@ pub fn build_midi_event_world(
     let scaled_time = if (rate - 1.0).abs() < 1e-9 {
         sc.time.clone()
     } else {
-        let m = gate(&mut sc.chip, "B_1x1_Gate_Expr_MathMultiply", MULTIPLY, next_pos(), vec![(
+        let m = gate(&mut sc.chip, "B_1x1_Gate_Expr_MathMultiply", MULTIPLY, shared_pos(), vec![(
             "InputB",
             Box::new(WireVariant::Number(rate)) as Box<dyn AsBrdbValue>,
         )]);
@@ -915,7 +922,7 @@ pub fn build_midi_event_world(
         WirePort::new(m, MULTIPLY, "Output")
     };
     let play_time = if opts.loop_playback {
-        let m = gate(&mut sc.chip, "B_1x1_Gate_Expr_MathModuloFloored", MODULO, next_pos(), vec![(
+        let m = gate(&mut sc.chip, "B_1x1_Gate_Expr_MathModuloFloored", MODULO, shared_pos(), vec![(
             "InputB",
             Box::new(WireVariant::Number(score.duration_s)) as Box<dyn AsBrdbValue>,
         )]);
@@ -927,43 +934,54 @@ pub fn build_midi_event_world(
 
     // Shared reset signal: last tick's playback time, and whether it jumped
     // backward (a restart or a loop wrap). Fanned out to every speaker's reset.
-    let prev = gate(&mut sc.chip, "B_1x1_Gate_Pseudo_BufferTicks", BUFFER_TICKS, next_pos(), vec![(
+    let prev = gate(&mut sc.chip, "B_1x1_Gate_Pseudo_BufferTicks", BUFFER_TICKS, shared_pos(), vec![(
         "TicksToWait",
         Box::new(1i32) as Box<dyn AsBrdbValue>,
     )]);
     world.add_wire_connection(play_time.clone(), WirePort::new(prev, BUFFER_TICKS, "Input"));
-    let decreased = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareLess", COMPARE_LESS, next_pos(), vec![]);
+    let decreased = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareLess", COMPARE_LESS, shared_pos(), vec![]);
     world.add_wire_connection(play_time.clone(), WirePort::new(decreased, COMPARE_LESS, "InputA"));
     world.add_wire_connection(WirePort::new(prev, BUFFER_TICKS, "Output"), WirePort::new(decreased, COMPARE_LESS, "InputB"));
 
     // --- 3. Per-speaker playhead ---------------------------------------------
     for (v, voice) in score.voices.iter().enumerate() {
+        // This voice's whole playhead lives on its OWN row, in a fixed
+        // left-to-right column order -- the repeating strip. Voice 0 sits just
+        // below the shared row; each next voice is one row further along, so the
+        // voices stack instead of running end-to-end.
+        let row = SHARED_ROW - 1 - v as i32;
+        let mut col = 0i32;
+        let mut vpos = || {
+            let p = service(col, row);
+            col += 1;
+            p
+        };
         // The events, packed one quat each: (start, end, pitch, vol) = (X,Y,Z,W).
         let events: Vec<(f64, f64, f64, f64)> = voice
             .notes
             .iter()
             .map(|n| (n.start_s, n.end_s, n.pitch, n.volume))
             .collect();
-        let events_arr = gate(&mut sc.chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, next_pos(), vec![(
+        let events_arr = gate(&mut sc.chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, vpos(), vec![(
             "Value",
             Box::new(WireArrayVariant::QuatArray(events)) as Box<dyn AsBrdbValue>,
         )]);
         // The playhead index register (starts 0).
-        let idx_var = gate(&mut sc.chip, "B_1x1_Gate_Variable", VAR, next_pos(), vec![(
+        let idx_var = gate(&mut sc.chip, "B_1x1_Gate_Variable", VAR, vpos(), vec![(
             "Value",
             Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
         )]);
         // This speaker's per-tick exec pulse (own detector, no cross-speaker
         // chaining -- the reset/advance branches would break a shared chain).
-        let detector = gate(&mut sc.chip, "B_1x1_Gate_Expr_ChangeDetectorExec", CHANGE_DETECTOR, next_pos(), vec![]);
+        let detector = gate(&mut sc.chip, "B_1x1_Gate_Expr_ChangeDetectorExec", CHANGE_DETECTOR, vpos(), vec![]);
         world.add_wire_connection(play_time.clone(), WirePort::new(detector, CHANGE_DETECTOR, "Input"));
 
         // Read the current event and break it into its four floats.
-        let get = gate(&mut sc.chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, next_pos(), vec![]);
+        let get = gate(&mut sc.chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, vpos(), vec![]);
         world.add_wire_connection(WirePort::new(events_arr, ARRAY_VAR, "ArrayVarRef"), WirePort::new(get, ARRAY_GET, "ArrayVarRef"));
         world.add_wire_connection(WirePort::new(idx_var, VAR, "Value"), WirePort::new(get, ARRAY_GET, "Index"));
         world.add_wire_connection(WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"), WirePort::new(get, ARRAY_GET, "Exec"));
-        let split = gate(&mut sc.chip, "B_1x1_Gate_Expr_SplitQuaternion", SPLIT_QUAT, next_pos(), vec![]);
+        let split = gate(&mut sc.chip, "B_1x1_Gate_Expr_SplitQuaternion", SPLIT_QUAT, vpos(), vec![]);
         world.add_wire_connection(WirePort::new(get, ARRAY_GET, "Value"), WirePort::new(split, SPLIT_QUAT, "Input"));
         let start = WirePort::new(split, SPLIT_QUAT, "X");
         let end = WirePort::new(split, SPLIT_QUAT, "Y");
@@ -971,10 +989,10 @@ pub fn build_midi_event_world(
         let vol = WirePort::new(split, SPLIT_QUAT, "W");
 
         // Reset first: if playback time jumped backward, set the index to 0.
-        let br_reset = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, next_pos(), vec![]);
+        let br_reset = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
         world.add_wire_connection(WirePort::new(decreased, COMPARE_LESS, "bOutput"), WirePort::new(br_reset, BRANCH, "bCond"));
         world.add_wire_connection(WirePort::new(get, ARRAY_GET, "ExecOut"), WirePort::new(br_reset, BRANCH, "Exec"));
-        let var_set = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, next_pos(), vec![(
+        let var_set = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, vpos(), vec![(
             "Value",
             Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
         )]);
@@ -982,16 +1000,16 @@ pub fn build_midi_event_world(
         world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutA"), WirePort::new(var_set, VAR_SET, "Exec"));
 
         // Advance: on the no-reset exec, if Time > end and in bounds, idx += 1.
-        let gt_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreater", COMPARE_GREATER, next_pos(), vec![]);
+        let gt_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreater", COMPARE_GREATER, vpos(), vec![]);
         world.add_wire_connection(play_time.clone(), WirePort::new(gt_end, COMPARE_GREATER, "InputA"));
         world.add_wire_connection(end.clone(), WirePort::new(gt_end, COMPARE_GREATER, "InputB"));
-        let br_time = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, next_pos(), vec![]);
+        let br_time = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
         world.add_wire_connection(WirePort::new(gt_end, COMPARE_GREATER, "bOutput"), WirePort::new(br_time, BRANCH, "bCond"));
         world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutB"), WirePort::new(br_time, BRANCH, "Exec"));
-        let br_oob = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, next_pos(), vec![]);
+        let br_oob = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
         world.add_wire_connection(WirePort::new(get, ARRAY_GET, "bOutOfBounds"), WirePort::new(br_oob, BRANCH, "bCond"));
         world.add_wire_connection(WirePort::new(br_time, BRANCH, "ExecOutA"), WirePort::new(br_oob, BRANCH, "Exec"));
-        let inc = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, next_pos(), vec![(
+        let inc = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, vpos(), vec![(
             "Value",
             Box::new(WireVariant::Int(1)) as Box<dyn AsBrdbValue>,
         )]);
@@ -999,20 +1017,20 @@ pub fn build_midi_event_world(
         world.add_wire_connection(WirePort::new(br_oob, BRANCH, "ExecOutB"), WirePort::new(inc, VAR_INCREMENT, "Exec"));
 
         // volume = (t >= start) ? ((t <= end) ? vol : 0) : 0
-        let ge_start = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE, next_pos(), vec![]);
+        let ge_start = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE, vpos(), vec![]);
         world.add_wire_connection(play_time.clone(), WirePort::new(ge_start, COMPARE_GE, "InputA"));
         world.add_wire_connection(start, WirePort::new(ge_start, COMPARE_GE, "InputB"));
-        let le_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareLessOrEqual", COMPARE_LE, next_pos(), vec![]);
+        let le_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareLessOrEqual", COMPARE_LE, vpos(), vec![]);
         world.add_wire_connection(play_time.clone(), WirePort::new(le_end, COMPARE_LE, "InputA"));
         world.add_wire_connection(end, WirePort::new(le_end, COMPARE_LE, "InputB"));
 
-        let vol_inner = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, next_pos(), vec![(
+        let vol_inner = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, vpos(), vec![(
             "InputA",
             Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
         )]);
         world.add_wire_connection(WirePort::new(le_end, COMPARE_LE, "bOutput"), WirePort::new(vol_inner, SELECT, "bSelectB"));
         world.add_wire_connection(vol, WirePort::new(vol_inner, SELECT, "InputB"));
-        let vol_gated = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, next_pos(), vec![(
+        let vol_gated = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, vpos(), vec![(
             "InputA",
             Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
         )]);
@@ -1562,5 +1580,57 @@ mod tests {
         let world = build_voice_world(&voice_streams(5, 8, o.fps), &o).expect("build");
         let names = written_audio_asset_names(&world);
         assert_eq!(names, vec!["BA_Synth_Basic_Triangle".to_string()], "{names:?}");
+    }
+
+    /// A score of `voices` speakers, each a couple of in-range notes -- enough
+    /// to build a real world through [`build_midi_event_world`].
+    fn midi_score(voices: usize) -> crate::midi::MidiScore {
+        use crate::midi::{NoteSpan, SpeakerVoice};
+        let notes = vec![
+            NoteSpan { start_s: 0.0, end_s: 0.5, pitch: 1.0, volume: 1.0 },
+            NoteSpan { start_s: 0.5, end_s: 1.0, pitch: 2.0, volume: 0.8 },
+        ];
+        crate::midi::MidiScore {
+            voices: (0..voices)
+                .map(|i| SpeakerVoice { notes: notes.clone(), synth: SynthWave::Sine, instrument_idx: i })
+                .collect(),
+            duration_s: 1.0,
+        }
+    }
+
+    /// The in-chip speaker cluster sits entirely above the gate layer, whatever
+    /// the speaker count. Every gate this crate places in a chip lives at
+    /// lattice stage 0, so its top is fixed; keeping every speaker's floor at or
+    /// above that top is the invariant that lets the playhead lattice grow as
+    /// wide as a large score needs without ever colliding with the speakers.
+    #[test]
+    fn in_chip_speakers_clear_the_gate_layer() {
+        let gate_top = STAGE_BASE_Z + 2 * GATE_HALF.z;
+        let half = speaker_half();
+        for total in [1usize, 8, 32, 200] {
+            for i in 0..total {
+                let bottom = speaker_inner_position(i, total).z - half.z;
+                assert!(
+                    bottom >= gate_top,
+                    "speaker {i}/{total} floor {bottom} must sit at or above the gate top {gate_top}"
+                );
+            }
+        }
+    }
+
+    /// A large MIDI placed IN the microchip builds without an overlap error.
+    /// The playhead grows the inner gate lattice along BOTH x (rows) and y
+    /// (columns), so a wide enough score used to push the gates into the old
+    /// sideways-offset speaker block; stacking the speakers onto their own z
+    /// plane above the gates keeps them clear. `finish` runs the inner-grid
+    /// overlap check, so an overlap surfaces as an `Err` here.
+    #[test]
+    fn a_large_in_chip_midi_places_without_overlap() {
+        let score = midi_score(24);
+        let opts = crate::midi::MidiOptions { speakers_in_chip: true, ..Default::default() };
+        build_midi_event_world(&score, &opts).expect("a large in-chip MIDI must not overlap");
+        // ...and the same score beside the chip (the default) still builds too.
+        let opts = crate::midi::MidiOptions { speakers_in_chip: false, ..Default::default() };
+        build_midi_event_world(&score, &opts).expect("the beside-the-chip layout must build");
     }
 }

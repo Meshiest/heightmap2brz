@@ -34,6 +34,49 @@ pub fn settings_grid(ui: &egui::Ui, id: &str) -> egui::Grid {
 /// it.
 pub const LABEL_COLUMN_WIDTH: f32 = 112.0;
 
+/// The "Save Destination" settings row shared by every generator: the
+/// (native-only) clipboard toggle and a full-height file-name field. A row in a
+/// [`theme::widgets::settings_table`](crate::gui::theme::widgets::settings_table).
+pub fn save_destination_row(
+    t: &mut crate::gui::theme::widgets::SettingsTable,
+    ui: &mut egui::Ui,
+    shared: &mut crate::gui::SharedOptions,
+) {
+    use crate::gui::theme::widgets;
+    t.row_hover(
+        ui,
+        "Save Destination",
+        Some("The save will be created relative to the location of the exe."),
+        |ui| {
+            #[cfg(not(target_arch = "wasm32"))]
+            widgets::toggle(ui, &mut shared.out_clipboard, "Copy to clipboard")
+                .on_hover_text("Copy the save file path to clipboard after generation");
+            widgets::text_field(ui, &mut shared.out_file, "File Name");
+        },
+    );
+}
+
+/// The out-file Warning/Note row for a [`settings_table`](crate::gui::theme::widgets::settings_table)
+/// — a labeled, indented row rather than a bare cell.
+pub fn out_file_warning_row(
+    t: &mut crate::gui::theme::widgets::SettingsTable,
+    ui: &mut egui::Ui,
+    out_file: &str,
+) {
+    if let Some(problem) = out_file_problem(out_file) {
+        t.row(ui, "Warning", |ui| {
+            ui.colored_label(egui::Color32::RED, problem);
+        });
+    } else if out_file_exists(out_file) {
+        t.row(ui, "Note", |ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 200, 100),
+                "A save already exists at this name and will be overwritten",
+            );
+        });
+    }
+}
+
 /// Pin a pane to the width it was handed and make text wrap by default.
 /// Called once at the top of a pane's `draw`: `style.wrap_mode` is the first
 /// thing `Ui::wrap_mode` consults, ahead of the fallbacks that otherwise
@@ -50,32 +93,44 @@ pub fn note(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
     ui.add(egui::Label::new(text.into()).wrap())
 }
 
+/// Height of an accordion-header badge, in points. Deliberately short: the
+/// badge should hug its 10px label, not tower over it.
+const CHIP_HEIGHT: f32 = 15.0;
+
 /// A small rounded badge for one value in an accordion header. Uses
 /// `strong_text_color` (not the muted label colour) since it's read against a
-/// filled background; zero vertical margin since `RichText::small` is already
-/// shorter than a normal row.
+/// filled background.
+///
+/// Hand-painted rather than a `Label` in a `Frame`, because the badge height
+/// *cannot* be controlled that way: this theme bundles Font Awesome as a
+/// fallback in every font family, and egui sizes a galley's rows to the TALLEST
+/// face in the family -- so a 10px text label lays out at FA's (scaled 1.2) row
+/// height and the pill stands far taller than its text, which no `size` /
+/// `line_height` / margin tweak brings down. We instead allocate a short fixed
+/// rect and paint the (tall-rowed) galley centred in it, so only the ~10px ink
+/// shows and the badge is exactly [`CHIP_HEIGHT`] tall.
 pub fn chip(ui: &mut egui::Ui, text: &str) -> egui::Response {
     let (fill, stroke, text_color) = {
         let w = ui.visuals().widgets.inactive;
         (w.bg_fill, w.bg_stroke, ui.visuals().strong_text_color())
     };
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin {
-            left: 5,
-            right: 5,
-            top: 0,
-            bottom: 0,
-        })
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(egui::RichText::new(text).small().color(text_color))
-                    .selectable(false),
-            );
-        })
-        .response
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::new(10.0, egui::FontFamily::Proportional),
+        text_color,
+    );
+    let size = egui::vec2(galley.rect.width() + 12.0, CHIP_HEIGHT);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(4),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(rect.center() - galley.rect.size() * 0.5, galley, text_color);
+    resp
 }
 
 /// One collapsible block of settings: a name plus a row of value [`chip`]s.
@@ -91,38 +146,91 @@ pub fn section(
     open_by_default: bool,
     body: impl FnOnce(&mut egui::Ui),
 ) {
+    use crate::gui::theme::{self, icons, widgets};
+
     let id = ui.make_persistent_id(id_salt);
-    // Whole row toggles. selectable_labels defaults ON, so a plain label
-    // wins the hit-test over the row; title+chips use .selectable(false).
-    // The interaction rect is widened, never allocated: a zero-height
-    // wrapped item still costs one item_spacing.y.
-    let mut row_clicked = false;
-    let mut header = egui::collapsing_header::CollapsingState::load_with_default_open(
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
         id,
         open_by_default,
-    )
-    .show_header(ui, |ui| {
-        let row = ui.horizontal_wrapped(|ui| {
-            ui.add(egui::Label::new(egui::RichText::new(title).strong()).selectable(false));
-            for c in chips {
-                chip(ui, c);
-            }
-        });
-        let mut hit = row.response.rect;
-        hit.max.x = hit.max.x.max(ui.max_rect().right());
-        row_clicked = ui
-            .interact(hit, row.response.id, egui::Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked();
-    });
-    if row_clicked {
-        header.toggle();
+    );
+    let open = state.is_open();
+
+    // A dark header band (matching a `widgets::section` header) with an FA
+    // chevron, the title and its value chips. The whole band toggles.
+    let pad = widgets::CELL_PAD as i8;
+    let width = ui.available_width();
+    let r = theme::RADIUS;
+    // The header rounds all four corners when closed; when open it rounds only
+    // its top, so it fuses flush with the body card directly below.
+    let header_radius = if open {
+        egui::CornerRadius { nw: r, ne: r, sw: 0, se: 0 }
+    } else {
+        egui::CornerRadius::same(r)
+    };
+    let header = egui::Frame::new()
+        .fill(theme::SURFACE_HEADER)
+        .corner_radius(header_radius)
+        .inner_margin(egui::Margin { left: pad, right: pad, top: 4, bottom: 4 })
+        .show(ui, |ui| {
+            ui.set_min_width(width - 2.0 * widgets::CELL_PAD);
+            ui.horizontal_wrapped(|ui| {
+                // Fixed-width (1.5em) centered chevron so the title never shifts
+                // horizontally when the icon swaps between right/down.
+                let chevron = if open { icons::CHEVRON_DOWN } else { icons::CHEVRON_RIGHT };
+                let em = ui.text_style_height(&egui::TextStyle::Body);
+                let (r, _) = ui.allocate_exact_size(egui::vec2(em * 1.5, em), egui::Sense::hover());
+                ui.painter().text(
+                    r.center().round(),
+                    egui::Align2::CENTER_CENTER,
+                    chevron,
+                    egui::FontId::new(em, theme::icon_family()),
+                    ui.visuals().strong_text_color(),
+                );
+                // Never wrap the title: the pane sets a global `Wrap` mode, and
+                // under it a narrow header allocates the title less width than
+                // its galley, so the text overflows left and rides up onto the
+                // chevron. `Extend` gives it its natural width, placed cleanly
+                // after the chevron; only the chips (below) wrap.
+                ui.add(
+                    egui::Label::new(egui::RichText::new(title.to_uppercase()).strong())
+                        .selectable(false)
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+                for c in chips {
+                    chip(ui, c);
+                }
+            });
+        })
+        .response;
+    if ui
+        .interact(header.rect, id.with("hdr"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        state.toggle(ui);
     }
-    // The triangle is a separate widget from the row, so it needs saying
-    // twice or the cursor changes over most of the header and not all of it.
-    let (toggle_button, _, _) = header.body(body);
-    toggle_button.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    // Body: a lighter card flush UNDER the header band -- kill the inter-widget
+    // gap so the two touch, and round only its bottom corners so header + body
+    // read as one card.
+    let prev_gap = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    state.show_body_unindented(ui, |ui| {
+        egui::Frame::new()
+            // Darker than the surrounding Settings card so the accordion body
+            // reads as a distinct nested card.
+            .fill(theme::BG_SECONDARY_ALT)
+            .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: r, se: r })
+            .inner_margin(egui::Margin::same(pad))
+            .show(ui, |ui| {
+                ui.set_min_width(width - 2.0 * widgets::CELL_PAD);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                body(ui);
+            });
+    });
+    ui.spacing_mut().item_spacing.y = prev_gap;
+    state.store(ui.ctx());
 }
 
 /// An image the user picked, already decoded -- works identically on native
@@ -511,6 +619,12 @@ pub fn copy_path_to_clipboard(out_file: &str) -> Result<(), String> {
         .unwrap_or_else(|_| std::path::PathBuf::from(out_file))
         .to_string_lossy()
         .to_string();
+
+    // Strip the Windows verbatim-path prefix (`\\?\`) that `canonicalize` adds,
+    // so the clipboard gets a plain `C:\...` path.
+    if let Some(stripped) = full_path.strip_prefix(r"\\?\") {
+        full_path = stripped.to_string();
+    }
 
     // lowercase the first letter
     full_path.get_mut(0..1).map(|s| s.make_ascii_lowercase());

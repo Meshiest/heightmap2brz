@@ -1,6 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use heightmap::gui::{BrzApp, logger};
+use heightmap::gui::{BrzApp, logger, theme};
 use log::info;
 
 // run the window with glium
@@ -20,6 +20,7 @@ fn main() -> Result<(), eframe::Error> {
         },
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            theme::install(&cc.egui_ctx);
             info!("Select a tab to get started.");
             Ok(Box::<BrzApp>::default())
         }),
@@ -49,6 +50,7 @@ fn main() {
                 eframe::WebOptions::default(),
                 Box::new(|cc| {
                     egui_extras::install_image_loaders(&cc.egui_ctx);
+                    theme::install(&cc.egui_ctx);
                     info!("Select a tab to get started.");
                     Ok(Box::<BrzApp>::default())
                 }),

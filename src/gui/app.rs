@@ -3,19 +3,24 @@ use crate::gui::audio::AudioApp;
 use crate::gui::heightmap::HeightmapApp;
 use crate::gui::midi::MidiApp;
 use crate::gui::text::TextApp;
+use crate::gui::theme::{self, icons, widgets};
 use crate::gui::video::VideoApp;
 use eframe::App;
-use egui::{CentralPanel, Color32, Context, Id, ScrollArea, TopBottomPanel, Ui};
+use egui::{Align2, CentralPanel, Color32, Context, FontId, Id, ScrollArea, TopBottomPanel, Ui};
 
 /// A homepage tool card is at least this wide; the grid picks a column count
 /// from the view width so the cards fill it and reflow as the window resizes.
 const MIN_CARD_W: f32 = 240.0;
 /// Card height, tall enough for the longest description to wrap at the minimum
 /// card width without clipping.
-const CARD_H: f32 = 112.0;
+const CARD_H: f32 = 132.0;
 /// Gap between cards, and the padding inside one.
 const CARD_GAP: f32 = 10.0;
 const CARD_PAD: f32 = 12.0;
+/// Side length of a card's accent icon square.
+const CARD_ICON: f32 = 56.0;
+/// Horizontal padding around the scrolling content and the header bar.
+const PAGE_PAD: i8 = 12;
 
 pub struct BrzApp {
     always_on_top: bool,
@@ -63,6 +68,31 @@ impl Menu {
         Menu::Audio,
         Menu::Midi,
     ];
+
+    /// The Font Awesome glyph for this tool, shown on its homepage card and in
+    /// its view header.
+    pub const fn icon(&self) -> &'static str {
+        match self {
+            Menu::Image => icons::IMAGE,
+            Menu::Text => icons::FONT,
+            Menu::Heightmap => icons::MOUNTAIN,
+            Menu::Video => icons::FILM,
+            Menu::Audio => icons::WAVE_SQUARE,
+            Menu::Midi => icons::MUSIC,
+        }
+    }
+
+    /// Per-tool accent color for the homepage card's icon square.
+    pub const fn accent(&self) -> Color32 {
+        match self {
+            Menu::Image => Color32::from_rgb(0x00, 0x9b, 0xee),     // blue
+            Menu::Heightmap => Color32::from_rgb(0x5d, 0xa9, 0x3d), // green
+            Menu::Text => Color32::from_rgb(0xff, 0xa1, 0x0b),      // orange
+            Menu::Video => Color32::from_rgb(0xe0, 0x2d, 0x2d),     // red
+            Menu::Audio => Color32::from_rgb(0x9b, 0x5d, 0xe5),     // purple
+            Menu::Midi => Color32::from_rgb(0x00, 0xbf, 0xa6),      // teal
+        }
+    }
 
     /// One-line description, shown under the card title and in each view's top
     /// bar.
@@ -117,28 +147,43 @@ impl Default for SharedOptions {
 }
 
 impl BrzApp {
-    /// The homepage: the app header (title, version, repo link, always-on-top)
-    /// above a reflowing grid of tool cards.
-    fn draw_home(&mut self, ui: &mut Ui) {
-        self.draw_header(ui);
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(10.0);
+    /// The homepage tool grid, rendered inside the scrolling central panel.
+    /// Laid out as explicit rows of `cols` cards (rather than
+    /// `horizontal_wrapped`, whose exactly-fits wrapping is fragile) so the tiles
+    /// stay a uniform grid with even gaps.
+    fn draw_home_grid(&mut self, ui: &mut Ui) {
+        // Equal horizontal and vertical gaps: item_spacing governs BOTH the gap
+        // between cards in a row and between the rows themselves.
+        ui.spacing_mut().item_spacing = egui::vec2(CARD_GAP, CARD_GAP);
+        let avail = ui.available_width();
+        let cols = ((avail + CARD_GAP) / (MIN_CARD_W + CARD_GAP)).floor().max(1.0) as usize;
+        let card_w = ((avail - CARD_GAP * (cols as f32 - 1.0)) / cols as f32).floor();
 
-        ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(CARD_GAP, CARD_GAP);
-            // Pick a column count from the view width so the cards fill it, then
-            // give every card an equal share of the row (minus the gaps).
-            let avail = ui.available_width();
-            let cols = ((avail + CARD_GAP) / (MIN_CARD_W + CARD_GAP)).floor().max(1.0);
-            let card_w = ((avail - CARD_GAP * (cols - 1.0)) / cols).floor();
-            ui.horizontal_wrapped(|ui| {
-                for menu in Menu::ALL {
+        let mut clicked = None;
+        for chunk in Menu::ALL.chunks(cols) {
+            ui.horizontal(|ui| {
+                for &menu in chunk {
                     if Self::menu_card(ui, menu, card_w) {
-                        self.pane = Some(menu);
+                        clicked = Some(menu);
                     }
                 }
             });
+        }
+        if let Some(menu) = clicked {
+            self.pane = Some(menu);
+        }
+    }
+
+    /// The scrolling content area: the scrollbar is locked to the window's right
+    /// edge (the scroll area is full-width) while the content is padded inside,
+    /// so the bar never rides in from the margin. A `Frame` (not the panel) so
+    /// the header/footer panels above and below stay flush.
+    fn scroll_body(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // Top margin matches the sides so the first card is evenly inset.
+            egui::Frame::new()
+                .inner_margin(egui::Margin { left: PAGE_PAD, right: PAGE_PAD, top: PAGE_PAD, bottom: PAGE_PAD })
+                .show(ui, |ui| add(ui));
         });
     }
 
@@ -149,10 +194,7 @@ impl BrzApp {
             ui.heading("brz tools");
             ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .checkbox(&mut self.always_on_top, "Always on top")
-                    .changed()
-                {
+                if widgets::toggle(ui, &mut self.always_on_top, "Always on top").changed() {
                     ui.ctx()
                         .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                             if self.always_on_top {
@@ -164,113 +206,147 @@ impl BrzApp {
                 }
             });
         });
-        ui.hyperlink("https://github.com/brickadia-community/heightmap2brz");
+        ui.hyperlink_to(
+            format!("{}  brickadia-community/heightmap2brz", icons::UP_RIGHT_FROM_SQUARE),
+            "https://github.com/brickadia-community/heightmap2brz",
+        );
         ui.label("Convert images, heightmaps, video, audio, and MIDI into Brickadia save files.");
         egui::warn_if_debug_build(ui);
     }
 
-    /// One clickable tool card of the given width: a framed panel whose title
-    /// (heading) sits above its wrapped description. Returns whether it was
-    /// clicked.
+    /// One clickable tool card of the given width: a big per-tool icon in a
+    /// rounded accent-colored square on the left, with the title and wrapped
+    /// description stacked to its right (like omegga's menu buttons). Returns
+    /// whether it was clicked.
     ///
-    /// The content is laid out top-down (the parent grid is horizontal, which
-    /// would otherwise put the description beside the title), bounded to the
-    /// card width so the description wraps instead of overrunning its
-    /// neighbours. The background is painted in a second pass -- reserve a shape
-    /// slot, lay out the content, then fill the slot from the card's own
-    /// interaction visuals -- so it highlights on hover, which a `Frame` fill
-    /// (drawn before the hover state is known) cannot do.
+    /// Allocated at an EXACT `width` x [`CARD_H`] so every card is identical
+    /// regardless of description length; the text is drawn in a clipped child so
+    /// an over-long description is trimmed rather than growing the card (which
+    /// would desync the grid rows and gaps).
     fn menu_card(ui: &mut Ui, menu: Menu, width: f32) -> bool {
-        let interior = width - 2.0 * CARD_PAD;
-        let inner = ui.allocate_ui_with_layout(
-            egui::vec2(width, CARD_H),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                let bg = ui.painter().add(egui::Shape::Noop);
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::same(CARD_PAD as i8))
-                    .show(ui, |ui| {
-                        ui.set_min_size(egui::vec2(interior, CARD_H - 2.0 * CARD_PAD));
-                        ui.set_max_width(interior);
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(menu.as_ref()).heading().strong())
-                                .selectable(false),
-                        );
-                        ui.add_space(4.0);
-                        ui.add(egui::Label::new(menu.description()).selectable(false).wrap());
-                    });
-                bg
-            },
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, CARD_H), egui::Sense::click());
+
+        // Fill only, no stroke — cards have no outline. Painted from the card's
+        // own interaction visuals so it highlights on hover.
+        let fill = ui.style().interact(&response).bg_fill;
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(8), fill);
+
+        let inner = rect.shrink(CARD_PAD);
+        // Accent square with the big white tool icon, vertically centered.
+        let sq = egui::Rect::from_min_size(
+            egui::pos2(inner.left(), inner.center().y - CARD_ICON / 2.0),
+            egui::vec2(CARD_ICON, CARD_ICON),
         );
-        let bg = inner.inner;
-        let response = inner.response.interact(egui::Sense::click());
-        // Release the style borrow before touching the painter again.
-        let (fill, stroke) = {
-            let v = ui.style().interact(&response);
-            (v.bg_fill, v.bg_stroke)
-        };
-        ui.painter().set(
-            bg,
-            egui::epaint::RectShape::new(
-                response.rect,
-                egui::CornerRadius::same(6),
-                fill,
-                stroke,
-                egui::StrokeKind::Inside,
-            ),
+        ui.painter().rect_filled(sq, egui::CornerRadius::same(12), menu.accent());
+        ui.painter().text(
+            sq.center().round(),
+            Align2::CENTER_CENTER,
+            menu.icon(),
+            FontId::new(CARD_ICON * 0.55, theme::icon_family()),
+            Color32::WHITE,
         );
-        response
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
+
+        // Title (white) + wrapped description, painted DIRECTLY (galleys, not
+        // widgets) and clipped to the remaining area. Painting rather than
+        // adding widgets is essential: a child `Ui` would allocate space in the
+        // parent row and shove the next card over.
+        let text_rect =
+            egui::Rect::from_min_max(egui::pos2(sq.right() + 8.0, inner.top()), inner.max);
+        // Intersect with the current clip (the scroll viewport) — NOT replace it
+        // — or a card scrolled off-screen would paint its text over the log below.
+        let painter = ui.painter().with_clip_rect(text_rect.intersect(ui.clip_rect()));
+        let title = painter.layout_no_wrap(
+            menu.as_ref().to_owned(),
+            egui::TextStyle::Heading.resolve(ui.style()),
+            Color32::WHITE,
+        );
+        let title_h = title.size().y;
+        painter.galley(text_rect.min, title, Color32::WHITE);
+        let desc = painter.layout(
+            menu.description().to_owned(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            theme::TEXT,
+            text_rect.width(),
+        );
+        painter.galley(
+            egui::pos2(text_rect.left(), text_rect.top() + title_h + 2.0),
+            desc,
+            theme::TEXT,
+        );
+
+        response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
     }
 
-    /// An open tool: a top bar (back button, then the tool's title and
-    /// description) above the tool's own scrolling content.
-    fn draw_view(&mut self, ui: &mut Ui, ctx: &Context, menu: Menu) {
+    /// An open tool's top bar: back button, then the tool's title and
+    /// description. Lives in the dark header panel.
+    fn draw_view_header(&mut self, ui: &mut Ui, menu: Menu) {
         ui.horizontal(|ui| {
-            // `\u{2B05}` (heavy leftwards arrow) is in the bundled emoji font
-            // that already renders `✖` elsewhere, unlike the plain arrow
-            // `\u{2190}`, which has no glyph and shows a tofu box.
-            if ui
-                .add_sized([88.0, 34.0], egui::Button::new("\u{2B05} Back"))
+            // Font Awesome's arrow, from the theme's bundled solid face — no
+            // more relying on the emoji font's heavy arrow to dodge tofu.
+            if widgets::neutral(ui, format!("{}  Back", icons::ARROW_LEFT))
                 .on_hover_text("Return to the tool list")
                 .clicked()
             {
                 self.pane = None;
             }
-            ui.separator();
+            ui.add_space(4.0);
             ui.vertical(|ui| {
-                ui.heading(menu.as_ref());
+                ui.heading(format!("{}  {}", menu.icon(), menu.as_ref()));
                 ui.label(menu.description());
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak());
             });
         });
-        ui.separator();
-        ui.add_space(4.0);
+    }
 
-        ScrollArea::vertical().show(ui, |ui| match menu {
-            Menu::Image => self.heightmap.draw(ui, ctx, &mut self.shared, true),
-            Menu::Heightmap => self.heightmap.draw(ui, ctx, &mut self.shared, false),
+    /// A tool's scrolling content (file selection + settings).
+    fn draw_view_content(&mut self, ui: &mut Ui, menu: Menu) {
+        match menu {
+            Menu::Image => self.heightmap.draw(ui, &mut self.shared, true),
+            Menu::Heightmap => self.heightmap.draw(ui, &mut self.shared, false),
             Menu::Text => self.text.draw(ui, &mut self.shared),
             Menu::Video => self.video.draw(ui, &mut self.shared),
             Menu::Audio => self.audio.draw(ui, &mut self.shared),
             Menu::Midi => self.midi.draw(ui, &mut self.shared),
-        });
+        }
+    }
+
+    /// A tool's fixed footer (progress + submit buttons), in the dark footer
+    /// panel between the scroll area and the log.
+    fn draw_view_footer(&mut self, ui: &mut Ui, ctx: &Context, menu: Menu) {
+        match menu {
+            Menu::Image => self.heightmap.draw_footer(ui, ctx, &mut self.shared, true),
+            Menu::Heightmap => self.heightmap.draw_footer(ui, ctx, &mut self.shared, false),
+            Menu::Text => self.text.draw_footer(ui, &mut self.shared),
+            Menu::Video => self.video.draw_footer(ui, &mut self.shared),
+            Menu::Audio => self.audio.draw_footer(ui, &mut self.shared),
+            Menu::Midi => self.midi.draw_footer(ui, &mut self.shared),
+        }
     }
 }
 
 impl App for BrzApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // The log console is a real bottom panel now, so it shows under both the
-        // homepage and any open tool. Added before the central panel so it
-        // reserves its space first.
+        let pane = self.pane;
+
+        // Dark header panel (flush with the scroll below — no gap).
+        TopBottomPanel::top(Id::new("header"))
+            .frame(header_frame(egui::Margin { left: PAGE_PAD, right: PAGE_PAD, top: 8, bottom: 8 }))
+            .show(ctx, |ui| match pane {
+                None => self.draw_header(ui),
+                Some(menu) => self.draw_view_header(ui, menu),
+            });
+
+        // The log console at the very bottom (added first so it reserves the
+        // lowest strip; the footer panel then stacks above it).
         TopBottomPanel::bottom(Id::new("logs"))
             .min_height(30.0)
             .resizable(true)
             .frame(egui::Frame {
-                fill: Color32::BLACK,
+                // Near-black, darker than the navy footer above it, so the log
+                // reads as its own distinct strip.
+                fill: Color32::from_rgb(0x02, 0x04, 0x09),
                 inner_margin: 4.0.into(),
                 outer_margin: 0.0.into(),
                 ..Default::default()
@@ -279,9 +355,35 @@ impl App for BrzApp {
                 logger::draw(ui);
             });
 
-        CentralPanel::default().show(ctx, |ui| match self.pane {
-            None => self.draw_home(ui),
-            Some(menu) => self.draw_view(ui, ctx, menu),
-        });
+        // Fixed footer with the tool's progress + submit, above the log.
+        if let Some(menu) = pane {
+            TopBottomPanel::bottom(Id::new("footer"))
+                .frame(header_frame(egui::Margin {
+                    left: PAGE_PAD,
+                    right: PAGE_PAD,
+                    top: 8,
+                    bottom: 8,
+                }))
+                .show(ctx, |ui| self.draw_view_footer(ui, ctx, menu));
+        }
+
+        // No panel margin: the scroll area's scrollbar reaches the window edge;
+        // content padding is applied inside (`scroll_body`).
+        CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::SURFACE_PAGE))
+            .show(ctx, |ui| {
+                Self::scroll_body(ui, |ui| match pane {
+                    None => self.draw_home_grid(ui),
+                    Some(menu) => self.draw_view_content(ui, menu),
+                });
+            });
     }
+}
+
+/// A dark header/footer panel frame (section-header color) with the given
+/// content margin.
+fn header_frame(inner: egui::Margin) -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::SURFACE_HEADER)
+        .inner_margin(inner)
 }

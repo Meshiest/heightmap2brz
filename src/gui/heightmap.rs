@@ -4,8 +4,8 @@ use crate::{
     gui::{
         SharedOptions,
         util::{
-            PickedImage, deliver_world, draw_out_file_warnings, maps_from_images, pick_images,
-            refuse_bad_out_file, thumb,
+            PickedImage, bound_pane_width, deliver_world, maps_from_images, out_file_warning_row,
+            pick_images, refuse_bad_out_file, save_destination_row, thumb,
         },
     },
     opt::*,
@@ -14,7 +14,8 @@ use crate::{
 use brdb::assets::bricks::{
     PB_DEFAULT_BRICK, PB_DEFAULT_MICRO_BRICK, PB_DEFAULT_SMOOTH_TILE, PB_DEFAULT_STUDDED,
 };
-use egui::{Button, Color32, Context, Id, ProgressBar, Ui};
+use crate::gui::theme::{icons, widgets};
+use egui::{Color32, Context, Id, ProgressBar, Ui};
 use log::{error, info};
 use poll_promise::Promise;
 
@@ -298,115 +299,96 @@ impl HeightmapApp {
     }
 
     fn draw_settings(&mut self, ui: &mut Ui, shared: &mut SharedOptions, img_only: bool) {
-        ui.heading("Settings");
+        bound_pane_width(ui);
         ui.label("Configure how the generator outputs the saves as bricks");
 
-        // list of settings
-        egui::Grid::new("settings_grid")
-            .striped(true)
-            .spacing([40.0, 4.0])
-            .show(ui, |ui| {
-                ui.label("Save Destination")
-                    .on_hover_text("The save will be created relative to the location of the exe.");
-                ui.horizontal(|ui| {
-                    // the clipboard flag is meaningless on web (saves are
-                    // delivered as browser downloads)
-                    #[cfg(not(target_arch = "wasm32"))]
-                    ui.checkbox(&mut shared.out_clipboard, "Copy to clipboard")
-                        .on_hover_text("Copy the save file path to clipboard after generation");
+        // Full-width, square-striped settings table (shared widget).
+        widgets::settings_table(ui, |ui, t| {
+            save_destination_row(t, ui, shared);
+            out_file_warning_row(t, ui, &shared.out_file);
 
-                    ui.add(egui::TextEdit::singleline(&mut shared.out_file).hint_text("File Name"));
+            t.row_hover(ui, "Horizontal Scale", Some("The size of each pixel in studs (or microbricks)"), |ui| {
+                widgets::slider(ui, egui::Slider::new(&mut self.horizontal_size, 1..=100).text("studs"));
+            });
+            if !img_only {
+                t.row_hover(ui, "Vertical Size", Some("The height of each shade of grey from the heightmap"), |ui| {
+                    widgets::slider(ui, egui::Slider::new(&mut self.vertical_scale, 1..=100).text("units"));
                 });
-                ui.end_row();
-                draw_out_file_warnings(ui, &shared.out_file);
+            }
 
-                ui.label("Horizontal Scale")
-                    .on_hover_text("The size of each pixel in studs (or microbricks)");
-                ui.add(egui::Slider::new(&mut self.horizontal_size, 1..=100).text("studs"));
-                ui.end_row();
-                if !img_only {
-                    ui.label("Vertical Size")
-                        .on_hover_text("The height of each shade of grey from the heightmap");
-                    ui.add(egui::Slider::new(&mut self.vertical_scale, 1..=100).text("units"));
-                    ui.end_row();
-                }
-
-                ui.label("Optimization")
-                    .on_hover_text("Algorithm used to reduce brick count");
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut self.optimization, OptimizationMode::None, "None")
-                            .on_hover_text("No optimization (~one brick per pixel)");
-                        ui.radio_value(&mut self.optimization, OptimizationMode::Quad, "Quadtree")
+            t.row_hover(ui, "Optimization", Some("Algorithm used to reduce brick count"), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::radio(ui, &mut self.optimization, OptimizationMode::None, "None")
+                        .on_hover_text("No optimization (~one brick per pixel)");
+                    widgets::radio(ui, &mut self.optimization, OptimizationMode::Quad, "Quadtree")
                         .on_hover_text("Use quadtree based optimization. Looks prettier. May use more bricks. Uses a lot of memory for larger maps");
-                        ui.radio_value(&mut self.optimization, OptimizationMode::Greedy, "Greedy")
-                            .on_hover_text("Use greedy mesh for each height level. Uses fewer bricks but slower for images with many colors/heights");
-                    });
-                    if self.optimization == OptimizationMode::Greedy && !self.heightmaps.is_empty() {
-                        ui.colored_label(
-                            Color32::from_rgb(255, 200, 100),
-                            "Note: Greedy meshing does not properly calculate brick heights based on neighbor heights"
-                        );
-                    }
-                    if self.optimization == OptimizationMode::Greedy && self.has_large_image() {
-                        ui.colored_label(
-                            Color32::from_rgb(255, 100, 100),
-                            "Warning: Large images (>1024px) may use excessive memory with greedy optimization"
-                        );
-                    }});
-                ui.end_row();
+                    widgets::radio(ui, &mut self.optimization, OptimizationMode::Greedy, "Greedy")
+                        .on_hover_text("Use greedy mesh for each height level. Uses fewer bricks but slower for images with many colors/heights");
+                });
+                if self.optimization == OptimizationMode::Greedy && !self.heightmaps.is_empty() {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 200, 100),
+                        "Note: Greedy meshing does not properly calculate brick heights based on neighbor heights",
+                    );
+                }
+                if self.optimization == OptimizationMode::Greedy && self.has_large_image() {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 100, 100),
+                        "Warning: Large images (>1024px) may use excessive memory with greedy optimization",
+                    );
+                }
+            });
 
-                ui.label("Options")
-                    .on_hover_text("A list of options for modifying how the generator works");
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.opt_snap, "Snap")
+            t.row_hover(ui, "Options", Some("A list of options for modifying how the generator works"), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::toggle(ui, &mut self.opt_snap, "Snap")
                         .on_hover_text("Snap bricks to the brick grid");
-                    ui.checkbox(&mut self.opt_cull, "Cull").on_hover_text(
+                    widgets::toggle(ui, &mut self.opt_cull, "Cull").on_hover_text(
                         "Automatically remove bottom level bricks and fully transparent bricks\n\
                             In image mode, only transparent bricks are removed",
                     );
-                    ui.checkbox(&mut self.opt_nocollide, "No Collide")
+                    widgets::toggle(ui, &mut self.opt_nocollide, "No Collide")
                         .on_hover_text("Disable brick collision");
-                    ui.checkbox(&mut self.opt_lrgb, "LRGB")
+                    widgets::toggle(ui, &mut self.opt_lrgb, "LRGB")
                         .on_hover_text("Use linear rgb input color instead of sRGB");
-                    ui.checkbox(&mut self.opt_glow, "Glow")
+                    widgets::toggle(ui, &mut self.opt_glow, "Glow")
                         .on_hover_text("Glow bricks at lowest intensity");
                     if !img_only {
-                        ui.checkbox(&mut self.opt_hdmap, "HD Map")
+                        widgets::toggle(ui, &mut self.opt_hdmap, "HD Map")
                             .on_hover_text("Using a high detail rgb color encoded heightmap");
                     }
                 });
-                ui.end_row();
-
-                ui.label("Brick Type")
-                    .on_hover_text("Change which brick type is used for the save file");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.mode, BrickMode::Default, "Default")
-                        .on_hover_text("Use default bricks");
-                    ui.radio_value(&mut self.mode, BrickMode::Tile, "Tile")
-                        .on_hover_text("Use tile bricks");
-                    ui.radio_value(&mut self.mode, BrickMode::SmoothTile, "Smooth")
-                        .on_hover_text("Use smooth tile bricks");
-                    ui.radio_value(&mut self.mode, BrickMode::Stud, "Stud")
-                        .on_hover_text("Use studded bricks");
-                    ui.radio_value(&mut self.mode, BrickMode::Micro, "Micro")
-                        .on_hover_text("Use micro bricks");
-                });
-                ui.end_row();
             });
 
-        ui.add_space(8.0);
-        ui.separator();
+            t.row_hover(ui, "Brick Type", Some("Change which brick type is used for the save file"), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::radio(ui, &mut self.mode, BrickMode::Default, "Default")
+                        .on_hover_text("Use default bricks");
+                    widgets::radio(ui, &mut self.mode, BrickMode::Tile, "Tile")
+                        .on_hover_text("Use tile bricks");
+                    widgets::radio(ui, &mut self.mode, BrickMode::SmoothTile, "Smooth")
+                        .on_hover_text("Use smooth tile bricks");
+                    widgets::radio(ui, &mut self.mode, BrickMode::Stud, "Stud")
+                        .on_hover_text("Use studded bricks");
+                    widgets::radio(ui, &mut self.mode, BrickMode::Micro, "Micro")
+                        .on_hover_text("Use micro bricks");
+                });
+            });
+        });
+    }
 
-        if !img_only {
-            ui.heading("Heightmap Images");
-            ui.label("Select image files to use for save generation.");
-
-            // handle heightmap multiple file selection
-            if ui.button("Select heightmaps").clicked() && self.pending_pick.is_none() {
-                self.pending_pick = Some((PickTarget::Heightmaps, pick_images(true)));
-            }
-
+    /// The heightmap multi-select card body (heightmap mode only).
+    fn draw_heightmaps(&mut self, ui: &mut Ui) {
+        bound_pane_width(ui);
+        ui.label("Select image files to use for save generation.");
+        if widgets::info(ui, format!("{}  Select heightmaps", icons::IMAGE)).clicked()
+            && self.pending_pick.is_none()
+        {
+            self.pending_pick = Some((PickTarget::Heightmaps, pick_images(true)));
+        }
+        // Only draw the (striped) list grid when there are rows — an empty grid
+        // still reserves height, which read as odd extra bottom padding.
+        if !self.heightmaps.is_empty() {
             egui::Grid::new("heightmap_grid")
                 .striped(true)
                 .spacing([8.0, 4.0])
@@ -414,45 +396,34 @@ impl HeightmapApp {
                 .show(ui, |ui| {
                     let mut to_remove = Vec::new();
                     for (i, img) in self.heightmaps.iter().enumerate() {
-                        if ui.add(Button::new("✖")).clicked() {
+                        if widgets::danger_icon(ui, icons::XMARK).clicked() {
                             to_remove.push(i);
                         }
                         thumb(ui, img);
-                        ui.label(&img.name);
+                        ui.add(egui::Label::new(&img.name).truncate());
                         ui.end_row();
                     }
                     for i in to_remove.into_iter().rev() {
                         self.heightmaps.remove(i);
                     }
                 });
-
-            ui.separator();
         }
+    }
 
-        if img_only {
-            ui.heading("Image");
-            ui.label("Select the image to convert into bricks (one brick per pixel, optimized).");
+    /// The colormap / single-image select card body.
+    fn draw_colormap(&mut self, ui: &mut Ui, img_only: bool) {
+        bound_pane_width(ui);
+        ui.label(if img_only {
+            "Select the image to convert into bricks (one brick per pixel, optimized)."
         } else {
-            ui.heading("Colormap Image");
-            ui.label("Select image file to use for heightmap coloring.");
-        }
-
-        // handle colormap single file selection
-        if ui
-            .add(
-                Button::new(if img_only {
-                    "Select image"
-                } else {
-                    "Select colormap"
-                })
-                .fill(Color32::from_rgb(60, 60, 120)),
-            )
-            .clicked()
+            "Select image file to use for heightmap coloring."
+        });
+        let pick_label = if img_only { "Select image" } else { "Select colormap" };
+        if widgets::info(ui, format!("{}  {}", icons::IMAGE, pick_label)).clicked()
             && self.pending_pick.is_none()
         {
             self.pending_pick = Some((PickTarget::Colormap, pick_images(false)));
         }
-
         if let Some(img) = &self.colormap {
             let mut clear = false;
             egui::Grid::new("colormap_grid")
@@ -460,11 +431,11 @@ impl HeightmapApp {
                 .spacing([8.0, 4.0])
                 .min_col_width(4.0)
                 .show(ui, |ui| {
-                    if ui.button("✖").clicked() {
+                    if widgets::danger_icon(ui, icons::XMARK).clicked() {
                         clear = true;
                     }
                     thumb(ui, img);
-                    ui.label(&img.name);
+                    ui.add(egui::Label::new(&img.name).truncate());
                 });
             if clear {
                 self.colormap = None;
@@ -503,7 +474,7 @@ impl HeightmapApp {
                 }
                 None => {
                     ui.horizontal(|ui| {
-                        let stop_btn = ui.button("Stop");
+                        let stop_btn = widgets::neutral(ui, format!("{}  Stop", icons::STOP));
                         ui.add(
                             ProgressBar::new(ctx.animate_value_with_time(
                                 Id::new("progress"),
@@ -550,11 +521,7 @@ impl HeightmapApp {
 
         if img_only {
             if colormap_ok {
-                if ui
-                    .add(
-                        Button::new("Generate image2brick save")
-                            .fill(Color32::from_rgb(50, 90, 50)),
-                    )
+                if widgets::primary(ui, format!("{}  Generate image2brick save", icons::DOWNLOAD))
                     .clicked()
                 {
                     self.run_converter(shared.clone(), true);
@@ -566,18 +533,13 @@ impl HeightmapApp {
         }
 
         if heightmap_ok || colormap_ok {
-            if ui
-                .add(
-                    Button::new(match (heightmap_ok, colormap_ok) {
-                        (true, true) => "Generate save",
-                        (true, false) => "Generate colorless save",
-                        (false, true) => "Generate image2brick save",
-                        (false, false) => unreachable!(),
-                    })
-                    .fill(Color32::from_rgb(50, 90, 50)),
-                )
-                .clicked()
-            {
+            let label = match (heightmap_ok, colormap_ok) {
+                (true, true) => "Generate save",
+                (true, false) => "Generate colorless save",
+                (false, true) => "Generate image2brick save",
+                (false, false) => unreachable!(),
+            };
+            if widgets::primary(ui, format!("{}  {}", icons::DOWNLOAD, label)).clicked() {
                 self.run_converter(shared.clone(), false);
             }
         } else {
@@ -585,16 +547,28 @@ impl HeightmapApp {
         }
     }
 
-    pub fn draw(
+    pub fn draw(&mut self, ui: &mut Ui, shared: &mut SharedOptions, img_only: bool) {
+        self.poll_pick();
+        // File selection cards above the settings card.
+        if img_only {
+            widgets::section(ui, "Image", |ui| self.draw_colormap(ui, true));
+        } else {
+            widgets::section(ui, "Heightmap Images", |ui| self.draw_heightmaps(ui));
+            ui.add_space(10.0);
+            widgets::section(ui, "Colormap Image", |ui| self.draw_colormap(ui, false));
+        }
+        ui.add_space(10.0);
+        widgets::section(ui, "Settings", |ui| self.draw_settings(ui, shared, img_only));
+    }
+
+    /// The fixed footer: the render progress bar or the Generate button.
+    pub fn draw_footer(
         &mut self,
         ui: &mut Ui,
         ctx: &Context,
         shared: &mut SharedOptions,
         img_only: bool,
     ) {
-        self.poll_pick();
-        self.draw_settings(ui, shared, img_only);
-        ui.separator();
         if !self.draw_progress(ctx, ui) {
             self.draw_submit(ui, shared, img_only);
         }

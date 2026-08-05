@@ -6,5 +6,6 @@ pub mod heightmap;
 pub mod midi;
 pub mod midi_preview;
 pub mod text;
+pub mod theme;
 pub mod util;
 pub mod video;

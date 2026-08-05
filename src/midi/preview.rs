@@ -6,7 +6,7 @@
 //! device, no platform code. The players (desktop rodio, browser Web Audio) and
 //! the CLI `--preview` all consume this.
 use super::MidiScore;
-use crate::audio::bands::BASE_HZ;
+use crate::audio::bands::{BASE_HZ, PITCH_MAX, PITCH_MIN};
 use crate::audio::track::SynthWave;
 
 /// Peak the normalized mix is scaled to, leaving headroom so summed voices do
@@ -25,25 +25,32 @@ fn wave(synth: SynthWave, phase: f64) -> f64 {
 }
 
 /// Render `score` to a mono PCM buffer at `sample_rate`, bounded to the first
-/// `seconds` (`<= 0` renders the whole piece). Each voice is an oscillator of
-/// its wave, sounding its active note's pitch at that note's volume and silent
-/// in the gaps; phase runs continuously (held pitch across gaps) so notes do
-/// not click. The mix is normalized to [`PREVIEW_PEAK`].
-pub fn synthesize(score: &MidiScore, sample_rate: u32, seconds: f32) -> Vec<f32> {
+/// `seconds` of the PIECE (`<= 0` renders the whole piece) and sped up by
+/// `rate` (the same `playback_rate` the game clock applies, so 2.0 plays it in
+/// half the wall-clock time). Each voice is an oscillator of its wave, sounding
+/// its active note's pitch at that note's volume and silent in the gaps; phase
+/// runs continuously (held pitch across gaps) so notes do not click. Notes whose
+/// pitch is outside the emitter's `PITCH_MIN..=PITCH_MAX` range are DROPPED, as
+/// the build drops them. The mix is normalized to [`PREVIEW_PEAK`].
+pub fn synthesize(score: &MidiScore, sample_rate: u32, seconds: f32, rate: f32) -> Vec<f32> {
     if score.voices.is_empty() || sample_rate == 0 || score.duration_s <= 0.0 {
         return Vec::new();
     }
-    let duration = if seconds <= 0.0 {
+    let rate = (rate as f64).max(0.01);
+    // `seconds` selects a span of the piece; the played (wall-clock) length is
+    // that span divided by the playback rate.
+    let span_s = if seconds <= 0.0 {
         score.duration_s
     } else {
         (seconds as f64).min(score.duration_s)
     };
-    let n = (duration * sample_rate as f64) as usize;
+    let n = ((span_s / rate) * sample_rate as f64) as usize;
     if n == 0 {
         return Vec::new();
     }
     let dt = 1.0 / sample_rate as f64;
     let mut out = vec![0.0f32; n];
+    let (lo, hi) = (PITCH_MIN as f64, PITCH_MAX as f64);
 
     for voice in &score.voices {
         if voice.notes.is_empty() {
@@ -53,7 +60,8 @@ pub fn synthesize(score: &MidiScore, sample_rate: u32, seconds: f32) -> Vec<f32>
         let mut cursor = 0usize; // first note not yet ended
         let mut held_pitch = voice.notes[0].pitch;
         for (i, sample) in out.iter_mut().enumerate() {
-            let t = i as f64 * dt;
+            // Score-time position: wall-clock time scaled up by the rate.
+            let t = i as f64 * dt * rate;
             while cursor < voice.notes.len() && voice.notes[cursor].end_s <= t {
                 cursor += 1;
             }
@@ -61,13 +69,14 @@ pub fn synthesize(score: &MidiScore, sample_rate: u32, seconds: f32) -> Vec<f32>
             if cursor < voice.notes.len() {
                 held_pitch = voice.notes[cursor].pitch;
             }
-            // Advance phase every sample (held pitch across gaps) so a note
-            // resuming the waveform does not click.
+            // Advance phase in real time (pitch is unchanged by `rate`) so a
+            // note resuming the waveform does not click.
             phase += held_pitch * BASE_HZ as f64 * dt;
             if phase >= 1.0 {
                 phase -= phase.floor();
             }
-            if active {
+            // Only sound in-range pitches -- the build drops the rest.
+            if active && (lo..=hi).contains(&held_pitch) {
                 *sample += (wave(voice.synth, phase) * voice.notes[cursor].volume) as f32;
             }
         }
@@ -127,14 +136,14 @@ mod tests {
     #[test]
     fn synthesis_is_deterministic() {
         let s = one_note(1.0, SynthWave::Sine, 1.0);
-        assert_eq!(synthesize(&s, 44_100, 0.0), synthesize(&s, 44_100, 0.0));
+        assert_eq!(synthesize(&s, 44_100, 0.0, 1.0), synthesize(&s, 44_100, 0.0, 1.0));
     }
 
     #[test]
     fn a_held_a4_renders_near_440_hz() {
         let sr = 44_100u32;
         let s = one_note(1.0, SynthWave::Sine, 1.0); // pitch 1.0 -> 440 Hz
-        let pcm = synthesize(&s, sr, 0.0);
+        let pcm = synthesize(&s, sr, 0.0, 1.0);
         let crossings = pcm.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
         let hz = crossings as f64 / (pcm.len() as f64 / sr as f64);
         assert!((hz - 440.0).abs() < 5.0, "dominant frequency {hz} should be ~440 Hz");
@@ -155,7 +164,7 @@ mod tests {
             duration_s: 1.0,
         };
         let sr = 10_000u32;
-        let pcm = synthesize(&score, sr, 0.0);
+        let pcm = synthesize(&score, sr, 0.0, 1.0);
         // Sample at t=0.5 (mid-gap) should be silent.
         let mid = (0.5 * sr as f64) as usize;
         assert!(pcm[mid].abs() < 1e-6, "the gap must be silent, got {}", pcm[mid]);
@@ -164,9 +173,9 @@ mod tests {
     #[test]
     fn the_seconds_cap_bounds_the_render() {
         let s = one_note(1.0, SynthWave::Sine, 10.0);
-        let one = synthesize(&s, 8_000, 1.0);
+        let one = synthesize(&s, 8_000, 1.0, 1.0);
         assert!((one.len() as i64 - 8_000).abs() < 8_000 / 10, "about one second");
-        let all = synthesize(&s, 8_000, 0.0);
+        let all = synthesize(&s, 8_000, 0.0, 1.0);
         assert!(all.len() > one.len() * 5, "the whole piece is much longer");
     }
 

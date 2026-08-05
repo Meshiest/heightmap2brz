@@ -2,8 +2,8 @@ use crate::{
     gui::{
         SharedOptions,
         util::{
-            PickedImage, deliver_save, deliver_world, draw_out_file_warnings, pick_images,
-            refuse_bad_out_file, thumb,
+            PickedImage, deliver_save, deliver_world, out_file_warning_row, pick_images,
+            refuse_bad_out_file, save_destination_row, thumb,
         },
     },
     text::{
@@ -11,8 +11,9 @@ use crate::{
         build_calibration_world, encode_tiles, make_text_prefab, mono_geometry,
     },
 };
+use crate::gui::theme::{icons, widgets};
 use brdb::World;
-use egui::{Button, Color32, Ui};
+use egui::{Color32, Ui};
 use log::{error, info};
 use poll_promise::Promise;
 
@@ -219,266 +220,272 @@ impl TextApp {
     }
 
     fn draw_settings(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
-        ui.heading("Settings");
         ui.label("Render an image as TextDisplay component bricks -- one colored glyph per pixel.");
 
-        egui::Grid::new("text_settings_grid")
-            .striped(true)
-            .spacing([40.0, 4.0])
-            .show(ui, |ui| {
-                ui.label("Save Destination")
-                    .on_hover_text("The save will be created relative to the location of the exe.");
-                ui.horizontal(|ui| {
-                    // the clipboard flag is meaningless on web (saves are
-                    // delivered as browser downloads)
-                    #[cfg(not(target_arch = "wasm32"))]
-                    ui.checkbox(&mut shared.out_clipboard, "Copy to clipboard")
-                        .on_hover_text("Copy the save file path to clipboard after generation");
-                    ui.add(egui::TextEdit::singleline(&mut shared.out_file).hint_text("File Name"));
-                });
-                ui.end_row();
-                draw_out_file_warnings(ui, &shared.out_file);
+        widgets::settings_table(ui, |ui, t| {
+            save_destination_row(t, ui, shared);
+            out_file_warning_row(t, ui, &shared.out_file);
 
-                ui.label("Font")
-                    .on_hover_text("Font preset; selecting one reseeds glyphs and calibration");
-                ui.horizontal(|ui| {
-                    let mut changed = false;
-                    egui::ComboBox::from_id_salt("text_font_preset")
-                        .selected_text(self.preset.name())
-                        .show_ui(ui, |ui| {
+            t.row_hover(
+                ui,
+                "Font",
+                Some("Font preset; selecting one reseeds glyphs and calibration"),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        let mut changed = false;
+                        widgets::combo(ui, "text_font_preset", self.preset.name(), 160.0, |ui| {
                             for p in FontPreset::ALL {
-                                changed |=
-                                    ui.selectable_value(&mut self.preset, p, p.name()).changed();
+                                changed |= widgets::combo_item(ui, &mut self.preset, p, p.name())
+                                    .changed();
                             }
                         });
-                    if self.preset == FontPreset::Orbitron {
-                        ui.colored_label(
-                            Color32::from_rgb(255, 200, 100),
-                            "1 glyph/px; transparency does not align (proportional font)",
-                        );
-                    }
-                    if changed {
-                        self.load_preset();
-                    }
-                });
-                ui.end_row();
+                        if self.preset == FontPreset::Orbitron {
+                            ui.colored_label(
+                                Color32::from_rgb(255, 200, 100),
+                                "1 glyph/px; transparency does not align (proportional font)",
+                            );
+                        }
+                        if changed {
+                            self.load_preset();
+                        }
+                    });
+                },
+            );
 
-                ui.label("Pixel Glyphs").on_hover_text(
-                    "Glyphs emitted per pixel: fill for opaque pixels, empty for transparent",
-                );
-                ui.horizontal(|ui| {
-                    ui.label("Fill");
-                    ui.add(egui::TextEdit::singleline(&mut self.fill_char).desired_width(24.0))
-                        .on_hover_text("Glyph for opaque pixels (first character is used)");
-                    ui.label("Empty");
-                    ui.add(egui::TextEdit::singleline(&mut self.empty_char).desired_width(24.0))
-                        .on_hover_text("Glyph for transparent pixels (first character is used)");
-                    ui.label("Repeat");
-                    ui.add(egui::Slider::new(&mut self.char_repeat, 1..=4))
-                        .on_hover_text(
+            t.row_hover(
+                ui,
+                "Pixel Glyphs",
+                Some("Glyphs emitted per pixel: fill for opaque pixels, empty for transparent"),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Fill");
+                        ui.add(egui::TextEdit::singleline(&mut self.fill_char).desired_width(24.0))
+                            .on_hover_text("Glyph for opaque pixels (first character is used)");
+                        ui.label("Empty");
+                        ui.add(egui::TextEdit::singleline(&mut self.empty_char).desired_width(24.0))
+                            .on_hover_text("Glyph for transparent pixels (first character is used)");
+                        ui.label("Repeat");
+                        widgets::slider(ui, egui::Slider::new(&mut self.char_repeat, 1..=4)).on_hover_text(
                             "Glyphs per pixel; 2 makes square pixels with the monospace font",
                         );
-                });
-                ui.end_row();
+                    });
+                },
+            );
 
-                ui.label("Mode").on_hover_text(
-                    "Color: one colored glyph run per pixel. Braille: monochrome, 8 pixels per character. Blocks: monochrome quadrants, 4 per character",
-                );
-                ui.horizontal(|ui| {
-                    let mut mode_changed = false;
-                    for m in PixelMode::ALL {
-                        mode_changed |= ui.radio_value(&mut self.mode, m, m.name()).changed();
-                    }
-                    if mode_changed {
-                        // re-pull the preset's color geometry, then apply the
-                        // mono overrides when applicable
-                        self.load_preset();
-                    }
-                    if self.mode != PixelMode::Color {
-                        ui.label("Luma");
-                        ui.add(egui::Slider::new(&mut self.luma_threshold, 0..=255))
-                            .on_hover_text("Pixels at least this bright are drawn");
-                        ui.checkbox(&mut self.invert, "Invert")
-                            .on_hover_text("Draw dark pixels instead of bright ones");
-                    }
-                });
-                ui.end_row();
+            t.row_hover(
+                ui,
+                "Mode",
+                Some("Color: one colored glyph run per pixel. Braille: monochrome, 8 pixels per character. Blocks: monochrome quadrants, 4 per character"),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        let mut mode_changed = false;
+                        for m in PixelMode::ALL {
+                            mode_changed |= ui.radio_value(&mut self.mode, m, m.name()).changed();
+                        }
+                        if mode_changed {
+                            // re-pull the preset's color geometry, then apply the
+                            // mono overrides when applicable
+                            self.load_preset();
+                        }
+                        if self.mode != PixelMode::Color {
+                            ui.label("Luma");
+                            widgets::slider(ui, egui::Slider::new(&mut self.luma_threshold, 0..=255))
+                                .on_hover_text("Pixels at least this bright are drawn");
+                            widgets::toggle(ui, &mut self.invert, "Invert")
+                                .on_hover_text("Draw dark pixels instead of bright ones");
+                        }
+                    });
+                },
+            );
 
-                ui.label("Material").on_hover_text(
+            t.row_hover(
+                ui,
+                "Material",
+                Some(
                     "TextDisplay material. Unlit ignores lighting (the calibrated default); \
                      Graffiti projects onto nearby bricks; the rest are the standard brick \
                      materials",
-                );
-                ui.vertical(|ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for m in TextMaterial::ALL {
-                            ui.radio_value(&mut self.material, m, m.name());
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_enabled_ui(self.material.has_intensity(), |ui| {
-                            ui.label("Intensity");
-                            ui.add(egui::Slider::new(&mut self.material_intensity, 0..=10))
-                                .on_hover_text(
-                                    "Material Intensity: glow brightness / metal, glass, \
-                                     translucency strength",
-                                );
+                ),
+                |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for m in TextMaterial::ALL {
+                                ui.radio_value(&mut self.material, m, m.name());
+                            }
                         });
-                        ui.label("Scuff");
-                        ui.add(
-                            egui::DragValue::new(&mut self.scuff)
-                                .speed(0.01)
-                                .range(0.0..=4.0),
-                        )
-                        .on_hover_text("Worn-edge wear on the glyphs (0-4)");
-                    });
-                    ui.add_enabled_ui(self.material.is_graffiti(), |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("Depth Limit");
+                            ui.add_enabled_ui(self.material.has_intensity(), |ui| {
+                                ui.label("Intensity");
+                                widgets::slider(ui, egui::Slider::new(&mut self.material_intensity, 0..=10))
+                                    .on_hover_text(
+                                        "Material Intensity: glow brightness / metal, glass, \
+                                         translucency strength",
+                                    );
+                            });
+                            ui.label("Scuff");
                             ui.add(
-                                egui::DragValue::new(&mut self.graffiti_depth_limit)
-                                    .speed(0.1)
-                                    .suffix("cm")
-                                    .range(0.0..=f32::INFINITY),
+                                egui::DragValue::new(&mut self.scuff)
+                                    .speed(0.01)
+                                    .range(0.0..=4.0),
                             )
-                            .on_hover_text("How far the graffiti projects onto bricks behind it");
-                            ui.label("Angle Limit");
-                            ui.add(
-                                egui::DragValue::new(&mut self.graffiti_angle_limit)
-                                    .speed(1.0)
-                                    .suffix("°")
-                                    .range(0.0..=180.0),
-                            )
-                            .on_hover_text("Steepest surface angle the graffiti projects onto");
-                            ui.label("Priority");
-                            ui.add(egui::DragValue::new(&mut self.graffiti_priority))
-                                .on_hover_text("Layer order between overlapping graffiti");
+                            .on_hover_text("Worn-edge wear on the glyphs (0-4)");
                         });
-                    });
-                    // the game offers no shading for Unlit or Graffiti
-                    ui.add_enabled_ui(self.material.has_shading(), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Shading");
-                            egui::ComboBox::from_id_salt("text_shading")
-                                .selected_text(self.shading.name())
-                                .show_ui(ui, |ui| {
+                        ui.add_enabled_ui(self.material.is_graffiti(), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Depth Limit");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.graffiti_depth_limit)
+                                        .speed(0.1)
+                                        .suffix("cm")
+                                        .range(0.0..=f32::INFINITY),
+                                )
+                                .on_hover_text("How far the graffiti projects onto bricks behind it");
+                                ui.label("Angle Limit");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.graffiti_angle_limit)
+                                        .speed(1.0)
+                                        .suffix("°")
+                                        .range(0.0..=180.0),
+                                )
+                                .on_hover_text("Steepest surface angle the graffiti projects onto");
+                                ui.label("Priority");
+                                ui.add(egui::DragValue::new(&mut self.graffiti_priority))
+                                    .on_hover_text("Layer order between overlapping graffiti");
+                            });
+                        });
+                        // the game offers no shading for Unlit or Graffiti
+                        ui.add_enabled_ui(self.material.has_shading(), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Shading");
+                                widgets::combo(ui, "text_shading", self.shading.name(), 160.0, |ui| {
                                     for s in TextShading::ALL {
-                                        ui.selectable_value(&mut self.shading, s, s.name());
+                                        widgets::combo_item(ui, &mut self.shading, s, s.name());
                                     }
                                 });
-                            ui.add_enabled_ui(self.shading != TextShading::None, |ui| {
-                                ui.label("Width");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.shading_width)
-                                        .speed(0.05)
-                                        .range(0.0..=f32::INFINITY),
-                                );
-                                ui.checkbox(&mut self.invert_shading, "Invert");
+                                ui.add_enabled_ui(self.shading != TextShading::None, |ui| {
+                                    ui.label("Width");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.shading_width)
+                                            .speed(0.05)
+                                            .range(0.0..=f32::INFINITY),
+                                    );
+                                    widgets::toggle(ui, &mut self.invert_shading, "Invert");
+                                });
                             });
                         });
                     });
-                });
-                ui.end_row();
+                },
+            );
 
-                ui.label("Alpha Threshold")
-                    .on_hover_text("Pixels with alpha below this are rendered as transparent");
-                ui.add(egui::Slider::new(&mut self.alpha_threshold, 0..=255));
-                ui.end_row();
+            t.row_hover(
+                ui,
+                "Alpha Threshold",
+                Some("Pixels with alpha below this are rendered as transparent"),
+                |ui| {
+                    widgets::slider(ui, egui::Slider::new(&mut self.alpha_threshold, 0..=255));
+                },
+            );
 
-                ui.label("Pixel Size")
-                    .on_hover_text("World units per pixel row (1.0 = calibrated glyph fit)");
-                if ui
-                    .add(
-                        egui::Slider::new(&mut self.pixel_size, 0.01..=8.0)
-                            .logarithmic(true)
-                            .text("units"),
-                    )
-                    .changed()
-                {
-                    self.load_preset();
-                }
-                ui.end_row();
-
-                ui.label("Calibration").on_hover_text(
-                    "Manual glyph-fit tuning for the selected font; the preset seeds these \
-                     and changing the preset or pixel size reseeds them",
-                );
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Font Size");
-                        ui.add(egui::DragValue::new(&mut self.line_height).speed(0.01))
-                            .on_hover_text(
-                                "The TextDisplay LineHeight field -- the game's font size.                                  Scales the glyphs; presets derive it from Pixel Size",
-                            );
-                        ui.label("LineOffset");
-                        ui.add(egui::DragValue::new(&mut self.line_offset).speed(0.05));
-                        ui.label("Kerning");
-                        ui.add(egui::DragValue::new(&mut self.kerning).speed(0.01));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Offset X");
-                        ui.add(egui::DragValue::new(&mut self.offset_x).speed(0.01));
-                        ui.label("Offset Y");
-                        ui.add(egui::DragValue::new(&mut self.offset_y).speed(0.01));
-                        ui.label("Offset Z");
-                        ui.add(egui::DragValue::new(&mut self.offset_z).speed(0.1))
-                            .on_hover_text(
-                                "Out-of-plane: pushes the text off the anchor wall's face so the cubes hide behind the image",
-                            );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Gap X");
-                        ui.add(egui::DragValue::new(&mut self.pitch_x).speed(0.002))
-                            .on_hover_text(
-                                "Horizontal tile spacing as a fraction of the nominal pixel size. Gaps between tile columns = lower it, overlaps = raise it",
-                            );
-                        ui.label("Gap Y");
-                        ui.add(egui::DragValue::new(&mut self.pitch_y).speed(0.002))
-                            .on_hover_text(
-                                "Vertical tile spacing as a fraction of the nominal pixel size. Gaps between tile rows = lower it, overlaps = raise it",
-                            );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Cube Spacing");
-                        ui.add(
-                            egui::Slider::new(&mut self.cube_spacing, 1..=512)
+            t.row_hover(
+                ui,
+                "Pixel Size",
+                Some("World units per pixel row (1.0 = calibrated glyph fit)"),
+                |ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.pixel_size, 0.01..=8.0)
                                 .logarithmic(true)
                                 .text("units"),
                         )
-                        .on_hover_text(
-                            "World distance between the calibration grid's anchor cubes: \
-                             tiny spacing = tiny text displays, large = billboards",
-                        );
-                        if ui
-                            .button("Generate calibration save")
-                            .on_hover_text(
-                                "Writes calibrate.brz: a 128px checkerboard rendered like a \
-                                 normal export (current mode included), with labeled number \
-                                 Variable gates wired into EVERY text component -- edit a \
-                                 variable in-game and the whole grid updates live.",
+                        .changed()
+                    {
+                        self.load_preset();
+                    }
+                },
+            );
+
+            t.row_hover(
+                ui,
+                "Calibration",
+                Some(
+                    "Manual glyph-fit tuning for the selected font; the preset seeds these \
+                     and changing the preset or pixel size reseeds them",
+                ),
+                |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Font Size");
+                            ui.add(egui::DragValue::new(&mut self.line_height).speed(0.01))
+                                .on_hover_text(
+                                    "The TextDisplay LineHeight field -- the game's font size.                                  Scales the glyphs; presets derive it from Pixel Size",
+                                );
+                            ui.label("LineOffset");
+                            ui.add(egui::DragValue::new(&mut self.line_offset).speed(0.05));
+                            ui.label("Kerning");
+                            ui.add(egui::DragValue::new(&mut self.kerning).speed(0.01));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Offset X");
+                            ui.add(egui::DragValue::new(&mut self.offset_x).speed(0.01));
+                            ui.label("Offset Y");
+                            ui.add(egui::DragValue::new(&mut self.offset_y).speed(0.01));
+                            ui.label("Offset Z");
+                            ui.add(egui::DragValue::new(&mut self.offset_z).speed(0.1))
+                                .on_hover_text(
+                                    "Out-of-plane: pushes the text off the anchor wall's face so the cubes hide behind the image",
+                                );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Gap X");
+                            ui.add(egui::DragValue::new(&mut self.pitch_x).speed(0.002))
+                                .on_hover_text(
+                                    "Horizontal tile spacing as a fraction of the nominal pixel size. Gaps between tile columns = lower it, overlaps = raise it",
+                                );
+                            ui.label("Gap Y");
+                            ui.add(egui::DragValue::new(&mut self.pitch_y).speed(0.002))
+                                .on_hover_text(
+                                    "Vertical tile spacing as a fraction of the nominal pixel size. Gaps between tile rows = lower it, overlaps = raise it",
+                                );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Cube Spacing");
+                            ui.add(
+                                egui::Slider::new(&mut self.cube_spacing, 1..=512)
+                                    .logarithmic(true)
+                                    .text("units"),
                             )
-                            .clicked()
-                        {
-                            self.generate_calibration(shared);
-                        }
+                            .on_hover_text(
+                                "World distance between the calibration grid's anchor cubes: \
+                                 tiny spacing = tiny text displays, large = billboards",
+                            );
+                            if ui
+                                .button("Generate calibration save")
+                                .on_hover_text(
+                                    "Writes calibrate.brz: a 128px checkerboard rendered like a \
+                                     normal export (current mode included), with labeled number \
+                                     Variable gates wired into EVERY text component -- edit a \
+                                     variable in-game and the whole grid updates live.",
+                                )
+                                .clicked()
+                            {
+                                self.generate_calibration(shared);
+                            }
+                        });
                     });
-                });
-                ui.end_row();
-            });
+                },
+            );
+        });
 
-        ui.add_space(8.0);
-        ui.separator();
+    }
 
-        ui.heading("Image");
+    /// The image-selection card body (its own card above Settings).
+    fn draw_image(&mut self, ui: &mut Ui) {
         ui.label("Select the image to render as text.");
-        if ui
-            .add(Button::new("Select image").fill(Color32::from_rgb(60, 60, 120)))
-            .clicked()
+        if widgets::info(ui, format!("{}  Select image", icons::IMAGE)).clicked()
             && self.pending_pick.is_none()
         {
             self.pending_pick = Some(pick_images(false));
         }
-
         if let Some(img) = &self.image {
             let mut clear = false;
             egui::Grid::new("text_image_grid")
@@ -486,11 +493,11 @@ impl TextApp {
                 .spacing([8.0, 4.0])
                 .min_col_width(4.0)
                 .show(ui, |ui| {
-                    if ui.button("✖").clicked() {
+                    if widgets::danger_icon(ui, icons::XMARK).clicked() {
                         clear = true;
                     }
                     thumb(ui, img);
-                    ui.label(&img.name);
+                    ui.add(egui::Label::new(&img.name).truncate());
                 });
             if clear {
                 self.image = None;
@@ -504,10 +511,7 @@ impl TextApp {
             return;
         }
         if self.image.is_some() {
-            if ui
-                .add(Button::new("Generate image2text save").fill(Color32::from_rgb(50, 90, 50)))
-                .clicked()
-            {
+            if widgets::primary(ui, format!("{}  Generate image2text save", icons::DOWNLOAD)).clicked() {
                 self.generate(shared);
             }
         } else {
@@ -527,8 +531,14 @@ impl TextApp {
                 Err(promise) => self.pending_pick = Some(promise),
             }
         }
-        self.draw_settings(ui, shared);
-        ui.separator();
+        // Image selection above the settings, each in its own card.
+        widgets::section(ui, "Image", |ui| self.draw_image(ui));
+        ui.add_space(10.0);
+        widgets::section(ui, "Settings", |ui| self.draw_settings(ui, shared));
+    }
+
+    /// The fixed footer: the Generate button.
+    pub fn draw_footer(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
         self.draw_submit(ui, shared);
     }
 }

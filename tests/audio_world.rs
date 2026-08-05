@@ -2180,14 +2180,17 @@ fn in_chip_speakers_clear_the_gate_lattice_at_any_band_count() {
 }
 
 /// The layout function itself: every coordinate non-negative (negative
-/// inner-grid coordinates delete bricks in-game), and every speaker's low x
-/// face clear of the service rows, whose farthest gate reaches x-face 110.
+/// inner-grid coordinates delete bricks in-game), and every speaker's low z
+/// face at or above the gate layer. The block stacks ABOVE the gates (all at
+/// lattice stage 0) rather than beside them, so it clears the playhead lattice
+/// however far it spreads across x/y -- the MIDI playhead grows along both axes.
 #[test]
-fn in_chip_speaker_positions_are_nonnegative_and_clear_of_the_service_rows() {
-    // The service lattice (rows 0..-10) tops out at this x-face; the speaker
-    // block starts past it. Stated as a literal oracle, not imported.
-    const GATE_ROWS_MAX_X_FACE: i32 = 110;
-    let hx = speaker_half().x;
+fn in_chip_speaker_positions_are_nonnegative_and_clear_of_the_gate_layer() {
+    // Every in-chip gate sits at lattice stage 0, whose top z-face is
+    // STAGE_BASE_Z (6) + 2 * GATE_HALF.z (4) = 10; the speaker block starts at
+    // or above it. Stated as a literal oracle, not imported.
+    const GATE_LAYER_TOP_Z_FACE: i32 = 10;
+    let hz = speaker_half().z;
     for n in [1usize, 2, 8, 32, 79, 128] {
         for k in 0..n {
             let p = speaker_inner_position(k, n);
@@ -2198,10 +2201,10 @@ fn in_chip_speaker_positions_are_nonnegative_and_clear_of_the_service_rows() {
                 p.x, p.y, p.z
             );
             assert!(
-                p.x - hx > GATE_ROWS_MAX_X_FACE,
-                "n={n} speaker {k} low x-face {} does not clear the gate rows \
-                 (which reach {GATE_ROWS_MAX_X_FACE})",
-                p.x - hx
+                p.z - hz >= GATE_LAYER_TOP_Z_FACE,
+                "n={n} speaker {k} low z-face {} does not clear the gate layer \
+                 (which tops out at {GATE_LAYER_TOP_Z_FACE})",
+                p.z - hz
             );
         }
     }

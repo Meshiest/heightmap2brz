@@ -24,13 +24,14 @@ use crate::{
         SharedOptions,
         util::{
             ChannelProgress as UtilChannelProgress, RenderMsg, bound_pane_width,
-            deliver_world_unless_cancelled, draw_out_file_warnings, draw_progress_bar, note,
-            refuse_bad_out_file, section, settings_grid,
+            deliver_world_unless_cancelled, draw_progress_bar, note, out_file_warning_row,
+            refuse_bad_out_file, save_destination_row, section,
         },
     },
     progress::Progress,
 };
-use egui::{Button, Color32, Ui};
+use crate::gui::theme::{icons, widgets};
+use egui::{Color32, Ui};
 use log::{error, info};
 use poll_promise::Promise;
 
@@ -610,7 +611,6 @@ impl AudioApp {
     /// knob: in Pitch Switching it IS the number of speakers the save
     /// contains, so hiding it would hide the size of the build.
     fn draw_settings(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
-        ui.heading("Settings");
         ui.label(
             "Turn a song into a cluster of wired, pitched speaker bricks: the spectrum is \
              analysed once and written into wire arrays, and a chip plays it back.",
@@ -618,39 +618,30 @@ impl AudioApp {
 
         self.draw_preset_block(ui);
 
-        settings_grid(ui, "audio_settings_grid").show(ui, |ui| {
-            ui.label("Save Destination")
-                .on_hover_text("The save will be created relative to the location of the exe.");
-            // A plain `horizontal`, NOT `horizontal_wrapped`: a wrapping
-            // horizontal layout inside a grid cell reports a height that is
-            // short of what it drew, and the next row lands on top of it (this
-            // row and the preset row were where that showed). Nothing in here
-            // is text that needs to wrap -- the text field sizes itself to the
-            // cell, which `settings_grid`'s `max_col_width` already bounds.
-            ui.horizontal(|ui| {
-                #[cfg(not(target_arch = "wasm32"))]
-                ui.checkbox(&mut shared.out_clipboard, "Copy to clipboard")
-                    .on_hover_text("Copy the save file path to clipboard after generation");
-                ui.add(egui::TextEdit::singleline(&mut shared.out_file).hint_text("File Name"));
-            });
-            ui.end_row();
-            draw_out_file_warnings(ui, &shared.out_file);
+        widgets::settings_table(ui, |ui, t| {
+            save_destination_row(t, ui, shared);
+            out_file_warning_row(t, ui, &shared.out_file);
 
-            self.draw_mode_row(ui);
-            self.draw_voices_row(ui);
+            self.draw_mode_row(t, ui);
+            self.draw_voices_row(t, ui);
 
             // Playback is on the always-visible critical path, beside the mode
             // it plays back through, rather than buried in the Analysis
             // section: whether a track loops is a decision every render makes,
             // not an advanced analysis knob.
-            ui.label("Playback").on_hover_text(
-                "Loop: repeat the track forever (the default). Off: play through once and \
-                 stop on the last analysis frame -- the timer is given a limit of \
-                 (frames - 0.5) / fps, which expires halfway through the final frame. \
-                 Costs nothing either way: same gates, same wires, same speakers.",
+            t.row_hover(
+                ui,
+                "Playback",
+                Some(
+                    "Loop: repeat the track forever (the default). Off: play through once and \
+                     stop on the last analysis frame -- the timer is given a limit of \
+                     (frames - 0.5) / fps, which expires halfway through the final frame. \
+                     Costs nothing either way: same gates, same wires, same speakers.",
+                ),
+                |ui| {
+                    widgets::toggle(ui, &mut self.opts.loop_playback, "Loop");
+                },
             );
-            ui.checkbox(&mut self.opts.loop_playback, "Loop");
-            ui.end_row();
         });
 
         self.draw_advanced_sections(ui);
@@ -671,22 +662,22 @@ impl AudioApp {
     fn draw_advanced_sections(&mut self, ui: &mut Ui) {
         let (chips, open) = (self.analysis_chips(), self.analysis_is_tuned());
         section(ui, "audio_analysis_section", "Analysis", &chips, open, |ui| {
-            settings_grid(ui, "audio_analysis_grid").show(ui, |ui| self.draw_analysis_rows(ui));
+            widgets::settings_table(ui, |ui, t| self.draw_analysis_rows(t, ui));
         });
 
         let (chips, open) = (self.band_chips(), self.band_grid_is_tuned());
         section(ui, "audio_band_section", "Band grid", &chips, open, |ui| {
-            settings_grid(ui, "audio_band_grid").show(ui, |ui| self.draw_band_rows(ui));
+            widgets::settings_table(ui, |ui, t| self.draw_band_rows(t, ui));
         });
 
         let (chips, open) = (self.envelope_chips(), self.envelope_is_tuned());
         section(ui, "audio_envelope_section", "Envelope", &chips, open, |ui| {
-            settings_grid(ui, "audio_envelope_grid").show(ui, |ui| self.draw_envelope_rows(ui));
+            widgets::settings_table(ui, |ui, t| self.draw_envelope_rows(t, ui));
         });
 
         let (chips, open) = (self.level_chips(), self.levels_are_tuned());
         section(ui, "audio_level_section", "Levels", &chips, open, |ui| {
-            settings_grid(ui, "audio_level_grid").show(ui, |ui| self.draw_level_rows(ui));
+            widgets::settings_table(ui, |ui, t| self.draw_level_rows(t, ui));
         });
 
         let (chips, open) = (self.speaker_chips(), self.speakers_are_tuned());
@@ -697,7 +688,7 @@ impl AudioApp {
             &chips,
             open,
             |ui| {
-                settings_grid(ui, "audio_speaker_grid").show(ui, |ui| self.draw_speaker_rows(ui));
+                widgets::settings_table(ui, |ui, t| self.draw_speaker_rows(t, ui));
             },
         );
     }
@@ -859,161 +850,197 @@ impl AudioApp {
         ui.add_space(4.0);
     }
 
-    fn draw_mode_row(&mut self, ui: &mut Ui) {
-        ui.label("Mode").on_hover_text(
-            "Pitch-Per-Speaker: a fixed bank of speakers, each one owning a single pitch, \
-             with only their volumes written -- best for speech and broadband material, and \
-             it never writes a pitch, so it depends on no unverified in-game behaviour. \
-             Pitch Switching: Speakers speakers that TRACK spectral peaks, re-pitching and \
-             changing volume every frame -- no band grid, so no tuning error; best for tonal \
-             material such as piano. THE 'Max Voices' CONTROL MEANS SOMETHING DIFFERENT IN \
-             EACH.",
-        );
-        ui.horizontal(|ui| {
-            for m in AudioMode::ALL {
-                ui.radio_value(&mut self.mode, m, m.name());
-            }
-        });
-        ui.end_row();
-    }
-
-    fn draw_analysis_rows(&mut self, ui: &mut Ui) {
-        ui.label("Analysis FPS").on_hover_text(
-            "Analysis frames per second -- how often every speaker's volume is rewritten. \
-             The wire graph ticks at 60 Hz on a dedicated server and faster locally, so 30 \
-             is comfortable; raising it multiplies the array data without adding detail the \
-             window can resolve.",
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.opts.fps)
-                .speed(0.5)
-                .range(1.0..=120.0),
-        );
-        ui.end_row();
-
-        ui.label("Window").on_hover_text(
-            "STFT (short-time Fourier transform) window size, in samples -- the single \
-             biggest lever, and the one the \
-             presets differ on most. Long windows resolve pitch (a sustained partial gets a \
-             clean note) and smear transients; short ones do the reverse, which is why \
-             speech wants 2048 and a music box wants 16384. Powers of two only: the \
-             transform is a radix FFT.",
-        );
-        egui::ComboBox::from_id_salt("audio_window")
-            .selected_text(self.opts.window.to_string())
-            .show_ui(ui, |ui| {
-                for w in WINDOW_SIZES {
-                    ui.selectable_value(&mut self.opts.window, w, w.to_string());
-                }
-            });
-        ui.end_row();
-
-        ui.label("Max Frames").on_hover_text(
-            "Hard cap on analysed frames. Frames past 65535 spill into extra wire arrays, \
-             which costs two gates per stream per extra array and nothing else -- audio \
-             writes numbers straight into arrays with no packing, so a long render is cheap \
-             here in a way a long video render is not.",
-        );
-        ui.add(
-            egui::Slider::new(&mut self.opts.max_frames, 1..=crate::anim::pack::MAX_FRAMES)
-                .logarithmic(true),
-        );
-        ui.end_row();
-    }
-
-    fn draw_band_rows(&mut self, ui: &mut Ui) {
-        ui.label("Bands").on_hover_text(
-            "Total speakers, noise bands included. Bands sit on EXACT equal-tempered steps, \
-             so this selects the SPAN (the steps nearest A440), never the spacing -- and it \
-             is symmetric around A440, so narrowing trims the bass and the treble together. \
-             Narrowing helps a music box or solo piano and CRUSHES chiptune bass. Unlimited \
-             = every step the emitter's pitch range holds: 79 at Subdiv 12, 159 at 24.",
-        );
-        let mut unlimited = false;
-        if self.shows_band_grid_controls() {
-            ui.horizontal(|ui| {
-                let mut limited = self.opts.bands.is_some();
-                if ui.checkbox(&mut limited, "Limit").changed() {
-                    self.opts.bands = limited.then_some(self.bands_value);
-                }
-                ui.add_enabled_ui(limited, |ui| {
-                    if let Some(bands) = &mut self.opts.bands {
-                        ui.add(egui::Slider::new(bands, BANDS_RANGE).logarithmic(true));
-                    } else {
-                        // A disabled stand-in so the row does not change
-                        // width when the checkbox is cleared.
-                        ui.add_enabled(
-                            false,
-                            egui::Slider::new(&mut self.bands_value, BANDS_RANGE)
-                                .logarithmic(true),
-                        );
+    fn draw_mode_row(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
+        t.row_hover(
+            ui,
+            "Mode",
+            Some(
+                "Pitch-Per-Speaker: a fixed bank of speakers, each one owning a single pitch, \
+                 with only their volumes written -- best for speech and broadband material, and \
+                 it never writes a pitch, so it depends on no unverified in-game behaviour. \
+                 Pitch Switching: Speakers speakers that TRACK spectral peaks, re-pitching and \
+                 changing volume every frame -- no band grid, so no tuning error; best for tonal \
+                 material such as piano. THE 'Max Voices' CONTROL MEANS SOMETHING DIFFERENT IN \
+                 EACH.",
+            ),
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for m in AudioMode::ALL {
+                        widgets::radio(ui, &mut self.mode, m, m.name());
                     }
                 });
-                unlimited = !limited;
-            });
-            if let Some(b) = self.opts.bands {
-                self.bands_value = b;
-            }
-        } else {
-            note(ui, "(Pitch-Per-Speaker only -- Pitch Switching has no band grid)");
-        }
-        ui.end_row();
+            },
+        );
+    }
+
+    fn draw_analysis_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
+        t.row_hover(
+            ui,
+            "Analysis FPS",
+            Some(
+                "Analysis frames per second -- how often every speaker's volume is rewritten. \
+                 The wire graph ticks at 60 Hz on a dedicated server and faster locally, so 30 \
+                 is comfortable; raising it multiplies the array data without adding detail the \
+                 window can resolve.",
+            ),
+            |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.opts.fps)
+                        .speed(0.5)
+                        .range(1.0..=120.0),
+                );
+            },
+        );
+
+        t.row_hover(
+            ui,
+            "Window",
+            Some(
+                "STFT (short-time Fourier transform) window size, in samples -- the single \
+                 biggest lever, and the one the \
+                 presets differ on most. Long windows resolve pitch (a sustained partial gets a \
+                 clean note) and smear transients; short ones do the reverse, which is why \
+                 speech wants 2048 and a music box wants 16384. Powers of two only: the \
+                 transform is a radix FFT.",
+            ),
+            |ui| {
+                widgets::combo(ui, "audio_window", self.opts.window.to_string(), 160.0, |ui| {
+                    for w in WINDOW_SIZES {
+                        widgets::combo_item(ui, &mut self.opts.window, w, w.to_string());
+                    }
+                });
+            },
+        );
+
+        t.row_hover(
+            ui,
+            "Max Frames",
+            Some(
+                "Hard cap on analysed frames. Frames past 65535 spill into extra wire arrays, \
+                 which costs two gates per stream per extra array and nothing else -- audio \
+                 writes numbers straight into arrays with no packing, so a long render is cheap \
+                 here in a way a long video render is not.",
+            ),
+            |ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.opts.max_frames, 1..=crate::anim::pack::MAX_FRAMES)
+                        .logarithmic(true),
+                );
+            },
+        );
+    }
+
+    fn draw_band_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
+        let mut unlimited = false;
+        t.row_hover(
+            ui,
+            "Bands",
+            Some(
+                "Total speakers, noise bands included. Bands sit on EXACT equal-tempered steps, \
+                 so this selects the SPAN (the steps nearest A440), never the spacing -- and it \
+                 is symmetric around A440, so narrowing trims the bass and the treble together. \
+                 Narrowing helps a music box or solo piano and CRUSHES chiptune bass. Unlimited \
+                 = every step the emitter's pitch range holds: 79 at Subdiv 12, 159 at 24.",
+            ),
+            |ui| {
+                if self.shows_band_grid_controls() {
+                    ui.horizontal(|ui| {
+                        let mut limited = self.opts.bands.is_some();
+                        if widgets::toggle(ui, &mut limited, "Limit").changed() {
+                            self.opts.bands = limited.then_some(self.bands_value);
+                        }
+                        ui.add_enabled_ui(limited, |ui| {
+                            if let Some(bands) = &mut self.opts.bands {
+                                widgets::slider(ui, egui::Slider::new(bands, BANDS_RANGE).logarithmic(true));
+                            } else {
+                                // A disabled stand-in so the row does not change
+                                // width when the checkbox is cleared.
+                                ui.add_enabled(
+                                    false,
+                                    egui::Slider::new(&mut self.bands_value, BANDS_RANGE)
+                                        .logarithmic(true),
+                                );
+                            }
+                        });
+                        unlimited = !limited;
+                    });
+                    if let Some(b) = self.opts.bands {
+                        self.bands_value = b;
+                    }
+                } else {
+                    note(ui, "(Pitch-Per-Speaker only -- Pitch Switching has no band grid)");
+                }
+            },
+        );
         // Its OWN row, for the same reason the video pane's "(using source
         // size)" gets one: beside a checkbox and a slider there is less width
         // left than the sentence's longest word, and egui then breaks it
         // mid-word instead of at a space.
         if unlimited {
-            ui.label("");
-            note(ui, "(every band the pitch range holds)");
-            ui.end_row();
+            t.row(ui, "", |ui| {
+                note(ui, "(every band the pitch range holds)");
+            });
         }
 
-        ui.label("Subdiv").on_hover_text(
-            "Tonal bands per octave. MULTIPLES OF 12 ONLY, which is why this is a dropdown: \
-             only then does every band land on a real semitone, and anything else was heard \
-             in game as out of tune -- 14 sharp, 18 flat. 12 (one per semitone) is \
-             preferred; 24 halves the error on a source not tuned to A440 but splits each \
-             note across two speakers.",
+        t.row_hover(
+            ui,
+            "Subdiv",
+            Some(
+                "Tonal bands per octave. MULTIPLES OF 12 ONLY, which is why this is a dropdown: \
+                 only then does every band land on a real semitone, and anything else was heard \
+                 in game as out of tune -- 14 sharp, 18 flat. 12 (one per semitone) is \
+                 preferred; 24 halves the error on a source not tuned to A440 but splits each \
+                 note across two speakers.",
+            ),
+            |ui| {
+                if self.shows_band_grid_controls() {
+                    widgets::combo(ui, "audio_subdiv", self.opts.subdiv.to_string(), 160.0, |ui| {
+                        for s in SUBDIVS {
+                            widgets::combo_item(ui, &mut self.opts.subdiv, s, s.to_string());
+                        }
+                    });
+                } else {
+                    note(ui, "(Pitch-Per-Speaker only)");
+                }
+            },
         );
-        if self.shows_band_grid_controls() {
-            egui::ComboBox::from_id_salt("audio_subdiv")
-                .selected_text(self.opts.subdiv.to_string())
-                .show_ui(ui, |ui| {
-                    for s in SUBDIVS {
-                        ui.selectable_value(&mut self.opts.subdiv, s, s.to_string());
-                    }
-                });
-        } else {
-            note(ui, "(Pitch-Per-Speaker only)");
-        }
-        ui.end_row();
 
-        ui.label("Noise Bands").on_hover_text(
-            "White/pink noise speakers carrying the energy off either end of the tonal \
-             range. 0 is the default because every source tried in game -- speech, solo \
-             piano and a full pop mix -- was reported WORSE with them than without. 2 is \
-             worth trying on percussion, which nothing else in the bank can render at all.",
+        t.row_hover(
+            ui,
+            "Noise Bands",
+            Some(
+                "White/pink noise speakers carrying the energy off either end of the tonal \
+                 range. 0 is the default because every source tried in game -- speech, solo \
+                 piano and a full pop mix -- was reported WORSE with them than without. 2 is \
+                 worth trying on percussion, which nothing else in the bank can render at all.",
+            ),
+            |ui| {
+                if self.shows_band_grid_controls() {
+                    widgets::slider(ui, egui::Slider::new(&mut self.opts.noise_bands, 0..=2));
+                } else {
+                    note(ui, "(Pitch-Per-Speaker only)");
+                }
+            },
         );
-        if self.shows_band_grid_controls() {
-            ui.add(egui::Slider::new(&mut self.opts.noise_bands, 0..=2));
-        } else {
-            note(ui, "(Pitch-Per-Speaker only)");
-        }
-        ui.end_row();
 
-        ui.label("Peak Gate").on_hover_text(
-            "How far above the mean of its neighbourhood a band must stand to count as a \
-             note at all, as an amplitude ratio (1.5 = 3.5 dB). THIS, not Max Voices, is \
-             what limits a dense frame -- lower it to sound more bands at once. 1.0 \
-             disables it, which is the wall-of-sound behaviour that made an early render \
-             sound like noise: 94 of 96 bands sounding at once is noise by construction.",
+        t.row_hover(
+            ui,
+            "Peak Gate",
+            Some(
+                "How far above the mean of its neighbourhood a band must stand to count as a \
+                 note at all, as an amplitude ratio (1.5 = 3.5 dB). THIS, not Max Voices, is \
+                 what limits a dense frame -- lower it to sound more bands at once. 1.0 \
+                 disables it, which is the wall-of-sound behaviour that made an early render \
+                 sound like noise: 94 of 96 bands sounding at once is noise by construction.",
+            ),
+            |ui| {
+                if self.shows_band_grid_controls() {
+                    widgets::slider(ui, egui::Slider::new(&mut self.opts.peak_gate, 1.0..=6.0));
+                } else {
+                    note(ui, "(Pitch-Per-Speaker only -- Pitch Switching gates over FFT bins)");
+                }
+            },
         );
-        if self.shows_band_grid_controls() {
-            ui.add(egui::Slider::new(&mut self.opts.peak_gate, 1.0..=6.0));
-        } else {
-            note(ui, "(Pitch-Per-Speaker only -- Pitch Switching gates over FFT bins)");
-        }
-        ui.end_row();
     }
 
     /// The speaker-count row, kept OUT of the band-grid section on purpose.
@@ -1024,188 +1051,244 @@ impl AudioApp {
     /// build, not a tuning knob -- so it stays visible next to the mode that
     /// decides what it means. Label, hint and range are unchanged; only the
     /// row's position moved.
-    fn draw_voices_row(&mut self, ui: &mut Ui) {
+    fn draw_voices_row(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
         // THE label that has to change with the mode -- see
         // `max_voices_label`'s doc.
-        ui.label(self.max_voices_label())
-            .on_hover_text(self.max_voices_hint());
+        let label = self.max_voices_label();
+        let hint = self.max_voices_hint();
         // Read before the mutable borrow of `opts.max_voices` below.
         let range = self.min_voices()..=MAX_SPEAKERS;
-        ui.add(egui::Slider::new(&mut self.opts.max_voices, range));
-        ui.end_row();
+        t.row_hover(ui, label, Some(hint), |ui| {
+            widgets::slider(ui, egui::Slider::new(&mut self.opts.max_voices, range));
+        });
     }
 
-    fn draw_envelope_rows(&mut self, ui: &mut Ui) {
-        ui.label("Attack").on_hover_text(
-            "How fast a speaker's level RISES toward what the analysis measured, in \
-             milliseconds. Short by design -- an attack is what makes a render sound like an \
-             instrument being struck rather than a pad swelling.",
+    fn draw_envelope_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
+        t.row_hover(
+            ui,
+            "Attack",
+            Some(
+                "How fast a speaker's level RISES toward what the analysis measured, in \
+                 milliseconds. Short by design -- an attack is what makes a render sound like an \
+                 instrument being struck rather than a pad swelling.",
+            ),
+            |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.opts.attack_ms)
+                        .speed(0.5)
+                        .suffix(" ms")
+                        .range(0.0..=1000.0),
+                );
+            },
         );
-        ui.add(
-            egui::DragValue::new(&mut self.opts.attack_ms)
-                .speed(0.5)
-                .suffix(" ms")
-                .range(0.0..=1000.0),
-        );
-        ui.end_row();
 
-        ui.label("Release").on_hover_text(
-            "How fast a speaker's level FALLS, including after its band stops being \
-             selected, in milliseconds. THIS is what stops one-frame selections sounding \
-             like beeps. 150 suits sustained music; SPEECH WANTS 30-60, because a phoneme \
-             is 50-100 ms long and a 150 ms release smears clean across it. Do not tune this \
-             by maximising mean run length -- that was tried and made speech much worse.",
+        t.row_hover(
+            ui,
+            "Release",
+            Some(
+                "How fast a speaker's level FALLS, including after its band stops being \
+                 selected, in milliseconds. THIS is what stops one-frame selections sounding \
+                 like beeps. 150 suits sustained music; SPEECH WANTS 30-60, because a phoneme \
+                 is 50-100 ms long and a 150 ms release smears clean across it. Do not tune this \
+                 by maximising mean run length -- that was tried and made speech much worse.",
+            ),
+            |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.opts.release_ms)
+                        .speed(1.0)
+                        .suffix(" ms")
+                        .range(0.0..=2000.0),
+                );
+            },
         );
-        ui.add(
-            egui::DragValue::new(&mut self.opts.release_ms)
-                .speed(1.0)
-                .suffix(" ms")
-                .range(0.0..=2000.0),
-        );
-        ui.end_row();
 
-        ui.label("Voice Release").on_hover_text(
-            "Pitch Switching only: how long a voice takes to fade to EXACTLY zero once its \
-             partial has gone. Distinct from Release, which is a time constant on a voice \
-             that is still sounding and never reaches zero. The material decides it -- a \
-             sustained note can afford 150, a spoken phoneme cannot.",
+        t.row_hover(
+            ui,
+            "Voice Release",
+            Some(
+                "Pitch Switching only: how long a voice takes to fade to EXACTLY zero once its \
+                 partial has gone. Distinct from Release, which is a time constant on a voice \
+                 that is still sounding and never reaches zero. The material decides it -- a \
+                 sustained note can afford 150, a spoken phoneme cannot.",
+            ),
+            |ui| {
+                if self.mode == AudioMode::Voice {
+                    ui.add(
+                        egui::DragValue::new(&mut self.opts.voice_release_ms)
+                            .speed(1.0)
+                            .suffix(" ms")
+                            .range(0.0..=2000.0),
+                    );
+                } else {
+                    note(ui, "(Pitch Switching only -- a fixed-pitch band has no note-off to time)");
+                }
+            },
         );
-        if self.mode == AudioMode::Voice {
-            ui.add(
-                egui::DragValue::new(&mut self.opts.voice_release_ms)
-                    .speed(1.0)
-                    .suffix(" ms")
-                    .range(0.0..=2000.0),
-            );
-        } else {
-            note(ui, "(Pitch Switching only -- a fixed-pitch band has no note-off to time)");
-        }
-        ui.end_row();
 
-        ui.label("Pitch Snap").on_hover_text(
-            "Pitch Switching only: pull a continuing voice onto the nearest equal-tempered \
-             semitone when it is within this many cents. 0 = off, which is the default \
-             because Pitch Switching's whole claim is that it needs no grid -- snapping quantises \
-             real vibrato and glissando away along with the jitter.",
+        t.row_hover(
+            ui,
+            "Pitch Snap",
+            Some(
+                "Pitch Switching only: pull a continuing voice onto the nearest equal-tempered \
+                 semitone when it is within this many cents. 0 = off, which is the default \
+                 because Pitch Switching's whole claim is that it needs no grid -- snapping quantises \
+                 real vibrato and glissando away along with the jitter.",
+            ),
+            |ui| {
+                if self.mode == AudioMode::Voice {
+                    // The analysis owns the bound (`voices::MAX_PITCH_SNAP_CENTS` --
+                    // half a semitone, past which "snap if within" cannot mean
+                    // anything a listener hears differently), and the widget follows
+                    // it rather than carrying its own number: a range of 0..=100 here
+                    // let the GUI offer values the CLI refuses by name.
+                    ui.add(
+                        egui::DragValue::new(&mut self.opts.pitch_snap_cents)
+                            .speed(1.0)
+                            .suffix(" cents")
+                            .range(0.0..=crate::audio::voices::MAX_PITCH_SNAP_CENTS),
+                    );
+                } else {
+                    note(ui, "(Pitch Switching only)");
+                }
+            },
         );
-        if self.mode == AudioMode::Voice {
-            // The analysis owns the bound (`voices::MAX_PITCH_SNAP_CENTS` --
-            // half a semitone, past which "snap if within" cannot mean
-            // anything a listener hears differently), and the widget follows
-            // it rather than carrying its own number: a range of 0..=100 here
-            // let the GUI offer values the CLI refuses by name.
-            ui.add(
-                egui::DragValue::new(&mut self.opts.pitch_snap_cents)
-                    .speed(1.0)
-                    .suffix(" cents")
-                    .range(0.0..=crate::audio::voices::MAX_PITCH_SNAP_CENTS),
-            );
-        } else {
-            note(ui, "(Pitch Switching only)");
-        }
-        ui.end_row();
     }
 
-    fn draw_level_rows(&mut self, ui: &mut Ui) {
-        ui.label("Gain").on_hover_text(
-            "Post-normalisation multiplier, applied and then CLAMPED at 1.0 -- so this is a \
-             way to make a render quieter, never louder. Above 1.0 it only clips (the file \
-             even gets smaller as it rises), which is why the slider stops there.",
+    fn draw_level_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
+        t.row_hover(
+            ui,
+            "Gain",
+            Some(
+                "Post-normalisation multiplier, applied and then CLAMPED at 1.0 -- so this is a \
+                 way to make a render quieter, never louder. Above 1.0 it only clips (the file \
+                 even gets smaller as it rises), which is why the slider stops there.",
+            ),
+            |ui| {
+                widgets::slider(ui, egui::Slider::new(&mut self.opts.gain, 0.0..=1.0));
+            },
         );
-        ui.add(egui::Slider::new(&mut self.opts.gain, 0.0..=1.0));
-        ui.end_row();
 
-        ui.label("Leveling").on_hover_text(
-            "Per-frame automatic gain control: 0 keeps the track's own dynamics, 1 drags \
-             every frame toward full scale. 1.0 was best on EVERY source tried in game -- \
-             piano, speech and a music box alike -- which reversed the argument that it \
-             would flatten music. A bank of sine emitters has ~30 dB of usable range where a \
-             master has 60, so a track's dynamics do not survive the trip regardless.",
+        t.row_hover(
+            ui,
+            "Leveling",
+            Some(
+                "Per-frame automatic gain control: 0 keeps the track's own dynamics, 1 drags \
+                 every frame toward full scale. 1.0 was best on EVERY source tried in game -- \
+                 piano, speech and a music box alike -- which reversed the argument that it \
+                 would flatten music. A bank of sine emitters has ~30 dB of usable range where a \
+                 master has 60, so a track's dynamics do not survive the trip regardless.",
+            ),
+            |ui| {
+                widgets::slider(ui, egui::Slider::new(&mut self.opts.leveling, 0.0..=1.0));
+            },
         );
-        ui.add(egui::Slider::new(&mut self.opts.leveling, 0.0..=1.0));
-        ui.end_row();
 
-        ui.label("Floor").on_hover_text(
-            "Bands this many dB below THE LOUDEST BAND IN THE SAME FRAME become exactly \
-             zero. Frame-relative, not track-relative: an absolute floor is measured against \
-             a scale one loud transient sets for the whole track, and in the limit silences \
-             a quiet passage outright.",
+        t.row_hover(
+            ui,
+            "Floor",
+            Some(
+                "Bands this many dB below THE LOUDEST BAND IN THE SAME FRAME become exactly \
+                 zero. Frame-relative, not track-relative: an absolute floor is measured against \
+                 a scale one loud transient sets for the whole track, and in the limit silences \
+                 a quiet passage outright.",
+            ),
+            |ui| {
+                widgets::slider(ui, egui::Slider::new(&mut self.opts.floor_db, -120.0..=0.0).suffix(" dB"));
+            },
         );
-        ui.add(egui::Slider::new(&mut self.opts.floor_db, -120.0..=0.0).suffix(" dB"));
-        ui.end_row();
     }
 
-    fn draw_speaker_rows(&mut self, ui: &mut Ui) {
+    fn draw_speaker_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
         // The waveform is a baked emitter property, exactly like the two radii
         // below (it is written next to them in `add_emitter`), so it lives in
         // this section rather than under Analysis -- and it applies in BOTH
         // modes, so it is not gated on the band grid. The four basic waves are
         // the whole list, Sine first (the default the selector opens on).
-        ui.label("Waveform").on_hover_text(
-            "The synth the TONAL bands play through -- the four basic waves. Sine (the \
-             default) is the classic bank tone; square, triangle and sawtooth are brighter \
-             and buzzier. Applies to tonal bands in both modes; white/pink noise bands keep \
-             their own noise assets and are unaffected.",
+        t.row_hover(
+            ui,
+            "Waveform",
+            Some(
+                "The synth the TONAL bands play through -- the four basic waves. Sine (the \
+                 default) is the classic bank tone; square, triangle and sawtooth are brighter \
+                 and buzzier. Applies to tonal bands in both modes; white/pink noise bands keep \
+                 their own noise assets and are unaffected.",
+            ),
+            |ui| {
+                widgets::combo(ui, "audio_synth", self.opts.tonal_synth.name(), 160.0, |ui| {
+                    for w in SynthWave::ALL {
+                        widgets::combo_item(ui, &mut self.opts.tonal_synth, w, w.name());
+                    }
+                });
+            },
         );
-        egui::ComboBox::from_id_salt("audio_synth")
-            .selected_text(self.opts.tonal_synth.name())
-            .show_ui(ui, |ui| {
-                for w in SynthWave::ALL {
-                    ui.selectable_value(&mut self.opts.tonal_synth, w, w.name());
-                }
-            });
-        ui.end_row();
 
-        ui.label("Placement").on_hover_text(
-            "Where the speaker cluster goes. Beside the chip on the main grid (the \
-             default), or IN the microchip's own inner grid, which makes the whole audio \
-             device one portable microchip. The speakers play from the chip's ORIGIN \
-             either way -- an AudioEmitter on a microchip inner grid emits from the chip's \
-             world position -- so this only moves the bricks, it does not change the \
-             sound, and costs nothing (same speakers, gates and wires).",
+        t.row_hover(
+            ui,
+            "Placement",
+            Some(
+                "Where the speaker cluster goes. Beside the chip on the main grid (the \
+                 default), or IN the microchip's own inner grid, which makes the whole audio \
+                 device one portable microchip. The speakers play from the chip's ORIGIN \
+                 either way -- an AudioEmitter on a microchip inner grid emits from the chip's \
+                 world position -- so this only moves the bricks, it does not change the \
+                 sound, and costs nothing (same speakers, gates and wires).",
+            ),
+            |ui| {
+                widgets::toggle(ui, &mut self.opts.speakers_in_chip, "In microchip");
+            },
         );
-        ui.checkbox(&mut self.opts.speakers_in_chip, "In microchip");
-        ui.end_row();
 
-        ui.label("Controls").on_hover_text(
-            "Pre-generate three physical Pause/Restart/Resume buttons on the main grid, \
-             wired into the clock so the render is controllable out of the box. Off means \
-             you wire the clock's control pins yourself. Adds 9 bricks and 6 wires; no \
-             extra gate.",
+        t.row_hover(
+            ui,
+            "Controls",
+            Some(
+                "Pre-generate three physical Pause/Restart/Resume buttons on the main grid, \
+                 wired into the clock so the render is controllable out of the box. Off means \
+                 you wire the clock's control pins yourself. Adds 9 bricks and 6 wires; no \
+                 extra gate.",
+            ),
+            |ui| {
+                widgets::toggle(ui, &mut self.opts.control_buttons, "Control buttons");
+            },
         );
-        ui.checkbox(&mut self.opts.control_buttons, "Control buttons");
-        ui.end_row();
 
-        ui.label("Inner Radius").on_hover_text(
-            "The radius inside which there is NO distance attenuation, in units (10 units = \
-             1 brick). NOT COSMETIC: turning spatialization off kills PANNING, not distance \
-             attenuation, so a listener outside this radius hears a distance-filtered slice \
-             of the spectrum that changes as they walk. That was the root cause of 'it \
-             doesn't sound like the song'.",
+        t.row_hover(
+            ui,
+            "Inner Radius",
+            Some(
+                "The radius inside which there is NO distance attenuation, in units (10 units = \
+                 1 brick). NOT COSMETIC: turning spatialization off kills PANNING, not distance \
+                 attenuation, so a listener outside this radius hears a distance-filtered slice \
+                 of the spectrum that changes as they walk. That was the root cause of 'it \
+                 doesn't sound like the song'.",
+            ),
+            |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.opts.inner_radius)
+                        .speed(10.0)
+                        .range(1.0..=100_000.0),
+                );
+            },
         );
-        ui.add(
-            egui::DragValue::new(&mut self.opts.inner_radius)
-                .speed(10.0)
-                .range(1.0..=100_000.0),
-        );
-        ui.end_row();
 
-        ui.label("Max Distance").on_hover_text(
-            "Where the sound stops, in units (10 units = 1 brick). Must be larger than Inner \
-             Radius; the renderer refuses an inverted pair rather than building a silent save.",
+        t.row_hover(
+            ui,
+            "Max Distance",
+            Some(
+                "Where the sound stops, in units (10 units = 1 brick). Must be larger than Inner \
+                 Radius; the renderer refuses an inverted pair rather than building a silent save.",
+            ),
+            |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.opts.max_distance)
+                        .speed(10.0)
+                        .range(1.0..=1_000_000.0),
+                );
+            },
         );
-        ui.add(
-            egui::DragValue::new(&mut self.opts.max_distance)
-                .speed(10.0)
-                .range(1.0..=1_000_000.0),
-        );
-        ui.end_row();
     }
 
     fn draw_input(&mut self, ui: &mut Ui) {
-        ui.add_space(8.0);
-        ui.separator();
-        ui.heading("Source");
         ui.label(
             "Pick an audio file (mp3/wav/flac/ogg/m4a), or a video container to pull an \
              audio track out of (mp4/mov/mkv/webm/avi/m4v).",
@@ -1218,9 +1301,7 @@ impl AudioApp {
             // per-container track pick here.
             let picking = self.pending_pick.is_some();
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add(Button::new("Pick audio file").fill(Color32::from_rgb(60, 60, 120)))
-                    .clicked()
+                if widgets::info(ui, format!("{}  Pick audio file", icons::FOLDER_OPEN)).clicked()
                     && !picking
                 {
                     self.pending_pick = Some(pick_audio_bytes());
@@ -1238,7 +1319,7 @@ impl AudioApp {
                 }
                 Some(input) => {
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("✖").clicked() {
+                        if widgets::danger_icon(ui, icons::XMARK).clicked() {
                             clear_input = true;
                         }
                         let detail = match input.info {
@@ -1264,9 +1345,7 @@ impl AudioApp {
         {
             let picking = self.pending_pick.is_some();
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add(Button::new("Pick audio file").fill(Color32::from_rgb(60, 60, 120)))
-                    .clicked()
+                if widgets::info(ui, format!("{}  Pick audio file", icons::FOLDER_OPEN)).clicked()
                     && !picking
                 {
                     self.pending_pick = Some(pick_audio_path());
@@ -1322,7 +1401,7 @@ impl AudioApp {
                     // Wrapped: a long file name would otherwise run the row
                     // off the edge of the pane.
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("✖").clicked() {
+                        if widgets::danger_icon(ui, icons::XMARK).clicked() {
                             clear_input = true;
                         }
                         let detail = match input.info {
@@ -1454,10 +1533,7 @@ impl AudioApp {
         }
 
         if self.input.is_some() {
-            if ui
-                .add(Button::new("Generate audio2brick save").fill(Color32::from_rgb(50, 90, 50)))
-                .clicked()
-            {
+            if widgets::primary(ui, format!("{}  Generate audio2brick save", icons::DOWNLOAD)).clicked() {
                 self.generate(shared);
             }
         } else {
@@ -1677,13 +1753,10 @@ impl AudioApp {
             self.modal
                 .draw(ui.ctx(), "audio", &prompt, "the audio was not converted");
         }
-        self.draw_settings(ui, shared);
-        self.draw_input(ui);
-        ui.add_space(8.0);
-        ui.separator();
-        self.draw_cost(ui);
-        ui.separator();
-        self.draw_submit(ui, shared);
+        // File selection above the settings, each in its own card.
+        widgets::section(ui, "Source", |ui| self.draw_input(ui));
+        ui.add_space(10.0);
+        widgets::section(ui, "Settings", |ui| self.draw_settings(ui, shared));
         // A pick/probe resolving on its own thread (or an async browser upload)
         // has nothing else to wake the event loop, so the readout would
         // otherwise only pick up the file on the user's next mouse move.
@@ -1694,6 +1767,13 @@ impl AudioApp {
         if pending {
             ui.ctx().request_repaint();
         }
+    }
+
+    /// The fixed footer: the cost readout and the Generate button.
+    pub fn draw_footer(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
+        bound_pane_width(ui);
+        self.draw_cost(ui);
+        self.draw_submit(ui, shared);
     }
 }
 
