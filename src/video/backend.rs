@@ -134,10 +134,29 @@ fn open_builtin_checked(path: &Path) -> Result<BuiltinVideoSource, String> {
     // check as re-derived from the file, not trusted from an earlier step.
     let demuxer = Demuxer::open(path)?;
     if builtin::sps_declares_bt2020(&demuxer) {
-        return Err(bt2020_refusal(path));
+        return Err(bt2020_refusal(&path.display().to_string()));
     }
 
     Ok(source)
+}
+
+/// Web build: open a video container from uploaded bytes via the builtin
+/// (pure-Rust) backend. There is no ffmpeg in the browser, so only an
+/// H.264/CABAC track with out-of-band SPS/PPS and a non-BT.2020 matrix opens --
+/// everything else is refused with the same guards `open_builtin_checked`
+/// applies on native (a fresh demuxer for the BT.2020 check, as the source does
+/// not expose its own), rather than a silent wrong decode.
+#[cfg(target_arch = "wasm32")]
+pub fn open_video_bytes(
+    name: &str,
+    bytes: std::sync::Arc<[u8]>,
+) -> Result<Box<dyn FrameSource>, String> {
+    let source = BuiltinVideoSource::open_bytes(name, std::sync::Arc::clone(&bytes))?;
+    let demuxer = Demuxer::open_bytes(name, bytes)?;
+    if builtin::sps_declares_bt2020(&demuxer) {
+        return Err(bt2020_refusal(name));
+    }
+    Ok(Box::new(source))
 }
 
 /// Why the builtin backend could not open a file -- specifically, whether
@@ -265,14 +284,13 @@ pub fn open_video_ensuring(
 /// Names the reason (so `err.contains("BT.2020")` is a stable, testable
 /// contract) and suggests the same next step every other refusal in this
 /// backend does.
-fn bt2020_refusal(path: &Path) -> String {
+fn bt2020_refusal(label: &str) -> String {
     format!(
-        "{}: this H.264 stream's SPS declares a BT.2020 colour matrix (matrix_coefficients 9 \
-         or 10), which the builtin decoder falls back to a BT.601 conversion for rather than \
+        "{label}: this H.264 stream's SPS declares a BT.2020 colour matrix (matrix_coefficients \
+         9 or 10), which the builtin decoder falls back to a BT.601 conversion for rather than \
          decoding correctly -- measured 2.83-2.91 mean abs per-channel difference against \
          ffmpeg on synthetic content, close enough to this project's 3.0 \"wrong\" threshold \
-         that real saturated footage could silently exceed it; use --backend ffmpeg instead",
-        path.display()
+         that real saturated footage could silently exceed it; use --backend ffmpeg instead"
     )
 }
 

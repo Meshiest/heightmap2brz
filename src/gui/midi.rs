@@ -21,23 +21,17 @@ use crate::{
         midi_preview::{self, Preview},
         util::{bound_pane_width, deliver_world, draw_out_file_warnings, refuse_bad_out_file, settings_grid},
     },
-    midi::{Instrument, MidiOptions, MidiSummary, ToneAssignment, analyze_midi, preview::synthesize},
+    gui::util::pick_midi_bytes,
+    midi::{Instrument, MidiOptions, MidiSummary, ToneAssignment, analyze_midi, discover, preview::synthesize},
 };
 use egui::{Button, Color32, Ui};
 use log::{error, info};
 use poll_promise::Promise;
 
-// Reading and parsing a picked file is native-only (there is no picker on wasm),
-// so `discover` and the picker helper are imported only there.
-#[cfg(not(target_arch = "wasm32"))]
-use crate::{gui::util::pick_midi_path, midi::discover};
-
 /// A picked and parsed MIDI file: its display name, the raw bytes (kept for the
 /// build and the preview, both of which re-parse from them), and what `discover`
-/// found. Never `Some` on wasm -- there is no picker there -- so its fields are
-/// only read on native; `name` earns the `allow(dead_code)` the others get for
-/// free by being read in the cross-target summary/table/build code.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+/// found. The browser reads an uploaded file into these same bytes, so this is
+/// live on both targets.
 struct PickedMidi {
     name: String,
     bytes: Vec<u8>,
@@ -49,8 +43,8 @@ pub struct MidiApp {
     /// The picked file, or `None`. Never `Some` on wasm (no picker), which is
     /// also why `draw_submit` never offers Generate or Preview there.
     input: Option<PickedMidi>,
-    #[cfg(not(target_arch = "wasm32"))]
-    pending_pick: Option<Promise<Option<std::path::PathBuf>>>,
+    /// The in-flight file picker (native dialog or browser upload), if any.
+    pending_pick: Option<Promise<Option<(String, Vec<u8>)>>>,
     /// One tone per discovered instrument, resized (to all-Sine) each time a new
     /// file is parsed. Kept beside `opts` rather than inside its
     /// [`ToneAssignment`] so the per-row combos can bind a plain slice; the
@@ -86,7 +80,6 @@ impl Default for MidiApp {
     fn default() -> Self {
         Self {
             input: None,
-            #[cfg(not(target_arch = "wasm32"))]
             pending_pick: None,
             tones: Vec::new(),
             volumes: Vec::new(),
@@ -116,42 +109,28 @@ impl MidiApp {
         }
     }
 
-    /// Poll the in-flight picker: on a resolved path, read the (small) file and
-    /// parse it right here -- a `.mid` is kilobytes and `discover` is cheap, so
-    /// there is nothing to gain from a second worker thread. A read or parse
-    /// failure is logged and clears the input rather than surfacing half a file.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Poll the in-flight picker: on a resolved upload, parse the (small) bytes
+    /// right here -- a `.mid` is kilobytes and `discover` is cheap, so there is
+    /// nothing to gain from a second worker thread. A parse failure is logged and
+    /// clears the input rather than surfacing half a file. Works on both targets:
+    /// native and browser both hand back `(name, bytes)`.
     fn poll_picks(&mut self) {
         let Some(promise) = self.pending_pick.take() else {
             return;
         };
         match promise.try_take() {
             Ok(result) => {
-                if let Some(path) = result {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path.display().to_string());
-                    self.load_midi(name, &path);
+                if let Some((name, bytes)) = result {
+                    self.load_midi(name, bytes);
                 }
             }
             Err(promise) => self.pending_pick = Some(promise),
         }
     }
 
-    /// Read and parse the picked file, storing the result (or logging and
-    /// clearing on failure). Split out of `poll_picks` so the read+parse path is
-    /// one place.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn load_midi(&mut self, name: String, path: &std::path::Path) {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!("could not read {name}: {e}");
-                self.input = None;
-                return;
-            }
-        };
+    /// Parse the picked file's bytes, storing the result (or logging and clearing
+    /// on failure). Split out of `poll_picks` so the parse path is one place.
+    fn load_midi(&mut self, name: String, bytes: Vec<u8>) {
         match discover(&bytes) {
             Ok((instruments, summary)) => {
                 info!(
@@ -290,58 +269,46 @@ impl MidiApp {
         ui.heading("Source");
         ui.label("Pick a Standard MIDI File (.mid / .midi).");
 
-        #[cfg(target_arch = "wasm32")]
-        {
-            ui.colored_label(
-                Color32::from_rgb(255, 140, 60),
-                "Loading a MIDI file needs the desktop build: the browser build has no local \
-                 file path to read. The settings above are live and correct.",
-            );
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let picking = self.pending_pick.is_some();
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add(Button::new("Pick MIDI file").fill(Color32::from_rgb(60, 60, 120)))
-                    .clicked()
-                    && !picking
-                {
-                    self.pending_pick = Some(pick_midi_path());
-                }
-                if picking {
-                    ui.spinner();
-                    ui.label("reading...");
-                }
-            });
-
-            let mut clear = false;
-            match &self.input {
-                None => {
-                    ui.label("No MIDI file selected.");
-                }
-                Some(input) => {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("✖").clicked() {
-                            clear = true;
-                        }
-                        ui.label(&input.name);
-                    });
-                }
+        // The picker reads bytes on both targets: a native file dialog, or a
+        // browser file-upload blob read into memory.
+        let picking = self.pending_pick.is_some();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add(Button::new("Pick MIDI file").fill(Color32::from_rgb(60, 60, 120)))
+                .clicked()
+                && !picking
+            {
+                self.pending_pick = Some(pick_midi_bytes());
             }
-            if clear {
-                self.input = None;
-                self.tones.clear();
-                self.volumes.clear();
-                self.selected.clear();
-                self.preview.stop();
-                self.preview_started = None;
+            if picking {
+                ui.spinner();
+                ui.label("reading...");
+            }
+        });
+
+        let mut clear = false;
+        match &self.input {
+            None => {
+                ui.label("No MIDI file selected.");
+            }
+            Some(input) => {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("✖").clicked() {
+                        clear = true;
+                    }
+                    ui.label(&input.name);
+                });
             }
         }
+        if clear {
+            self.input = None;
+            self.tones.clear();
+            self.volumes.clear();
+            self.selected.clear();
+            self.preview.stop();
+            self.preview_started = None;
+        }
 
-        // Cross-target: draws nothing unless a file is parsed, which only
-        // happens on native -- so this is a no-op on wasm rather than gated.
         self.draw_summary(ui);
         self.draw_instrument_table(ui);
     }
@@ -608,10 +575,7 @@ impl MidiApp {
                 self.generate(shared);
             }
         } else {
-            #[cfg(not(target_arch = "wasm32"))]
             ui.label("Pick a MIDI file to continue...");
-            #[cfg(target_arch = "wasm32")]
-            ui.label("MIDI rendering is not available in the browser build.");
         }
     }
 
@@ -644,8 +608,8 @@ impl MidiApp {
 
     /// On click: schedule -> build the speaker world -> deliver. The same path
     /// as `main.rs`'s midi branch, dispatched on the same [`MidiOptions`].
-    /// Native runs it on a background thread; wasm has no picker so this path is
-    /// unreachable there, but it runs synchronously to keep one `generate`.
+    /// Native runs it on a background thread; the browser (no threads) runs it
+    /// inline, then `deliver_world` triggers a download of the `.brz`.
     fn generate(&mut self, shared: &SharedOptions) {
         if self.pending_generate.is_some() {
             return error!("a build is already in progress");
@@ -699,7 +663,6 @@ impl MidiApp {
 
     pub fn draw(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
         bound_pane_width(ui);
-        #[cfg(not(target_arch = "wasm32"))]
         self.poll_picks();
         self.poll_generate();
 
@@ -709,10 +672,9 @@ impl MidiApp {
         ui.separator();
         self.draw_submit(ui, shared);
 
-        // A picker resolving on its own thread has nothing else to wake the
-        // event loop, so without this the picked file would only appear on the
-        // user's next mouse move.
-        #[cfg(not(target_arch = "wasm32"))]
+        // A picker resolving on its own thread (or an async browser upload) has
+        // nothing else to wake the event loop, so without this the picked file
+        // would only appear on the user's next mouse move.
         if self.pending_pick.is_some() {
             ui.ctx().request_repaint();
         }

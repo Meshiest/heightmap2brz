@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 /// -- so that [`FrameSource::open`] can build a brand new [`Demuxer`] and
 /// decoder each time, which is what makes two opens agree frame for frame.
 pub struct BuiltinVideoSource {
-    path: PathBuf,
+    media: Media,
     width: u32,
     height: u32,
     fps: f32,
@@ -41,6 +41,32 @@ pub struct BuiltinVideoSource {
     /// Only ever used to size a progress bar -- see
     /// [`FrameSource::frame_count_estimate`] and `VideoTrack::duration_s`.
     duration_s: Option<f64>,
+}
+
+/// The video input a [`BuiltinVideoSource`] re-opens per stream: a path
+/// (native, streamed) or an in-memory blob (the web build's uploaded bytes,
+/// which have no path). Re-opening a fresh [`Demuxer`] each time is what makes
+/// two opens agree frame for frame -- see the struct's own doc.
+#[derive(Clone)]
+enum Media {
+    Path(PathBuf),
+    Bytes { bytes: std::sync::Arc<[u8]>, label: String },
+}
+
+impl Media {
+    fn open_demuxer(&self) -> Result<Demuxer, String> {
+        match self {
+            Media::Path(p) => Demuxer::open(p),
+            Media::Bytes { bytes, label } => Demuxer::open_bytes(label, std::sync::Arc::clone(bytes)),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Media::Path(p) => p.display().to_string(),
+            Media::Bytes { label, .. } => label.clone(),
+        }
+    }
 }
 
 impl BuiltinVideoSource {
@@ -58,14 +84,25 @@ impl BuiltinVideoSource {
     ///   caller at the same explanation and the same next step.
     /// - an H.264 track with no out-of-band SPS/PPS to decode with at all.
     pub fn open_path(path: &Path) -> Result<Self, String> {
-        let demuxer = Demuxer::open(path)?;
+        Self::open_media(Media::Path(path.to_path_buf()))
+    }
+
+    /// Like [`open_path`](Self::open_path), but over an in-memory blob (the web
+    /// build, whose uploaded files have no path). `name` supplies the error
+    /// label; the bytes are re-cursored per stream, as a path is re-opened.
+    pub fn open_bytes(name: &str, bytes: std::sync::Arc<[u8]>) -> Result<Self, String> {
+        Self::open_media(Media::Bytes { bytes, label: name.to_string() })
+    }
+
+    fn open_media(media: Media) -> Result<Self, String> {
+        let label = media.label();
+        let demuxer = media.open_demuxer()?;
         let track = demuxer.track();
 
         if track.codec != "h264" {
             return Err(format!(
-                "{}: the builtin decode backend only supports H.264, but this file's video \
+                "{label}: the builtin decode backend only supports H.264, but this file's video \
                  track is {:?}; use --backend ffmpeg",
-                path.display(),
                 track.codec
             ));
         }
@@ -73,32 +110,29 @@ impl BuiltinVideoSource {
             EntropyCoding::Cabac => {}
             EntropyCoding::Cavlc => {
                 return Err(format!(
-                    "{}: this H.264 stream uses CAVLC entropy coding, which the builtin \
+                    "{label}: this H.264 stream uses CAVLC entropy coding, which the builtin \
                      decoder (rust_h264) silently decodes to visibly wrong pixels rather than \
-                     erroring; use --backend ffmpeg instead",
-                    path.display()
+                     erroring; use --backend ffmpeg instead"
                 ));
             }
             EntropyCoding::Unknown => {
                 return Err(format!(
-                    "{}: this H.264 stream's entropy coding mode could not be determined, so \
+                    "{label}: this H.264 stream's entropy coding mode could not be determined, so \
                      it is refused the same as CAVLC -- guessing CABAC on a stream that turns \
                      out to be CAVLC would silently decode to wrong pixels; use --backend \
-                     ffmpeg instead",
-                    path.display()
+                     ffmpeg instead"
                 ));
             }
         }
         if demuxer.avc_decoder_config().is_none() {
             return Err(format!(
-                "{}: no out-of-band H.264 parameter sets (avcC/CodecPrivate) were found, so \
-                 there is no SPS/PPS to decode with; use --backend ffmpeg",
-                path.display()
+                "{label}: no out-of-band H.264 parameter sets (avcC/CodecPrivate) were found, so \
+                 there is no SPS/PPS to decode with; use --backend ffmpeg"
             ));
         }
 
         Ok(Self {
-            path: path.to_path_buf(),
+            media,
             width: track.width,
             height: track.height,
             fps: track.fps,
@@ -132,7 +166,7 @@ impl FrameSource for BuiltinVideoSource {
     }
 
     fn open(&self) -> Result<Box<dyn FrameStream + '_>, String> {
-        Ok(Box::new(BuiltinFrameStream::new(&self.path, self.width, self.height)?))
+        Ok(Box::new(BuiltinFrameStream::new(&self.media, self.width, self.height)?))
     }
 }
 
@@ -177,9 +211,9 @@ struct BuiltinFrameStream {
 }
 
 impl BuiltinFrameStream {
-    fn new(path: &Path, width: u32, height: u32) -> Result<Self, String> {
-        let display_path = path.display().to_string();
-        let demuxer = Demuxer::open(path)?;
+    fn new(media: &Media, width: u32, height: u32) -> Result<Self, String> {
+        let display_path = media.label();
+        let demuxer = media.open_demuxer()?;
 
         // `BuiltinVideoSource::open_path` already checked this is `Some` for the
         // source this stream was built from, but `open()` re-derives

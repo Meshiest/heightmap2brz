@@ -11,8 +11,56 @@
 //! determined) is load-bearing for a later task, not merely descriptive.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// A `Read + Seek + Send` reader, boxed so the demuxer works over either a
+/// streamed file (native) or an in-memory blob (the web build's uploaded
+/// bytes). `Send` so a native render thread may own the demuxer.
+trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
+/// Where the demuxer's readers come from: a path re-opened per handle (native,
+/// streamed from disk) or a blob re-cursored per handle (web, where an uploaded
+/// file is already fully in memory and has no path). Both `re_mp4` and
+/// `matroska_demuxer` take any `Read + Seek`, and the MP4 path needs two
+/// independent handles (one consumed parsing the `moov`, one retained to read
+/// sample bytes on demand), so this hands out FRESH readers rather than sharing
+/// one -- which for a `File` preserves the streamed, never-whole-file memory
+/// characteristic documented on [`Demuxer::open`].
+enum Src {
+    Path(PathBuf),
+    Bytes { bytes: Arc<[u8]>, label: String },
+}
+
+impl Src {
+    fn reader(&self) -> Result<Box<dyn ReadSeek>, String> {
+        match self {
+            Src::Path(p) => Ok(Box::new(
+                File::open(p).map_err(|e| format!("failed to open {}: {e}", p.display()))?,
+            )),
+            Src::Bytes { bytes, .. } => Ok(Box::new(Cursor::new(Arc::clone(bytes)))),
+        }
+    }
+
+    fn len(&self) -> Result<u64, String> {
+        match self {
+            Src::Path(p) => Ok(File::open(p)
+                .and_then(|f| f.metadata())
+                .map_err(|e| format!("failed to stat {}: {e}", p.display()))?
+                .len()),
+            Src::Bytes { bytes, .. } => Ok(bytes.len() as u64),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Src::Path(p) => p.display().to_string(),
+            Src::Bytes { label, .. } => label.clone(),
+        }
+    }
+}
 
 /// H.264 entropy coding mode, from the PPS `entropy_coding_mode_flag`.
 ///
@@ -122,27 +170,35 @@ impl Demuxer {
     /// handing it a `File` instead of an in-memory `Cursor` was the entire
     /// fix for that half.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let mut file =
-            File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        Self::open_src(Src::Path(path.to_path_buf()))
+    }
 
-        // Sniffs from a small magic-number read at the front of the file,
-        // not the whole thing -- then rewinds so the dispatched `open_*`
-        // starts from byte 0 regardless of how many of the (at most 8) magic
-        // bytes a short file actually had.
+    /// Like [`open`](Self::open), but over an in-memory blob (the web build,
+    /// whose uploaded files have no path). `name` supplies the error label; the
+    /// bytes are re-cursored per reader, exactly as a path is re-opened.
+    pub fn open_bytes(name: &str, bytes: Arc<[u8]>) -> Result<Self, String> {
+        Self::open_src(Src::Bytes { bytes, label: name.to_string() })
+    }
+
+    fn open_src(src: Src) -> Result<Self, String> {
+        let label = src.label();
+
+        // Sniff from a small magic-number read off a throwaway reader; the
+        // dispatched `open_*` each take their own fresh reader(s) from `src`, so
+        // there is nothing to rewind.
+        let mut reader = src.reader()?;
         let mut magic = [0u8; 8];
-        let n = file
+        let n = reader
             .read(&mut magic)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| format!("failed to seek {}: {e}", path.display()))?;
+            .map_err(|e| format!("failed to read {label}: {e}"))?;
+        drop(reader);
 
         match sniff(&magic[..n]) {
-            Sniff::Mp4 => open_mp4(file, path),
-            Sniff::Matroska => open_mkv(file),
+            Sniff::Mp4 => open_mp4(&src),
+            Sniff::Matroska => open_mkv(&src),
             Sniff::Unknown => Err(format!(
-                "{}: not a recognised video container (expected an MP4/MOV \
-                 `ftyp` box or an MKV/WebM EBML header)",
-                path.display()
+                "{label}: not a recognised video container (expected an MP4/MOV \
+                 `ftyp` box or an MKV/WebM EBML header)"
             )),
         }
     }
@@ -209,7 +265,7 @@ fn sniff(bytes: &[u8]) -> Sniff {
 /// materialized for the whole clip up front. See [`Demuxer::open`]'s doc for
 /// the memory characteristic this gives the whole `Demuxer`.
 struct Mp4Demux {
-    file: File,
+    reader: Box<dyn ReadSeek>,
     samples: Vec<re_mp4::Sample>,
     next_index: usize,
 }
@@ -223,11 +279,11 @@ impl Mp4Demux {
         let range = sample.byte_range();
         let len = range.end.saturating_sub(range.start);
 
-        self.file.seek(SeekFrom::Start(range.start as u64)).map_err(|e| {
+        self.reader.seek(SeekFrom::Start(range.start as u64)).map_err(|e| {
             format!("seeking to mp4 sample {} at byte {}: {e}", self.next_index - 1, range.start)
         })?;
         let mut data = vec![0u8; len];
-        self.file.read_exact(&mut data).map_err(|e| {
+        self.reader.read_exact(&mut data).map_err(|e| {
             format!(
                 "mp4 sample {} claims byte range {:?}, past the end of the file: {e}",
                 self.next_index - 1,
@@ -238,21 +294,15 @@ impl Mp4Demux {
     }
 }
 
-fn open_mp4(file: File, path: &Path) -> Result<Demuxer, String> {
-    let size = file
-        .metadata()
-        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-        .len();
-    // `re_mp4::Mp4::read` consumes its reader parsing metadata (`moov`
-    // etc.) and does not hand it back, but `Mp4Demux` above needs a live
-    // handle afterwards to read sample bytes on demand -- so it gets a
-    // clone. `file` itself is untouched by the parse below and is handed to
-    // `Mp4Demux` at its current position (0, from `Demuxer::open`'s rewind);
-    // that starting position doesn't actually matter since every
-    // `next_packet` call seeks explicitly before reading.
-    let read_handle = file
-        .try_clone()
-        .map_err(|e| format!("failed to clone file handle for {}: {e}", path.display()))?;
+fn open_mp4(src: &Src) -> Result<Demuxer, String> {
+    let size = src.len()?;
+    // `re_mp4::Mp4::read` consumes its reader parsing metadata (`moov` etc.)
+    // and does not hand it back, but `Mp4Demux` below needs a live handle
+    // afterwards to read sample bytes on demand -- so each gets its own fresh
+    // reader from `src` (a second `File::open` on native, a second `Cursor`
+    // over the shared `Arc` on the web). Every `next_packet` seeks explicitly
+    // before reading, so the retained reader's starting position is irrelevant.
+    let read_handle = src.reader()?;
 
     let mp4 = re_mp4::Mp4::read(read_handle, size)
         .map_err(|e| format!("invalid mp4/mov container: {e}"))?;
@@ -335,7 +385,7 @@ fn open_mp4(file: File, path: &Path) -> Result<Demuxer, String> {
 
     Ok(Demuxer {
         track: VideoTrack { codec, width, height, fps, frame_count, duration_s, entropy },
-        backend: Backend::Mp4(Mp4Demux { file, samples, next_index: 0 }),
+        backend: Backend::Mp4(Mp4Demux { reader: src.reader()?, samples, next_index: 0 }),
         avc_config,
     })
 }
@@ -350,7 +400,7 @@ fn open_mp4(file: File, path: &Path) -> Result<Demuxer, String> {
 /// instead of `Cursor<Vec<u8>>` was the entire memory fix for this half of
 /// the demuxer. See [`Demuxer::open`]'s doc for the resulting characteristic.
 struct MkvDemux {
-    file: matroska_demuxer::MatroskaFile<File>,
+    file: matroska_demuxer::MatroskaFile<Box<dyn ReadSeek>>,
     video_track: u64,
 }
 
@@ -374,8 +424,8 @@ impl MkvDemux {
     }
 }
 
-fn open_mkv(raw_file: File) -> Result<Demuxer, String> {
-    let file = matroska_demuxer::MatroskaFile::open(raw_file)
+fn open_mkv(src: &Src) -> Result<Demuxer, String> {
+    let file = matroska_demuxer::MatroskaFile::open(src.reader()?)
         .map_err(|e| format!("invalid mkv/webm container: {e}"))?;
 
     let track = file

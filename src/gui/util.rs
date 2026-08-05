@@ -241,23 +241,71 @@ pub fn pick_audio_path() -> Promise<Option<std::path::PathBuf>> {
     Promise::spawn_thread("pick_audio_path", move || pollster::block_on(pick))
 }
 
-/// Pick a MIDI file, returning its path. Native only, mirroring
-/// [`pick_audio_path`] -- the MIDI pane reads the (small) file's bytes itself
-/// once the path resolves, so there is no re-openable source to keep. Defaults
-/// the dialog into the user's Music folder, where a `.mid` most often lives; if
-/// [`dirs::audio_dir`] cannot name one (a headless or unusual profile) the
-/// dialog opens wherever rfd defaults instead. `None` if the user cancels.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn pick_midi_path() -> Promise<Option<std::path::PathBuf>> {
+/// Pick an audio file's (or audio-carrying container's) raw bytes and name --
+/// the web build's counterpart to [`pick_audio_path`]. Bytes rather than a path
+/// because a browser upload has none; the symphonia decoder re-cursors over the
+/// retained blob to decode a song twice (peak, then emit), so a few MB in memory
+/// replaces the native re-openable path. Web only: the native pane keeps the
+/// path so it can also reach the ffmpeg backend and per-container track pick.
+#[cfg(target_arch = "wasm32")]
+pub fn pick_audio_bytes() -> Promise<Option<(String, Vec<u8>)>> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .add_filter("Audio Files", &crate::audio::source::AUDIO_EXTENSIONS)
+        .add_filter("Video Files", &crate::video::source::VIDEO_EXTENSIONS);
+    let pick = async move {
+        let handle = dialog.pick_file().await?;
+        let name = handle.file_name();
+        let bytes = handle.read().await;
+        Some((name, bytes))
+    };
+    Promise::spawn_async(pick)
+}
+
+/// Pick a video file's raw bytes and name -- the web build's counterpart to
+/// [`pick_video_path`]. Bytes because a browser upload has no path, decoded by
+/// the pure-Rust builtin backend (there is no ffmpeg on wasm). Web only.
+#[cfg(target_arch = "wasm32")]
+pub fn pick_video_bytes() -> Promise<Option<(String, Vec<u8>)>> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .add_filter("Video Files", &crate::video::source::VIDEO_EXTENSIONS);
+    let pick = async move {
+        let handle = dialog.pick_file().await?;
+        let name = handle.file_name();
+        let bytes = handle.read().await;
+        Some((name, bytes))
+    };
+    Promise::spawn_async(pick)
+}
+
+/// Pick a MIDI file's raw bytes and name -- bytes rather than a path so it works
+/// on the web too (the browser has no filesystem path, only an uploaded blob it
+/// can read into memory). A `.mid` is kilobytes and the whole MIDI pipeline
+/// (`discover`, `analyze_midi`, `synthesize`, the builder) already takes
+/// `&[u8]`, so there is nothing to gain from a re-openable path source. On
+/// native the dialog defaults into the user's Music folder, where a `.mid` most
+/// often lives; if [`dirs::audio_dir`] cannot name one the dialog opens wherever
+/// rfd defaults. `None` if the user cancels.
+pub fn pick_midi_bytes() -> Promise<Option<(String, Vec<u8>)>> {
+    #[allow(unused_mut)]
     let mut dialog = rfd::AsyncFileDialog::new().add_filter("MIDI Files", &["mid", "midi"]);
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(dir) = dirs::audio_dir() {
         dialog = dialog.set_directory(dir);
     }
     let pick = async move {
         let handle = dialog.pick_file().await?;
-        Some(handle.path().to_path_buf())
+        let name = handle.file_name();
+        let bytes = handle.read().await;
+        Some((name, bytes))
     };
-    Promise::spawn_thread("pick_midi_path", move || pollster::block_on(pick))
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Promise::spawn_thread("pick_midi_bytes", move || pollster::block_on(pick))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Promise::spawn_async(pick)
+    }
 }
 
 /// Small square thumbnail for a picked image, served via egui's bytes loader.

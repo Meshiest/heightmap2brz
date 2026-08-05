@@ -38,16 +38,13 @@ use image::RgbaImage;
 use log::{error, info};
 use poll_promise::Promise;
 
-// A video file gets its own picker (returns a PATH, never bytes -- see
-// `gui::util::pick_video_path`'s doc) and its own decode path
-// (`video::backend`), neither of which exists on wasm: `pick_video_path` is
-// itself `#[cfg(not(target_arch = "wasm32"))]` (a browser file handle has no
-// real filesystem path to hand a streaming backend), and `video::ffmpeg`
-// (subprocess spawning) does not compile there at all. So every piece of
-// video support in this file -- the `Input::Video` variant, the picker
-// button, the backend dropdown, the download-consent modal -- is gated the
-// same way, and the Video pane simply keeps its pre-Task-8 two buttons
-// (animated file, frame sequence) on wasm.
+// A video file is decoded very differently per target. NATIVE picks a PATH and
+// streams it, and can reach the ffmpeg backend (subprocess) as well as the
+// pure-Rust builtin one -- so the backend dropdown and the download-consent
+// modal are native-only. The WEB build uploads the file's BYTES and decodes
+// them with the builtin (H.264/CABAC-only) backend alone, since ffmpeg cannot
+// spawn a subprocess in a browser. Both feed one `Input::Video`/`GenSource::
+// Video` (its fields differ by target) and one `backend` entry point.
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{
     gui::util::{FfmpegModal, draw_cancel_button, pick_video_path},
@@ -56,6 +53,8 @@ use crate::{
         ffmpeg::{DownloadConsent, ensure_ffmpeg, ffmpeg_available},
     },
 };
+#[cfg(target_arch = "wasm32")]
+use crate::{gui::util::pick_video_bytes, video::backend};
 
 // `MAX_FRAMES` (imported above): the largest frame count a render may carry
 // across all banks, now that a clip's frames can spill across multiple wire
@@ -175,12 +174,18 @@ enum Input {
     /// Left undecoded: `decode_sequence` bakes the *current* fps in, so
     /// decoding eagerly would go stale the moment the user moves the slider.
     Sequence(Vec<PickedImage>),
-    /// Identified only by path; opening is deferred to `generate`, unlike
-    /// `Animated`'s eager decode -- probing can spawn `ffprobe` or need a
-    /// download-consent decision this pane can't make at pick time.
-    /// `draw_cost` shows a plain notice rather than a real estimate here.
-    #[cfg(not(target_arch = "wasm32"))]
-    Video { path: std::path::PathBuf, name: String },
+    /// Held undecoded (a path on native, the uploaded bytes on the web);
+    /// opening is deferred to `generate`, unlike `Animated`'s eager decode --
+    /// probing can spawn `ffprobe` or need a download-consent decision this pane
+    /// can't make at pick time. `draw_cost` shows a plain notice rather than a
+    /// real estimate here.
+    Video {
+        #[cfg(not(target_arch = "wasm32"))]
+        path: std::path::PathBuf,
+        #[cfg(target_arch = "wasm32")]
+        bytes: std::sync::Arc<[u8]>,
+        name: String,
+    },
 }
 
 /// The picked input, captured just before a render is handed to the worker.
@@ -194,10 +199,17 @@ enum Input {
 enum GenSource {
     Clip(Clip),
     Sequence(Vec<(String, Arc<RgbaImage>)>),
-    /// Opening happens inside the worker via `backend::open_video_ensuring`,
-    /// the same call `main.rs` makes for the CLI.
-    #[cfg(not(target_arch = "wasm32"))]
-    Video(std::path::PathBuf),
+    /// Opening happens inside the worker: `backend::open_video_ensuring` from a
+    /// path on native (the same call `main.rs` makes for the CLI), or
+    /// `backend::open_video_bytes` from the uploaded blob on the web.
+    Video {
+        #[cfg(not(target_arch = "wasm32"))]
+        path: std::path::PathBuf,
+        #[cfg(target_arch = "wasm32")]
+        bytes: std::sync::Arc<[u8]>,
+        #[cfg(target_arch = "wasm32")]
+        name: String,
+    },
 }
 
 /// The result of [`VideoApp::check_ffmpeg_consent`]: whether resolving a
@@ -220,10 +232,12 @@ pub struct VideoApp {
     input: Input,
     pending_pick_animated: Option<Promise<Option<(String, Vec<u8>)>>>,
     pending_pick_sequence: Option<Promise<Vec<PickedImage>>>,
-    /// The in-flight "pick a video path" dialog. Native only -- see
-    /// `Input::Video`'s doc.
+    /// The in-flight video picker: a path dialog on native, a byte upload on
+    /// the web.
     #[cfg(not(target_arch = "wasm32"))]
     pending_pick_video: Option<Promise<Option<std::path::PathBuf>>>,
+    #[cfg(target_arch = "wasm32")]
+    pending_pick_video: Option<Promise<Option<(String, Vec<u8>)>>>,
     /// Which decode backend `generate` uses for an `Input::Video` source.
     #[cfg(not(target_arch = "wasm32"))]
     backend: Backend,
@@ -346,7 +360,6 @@ impl Default for VideoApp {
             input: Input::None,
             pending_pick_animated: None,
             pending_pick_sequence: None,
-            #[cfg(not(target_arch = "wasm32"))]
             pending_pick_video: None,
             #[cfg(not(target_arch = "wasm32"))]
             backend: Backend::Auto,
@@ -451,7 +464,6 @@ impl VideoApp {
                 // mirrors that rather than inventing a separate number.
                 Some((first.image.width(), first.image.height(), frames.len(), self.fps))
             }
-            #[cfg(not(target_arch = "wasm32"))]
             Input::Video { .. } => None,
         }
     }
@@ -681,17 +693,26 @@ impl VideoApp {
             }
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
         if let Some(promise) = self.pending_pick_video.take() {
             match promise.try_take() {
                 Ok(result) => {
-                    if let Some(path) = result {
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| path.display().to_string());
-                        info!("Selected video: {}", path.display());
-                        self.input = Input::Video { path, name };
+                    if let Some(picked) = result {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let path = picked;
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.display().to_string());
+                            info!("Selected video: {}", path.display());
+                            self.input = Input::Video { path, name };
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let (name, bytes) = picked;
+                            info!("Selected video: {name}");
+                            self.input = Input::Video { bytes: bytes.into(), name };
+                        }
                     }
                 }
                 Err(promise) => self.pending_pick_video = Some(promise),
@@ -1327,19 +1348,20 @@ impl VideoApp {
         ui.add_space(8.0);
         ui.separator();
         ui.heading("Source");
-        #[cfg(not(target_arch = "wasm32"))]
         ui.label(
             "Pick a single animated file (GIF/APNG/WebP), a numbered frame sequence (PNG/JPG), \
              or a video file (mp4/mov/mkv/webm/avi/m4v).",
         );
         #[cfg(target_arch = "wasm32")]
         ui.label(
-            "Pick a single animated file (GIF/APNG/WebP) or a numbered frame sequence (PNG/JPG).",
+            "In the browser a video file is decoded by the pure-Rust builtin backend, which \
+             handles H.264/CABAC in MP4 or MKV only; anything else is refused with a clear \
+             message (the desktop build's ffmpeg backend covers the rest).",
         );
 
-        let picking = self.pending_pick_animated.is_some() || self.pending_pick_sequence.is_some();
-        #[cfg(not(target_arch = "wasm32"))]
-        let picking = picking || self.pending_pick_video.is_some();
+        let picking = self.pending_pick_animated.is_some()
+            || self.pending_pick_sequence.is_some()
+            || self.pending_pick_video.is_some();
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add(Button::new("Pick animated file").fill(Color32::from_rgb(60, 60, 120)))
@@ -1355,16 +1377,19 @@ impl VideoApp {
             {
                 self.pending_pick_sequence = Some(pick_images(true));
             }
-            // No video picker on wasm: `pick_video_path` needs a real
-            // filesystem path to stream from, which a browser file handle
-            // does not have -- see the top-of-file doc comment.
-            #[cfg(not(target_arch = "wasm32"))]
             if ui
                 .add(Button::new("Pick video file").fill(Color32::from_rgb(60, 60, 120)))
                 .clicked()
                 && !picking
             {
-                self.pending_pick_video = Some(pick_video_path());
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.pending_pick_video = Some(pick_video_path());
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.pending_pick_video = Some(pick_video_bytes());
+                }
             }
         });
 
@@ -1442,6 +1467,15 @@ impl VideoApp {
                     ui.label(format!("{name} -- video source ({})", path.display()));
                 });
             }
+            #[cfg(target_arch = "wasm32")]
+            Input::Video { name, .. } => {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("✖").clicked() {
+                        clear_input = true;
+                    }
+                    ui.label(format!("{name} -- video source"));
+                });
+            }
         }
         if clear_input {
             self.input = Input::None;
@@ -1454,7 +1488,6 @@ impl VideoApp {
         // probed eagerly -- so this is called out separately rather than
         // folding into `live_cost`'s own `None` case below, which reads
         // as "nothing picked yet" and would be misleading here.
-        #[cfg(not(target_arch = "wasm32"))]
         if matches!(self.input, Input::Video { .. }) {
             ui.label(
                 "Video source selected -- cost is measured once Generate opens the file.",
@@ -1574,7 +1607,6 @@ impl VideoApp {
             Input::None => false,
             Input::Animated { .. } => true,
             Input::Sequence(frames) => !frames.is_empty(),
-            #[cfg(not(target_arch = "wasm32"))]
             Input::Video { .. } => true,
         };
 
@@ -1597,10 +1629,7 @@ impl VideoApp {
                 self.generate(shared);
             }
         } else {
-            #[cfg(not(target_arch = "wasm32"))]
             ui.label("Pick an animated file, frame sequence, or video file to continue...");
-            #[cfg(target_arch = "wasm32")]
-            ui.label("Pick an animated file or frame sequence to continue...");
         }
     }
 
@@ -1660,7 +1689,12 @@ impl VideoApp {
                 )
             }
             #[cfg(not(target_arch = "wasm32"))]
-            Input::Video { path, .. } => GenSource::Video(path.clone()),
+            Input::Video { path, .. } => GenSource::Video { path: path.clone() },
+            #[cfg(target_arch = "wasm32")]
+            Input::Video { bytes, name } => GenSource::Video {
+                bytes: std::sync::Arc::clone(bytes),
+                name: name.clone(),
+            },
         };
 
         // Everything below is plain data or an owned clone -- nothing here
@@ -1745,7 +1779,7 @@ impl VideoApp {
                     Box::new(decode(Source::Sequence(named), fps)?)
                 }
                 #[cfg(not(target_arch = "wasm32"))]
-                GenSource::Video(path) => {
+                GenSource::Video { path } => {
                     // `DownloadConsent::Never` is safe here, not silent:
                     // `check_ffmpeg_consent` already ran this exact call on
                     // the UI thread before this worker was ever spawned, so
@@ -1767,6 +1801,11 @@ impl VideoApp {
                         &mut || ensure_ffmpeg(DownloadConsent::Never),
                     )?
                 }
+                // The web build decodes the uploaded bytes with the builtin
+                // backend (no ffmpeg); the guards inside `open_video_bytes`
+                // refuse anything it cannot decode correctly.
+                #[cfg(target_arch = "wasm32")]
+                GenSource::Video { bytes, name } => backend::open_video_bytes(&name, bytes)?,
             };
 
             // Omitted resize means "use the source's own dimensions" -- skip

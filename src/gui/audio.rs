@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use crate::{
     audio::{
         AudioMode,
-        backend::{AudioBackend, DownloadConsent},
+        backend::AudioBackend,
         cost::{self, AudioCost},
         presets::AudioPreset,
         source::AudioInfo,
@@ -44,9 +44,18 @@ use poll_promise::Promise;
 // build, rather than offering a button that cannot work.
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{
-    audio::backend::open_audio_ensuring,
+    audio::backend::{DownloadConsent, open_audio_ensuring},
     gui::util::{FfmpegModal, draw_cancel_button, pick_audio_path},
     video::ffmpeg::{ensure_ffmpeg, ffmpeg_available},
+};
+
+// The web build has no ffmpeg and no filesystem path: it uploads a file's bytes
+// and decodes them with the pure-Rust builtin (symphonia) only. These are its
+// counterparts to the native picker/backend imports above.
+#[cfg(target_arch = "wasm32")]
+use crate::{
+    audio::{source::AudioSource, symphonia_src::SymphoniaSource},
+    gui::util::pick_audio_bytes,
 };
 
 /// STFT window sizes offered by the Window dropdown.
@@ -132,10 +141,13 @@ type ChannelProgress = UtilChannelProgress<std::convert::Infallible>;
 /// length (see [`AudioApp::draw_cost`]), and Generate still works, because
 /// the render measures the real frame count as it analyses.
 struct PickedAudio {
+    /// The decode input: a filesystem path (native, re-opened per pass) or the
+    /// uploaded blob (web, re-cursored per pass -- a browser handle has no
+    /// path).
+    #[cfg(not(target_arch = "wasm32"))]
     path: std::path::PathBuf,
-    /// Shown by `draw_input`, which is native-only -- there is no picker on
-    /// wasm, so nothing there ever constructs one of these to display.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(target_arch = "wasm32")]
+    bytes: std::sync::Arc<[u8]>,
     name: String,
     info: Option<AudioInfo>,
 }
@@ -163,6 +175,8 @@ pub struct AudioApp {
     input: Option<PickedAudio>,
     #[cfg(not(target_arch = "wasm32"))]
     pending_pick: Option<Promise<Option<std::path::PathBuf>>>,
+    #[cfg(target_arch = "wasm32")]
+    pending_pick: Option<Promise<Option<(String, Vec<u8>)>>>,
     /// The in-flight duration probe. Opens the picked file with the SELECTED
     /// backend and `DownloadConsent::Never` purely to read
     /// `AudioSource::info`, then drops it: the whole point is to give the
@@ -171,13 +185,16 @@ pub struct AudioApp {
     /// parse, or an `ffprobe` spawn) is not something to do on the UI thread.
     #[cfg(not(target_arch = "wasm32"))]
     pending_probe: Option<Promise<Result<AudioInfo, String>>>,
-    /// Which decode backend opens the file. Not `#[cfg]`'d, unlike the video
-    /// pane's: `AudioBackend` exists on every target (wasm's `Ffmpeg` refuses
-    /// cleanly rather than failing to compile).
+    /// Which decode backend opens the file. Kept on every target (`AudioBackend`
+    /// compiles everywhere), but the web build always uses the builtin decoder,
+    /// so it is only read on native (the backend selector, probe and render).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     backend: AudioBackend,
     /// Which audio stream to decode, 0 = first. Dual-audio releases carry the
     /// original language first and the dub second, so which one is "first" is
-    /// a container-ordering accident. Honoured by the ffmpeg backend only.
+    /// a container-ordering accident. Honoured by the ffmpeg backend only, so
+    /// read on native alone.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     audio_track: usize,
     /// The shared ffmpeg download-consent + download modal. Bundles what used
     /// to be a pending-consent path and an in-flight download `Promise`; see
@@ -225,7 +242,6 @@ impl Default for AudioApp {
         let opts = AudioOptions::default();
         Self {
             input: None,
-            #[cfg(not(target_arch = "wasm32"))]
             pending_pick: None,
             #[cfg(not(target_arch = "wasm32"))]
             pending_probe: None,
@@ -469,6 +485,38 @@ impl AudioApp {
                 },
                 Err(promise) => self.pending_probe = Some(promise),
             }
+        }
+    }
+
+    /// Poll the in-flight upload (web build). On a resolved upload the bytes are
+    /// retained and probed inline for the duration -- a song is a few MB and the
+    /// probe is cheap, and there are no threads here to defer it to.
+    #[cfg(target_arch = "wasm32")]
+    fn poll_picks(&mut self) {
+        let Some(promise) = self.pending_pick.take() else {
+            return;
+        };
+        match promise.try_take() {
+            Ok(result) => {
+                if let Some((name, bytes)) = result {
+                    let bytes: std::sync::Arc<[u8]> = bytes.into();
+                    info!("Selected audio: {name}");
+                    // Probe up front for the cost readout; a failure just leaves
+                    // `info` None (the render measures the real length itself).
+                    let info = match SymphoniaSource::open_bytes(&name, std::sync::Arc::clone(&bytes)) {
+                        Ok(s) => Some(s.info()),
+                        Err(e) => {
+                            info!(
+                                "Could not read the audio's length up front ({e}); the cost \
+                                 estimate will show only the part that does not depend on length"
+                            );
+                            None
+                        }
+                    };
+                    self.input = Some(PickedAudio { bytes, name, info });
+                }
+            }
+            Err(promise) => self.pending_pick = Some(promise),
         }
     }
 
@@ -1165,12 +1213,50 @@ impl AudioApp {
 
         #[cfg(target_arch = "wasm32")]
         {
-            ui.colored_label(
-                Color32::from_rgb(255, 140, 60),
-                "Audio rendering needs the desktop build: every decoder here opens a file \
-                 PATH and streams it twice, which a browser file handle cannot provide. The \
-                 settings and cost model above are live and correct.",
-            );
+            // The browser uploads bytes and decodes them with the builtin
+            // (symphonia) decoder only -- no ffmpeg, so no backend selector or
+            // per-container track pick here.
+            let picking = self.pending_pick.is_some();
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add(Button::new("Pick audio file").fill(Color32::from_rgb(60, 60, 120)))
+                    .clicked()
+                    && !picking
+                {
+                    self.pending_pick = Some(pick_audio_bytes());
+                }
+                if picking {
+                    ui.spinner();
+                    ui.label("reading...");
+                }
+            });
+
+            let mut clear_input = false;
+            match &self.input {
+                None => {
+                    ui.label("No source selected.");
+                }
+                Some(input) => {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("✖").clicked() {
+                            clear_input = true;
+                        }
+                        let detail = match input.info {
+                            Some(AudioInfo { sample_rate, duration_hint: Some(d) }) => {
+                                format!("{:.1}s at {sample_rate} Hz", d)
+                            }
+                            Some(AudioInfo { sample_rate, duration_hint: None }) => {
+                                format!("{sample_rate} Hz, length unknown until render")
+                            }
+                            None => "length not read yet".to_string(),
+                        };
+                        ui.label(format!("{} -- {detail}", input.name));
+                    });
+                }
+            }
+            if clear_input {
+                self.input = None;
+            }
             return;
         }
 
@@ -1375,10 +1461,7 @@ impl AudioApp {
                 self.generate(shared);
             }
         } else {
-            #[cfg(not(target_arch = "wasm32"))]
             ui.label("Pick an audio or video file to continue...");
-            #[cfg(target_arch = "wasm32")]
-            ui.label("Audio rendering is not available in the browser build.");
         }
     }
 
@@ -1386,9 +1469,10 @@ impl AudioApp {
     /// encode -> deliver. Same path as `main.rs`'s `--audio-mode` branch,
     /// dispatched on the same [`AudioMode`]/[`AudioOptions`] -- nothing here
     /// reimplements a step of it. Runs on a background thread on native (the
-    /// captured state is all `Copy` or one `PathBuf`); `wasm32` has no
-    /// `std::thread::spawn` and no picker, so this path is unreachable there.
-    /// Every failure is logged via `log::error!`, never panicked.
+    /// captured state is all `Copy`, a `PathBuf`, or an `Arc<[u8]>`); the web
+    /// build has no `std::thread::spawn`, so it runs inline (blocking the UI
+    /// thread for the render) and then `deliver_world_unless_cancelled`
+    /// downloads the `.brz`. Every failure is logged via `log::error!`.
     fn generate(&mut self, shared: &SharedOptions) {
         if self.pending_generate.is_some() {
             return error!("a render is already in progress");
@@ -1408,7 +1492,10 @@ impl AudioApp {
         let Some(input) = &self.input else {
             return error!("pick an audio or video file first");
         };
+        #[cfg(not(target_arch = "wasm32"))]
         let path = input.path.clone();
+        #[cfg(target_arch = "wasm32")]
+        let (name, bytes) = (input.name.clone(), std::sync::Arc::clone(&input.bytes));
 
         // A source may need ffmpeg, and whether the user consents to
         // downloading it is a question only the UI thread can ask. The same
@@ -1432,7 +1519,11 @@ impl AudioApp {
         // so this is a plain value capture and there is no second assembly
         // step where the two could diverge.
         let opts = self.audio_opts();
+        // Backend/track select an ffmpeg path that only exists on native; the
+        // web build always uses the builtin decoder and the default track.
+        #[cfg(not(target_arch = "wasm32"))]
         let backend = self.backend;
+        #[cfg(not(target_arch = "wasm32"))]
         let track = self.audio_track;
         let out_file = shared.out_file.clone();
         let out_clipboard = shared.out_clipboard;
@@ -1452,28 +1543,29 @@ impl AudioApp {
         }
 
         let work = move || -> Result<(), String> {
-            info!("Opening audio {}", path.display());
-            // `DownloadConsent::Never` is safe here, not silent:
+            // `DownloadConsent::Never` is safe on native, not silent:
             // `check_ffmpeg_consent` already ran this exact call on the UI
             // thread, so either ffmpeg was not needed or it is already
             // installed (the modal's Download button ran
             // `ensure_ffmpeg(Always)` and this worker only starts once that
-            // succeeded).
+            // succeeded). The web build has no ffmpeg: it decodes the uploaded
+            // bytes with the builtin (symphonia) source directly.
             #[cfg(not(target_arch = "wasm32"))]
-            let source = open_audio_ensuring(
-                &path,
-                backend,
-                DownloadConsent::Never,
-                track,
-                &mut |_| ensure_ffmpeg(DownloadConsent::Never),
-            )?;
+            let source = {
+                info!("Opening audio {}", path.display());
+                open_audio_ensuring(
+                    &path,
+                    backend,
+                    DownloadConsent::Never,
+                    track,
+                    &mut |_| ensure_ffmpeg(DownloadConsent::Never),
+                )?
+            };
             #[cfg(target_arch = "wasm32")]
-            let source = crate::audio::backend::open_audio_track(
-                &path,
-                backend,
-                DownloadConsent::Never,
-                track,
-            )?;
+            let source: Box<dyn AudioSource> = {
+                info!("Opening audio {name}");
+                Box::new(SymphoniaSource::open_bytes(&name, bytes)?)
+            };
 
             let mut progress = ChannelProgress::new(progress_tx, cancel_flag);
             // The CLI's two-branch dispatch, unchanged: one analysis front
@@ -1554,9 +1646,8 @@ impl AudioApp {
 
         #[cfg(target_arch = "wasm32")]
         {
-            // No threads on the web: run synchronously. Unreachable in
-            // practice -- there is no picker there, so `self.input` is always
-            // `None` -- but kept so the two targets have one `generate`.
+            // No threads on the web: run the render synchronously, blocking the
+            // UI thread until the `.brz` download is triggered.
             let result = work();
             if let Err(e) = &result {
                 error!("{e}");
@@ -1569,7 +1660,6 @@ impl AudioApp {
 
     pub fn draw(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
         bound_pane_width(ui);
-        #[cfg(not(target_arch = "wasm32"))]
         self.poll_picks();
         self.poll_generate();
         #[cfg(not(target_arch = "wasm32"))]
@@ -1594,11 +1684,14 @@ impl AudioApp {
         self.draw_cost(ui);
         ui.separator();
         self.draw_submit(ui, shared);
-        // A probe resolving on its own thread has nothing else to wake the
-        // event loop, so the readout would otherwise only pick up the
-        // duration on the user's next mouse move.
+        // A pick/probe resolving on its own thread (or an async browser upload)
+        // has nothing else to wake the event loop, so the readout would
+        // otherwise only pick up the file on the user's next mouse move.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.pending_probe.is_some() || self.pending_pick.is_some() {
+        let pending = self.pending_probe.is_some() || self.pending_pick.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let pending = self.pending_pick.is_some();
+        if pending {
             ui.ctx().request_repaint();
         }
     }

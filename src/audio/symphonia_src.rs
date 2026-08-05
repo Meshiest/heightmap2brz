@@ -2,9 +2,10 @@
 //! adapted to the one shape everything downstream assumes -- mono `f32` at
 //! [`TARGET_RATE`].
 //!
-//! [`SymphoniaSource`] holds nothing but the path, and every
-//! [`AudioSource::open`] re-probes from scratch. That is what makes two opens
-//! agree sample for sample, which the two-pass band analysis in
+//! [`SymphoniaSource`] holds nothing but its input -- a path (native) or an
+//! in-memory blob (the web build, whose uploaded files have no path) -- and
+//! every [`AudioSource::open`] re-probes from scratch. That is what makes two
+//! opens agree sample for sample, which the two-pass band analysis in
 //! [`crate::audio::track`] depends on.
 //!
 //! This is the only decode path the web build has: there is no ffmpeg on
@@ -12,7 +13,9 @@
 //! block next to `rustfft` rather than the native-only one.
 
 use crate::audio::source::{AudioInfo, AudioSource, AudioStream, first_non_finite};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -29,13 +32,45 @@ use symphonia::core::probe::Hint;
 /// frequencies -- quietly, with every band still finite and in range.
 pub const TARGET_RATE: u32 = 48_000;
 
-/// A re-openable handle to an audio file on disk.
+/// Where a [`SymphoniaSource`] re-reads its input on every open: a file on disk
+/// (native -- streamed, never held in memory) or an in-memory blob (the web
+/// build, where an uploaded file has no path). A song is a few MB, so holding
+/// the blob is fine, and re-cursoring over it each pass keeps two opens
+/// identical exactly as re-reading a path does.
+#[derive(Debug, Clone)]
+enum Media {
+    Path(PathBuf),
+    Bytes { bytes: Arc<[u8]>, ext: Option<String>, label: String },
+}
+
+impl Media {
+    /// Extension hint and error label pulled from a file name.
+    fn bytes(name: &str, bytes: Arc<[u8]>) -> Self {
+        let ext = Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_string);
+        Media::Bytes { bytes, ext, label: name.to_string() }
+    }
+
+    /// A name for this input in error messages and stream labels.
+    fn label(&self) -> String {
+        match self {
+            Media::Path(p) => p.display().to_string(),
+            Media::Bytes { label, .. } => label.clone(),
+        }
+    }
+}
+
+/// A re-openable handle to an audio input.
 ///
-/// Holds the path and the probed metadata, and deliberately no reader,
-/// decoder or decoded state: [`AudioSource::open`] re-probes every time.
+/// Holds the input source (path or in-memory blob) and the probed metadata, and
+/// deliberately no reader, decoder or decoded state: [`AudioSource::open`]
+/// re-probes every time, which is what makes two opens agree sample for sample
+/// -- the two-pass band analysis in [`crate::audio::track`] depends on it.
 #[derive(Debug, Clone)]
 pub struct SymphoniaSource {
-    path: PathBuf,
+    media: Media,
     info: AudioInfo,
 }
 
@@ -47,9 +82,21 @@ impl SymphoniaSource {
     /// audio track, a codec this build was not compiled with -- is an error
     /// here, at open time, rather than a surprise part-way through a render.
     pub fn open_path(path: &Path) -> Result<Self, String> {
-        let probed = probe_file(path)?;
+        Self::open_media(Media::Path(path.to_path_buf()))
+    }
+
+    /// Like [`open_path`](Self::open_path), but over an in-memory blob (the web
+    /// build, which uploads a file's bytes rather than a path). `name` supplies
+    /// the extension hint and the error label; the bytes are re-cursored on
+    /// every open.
+    pub fn open_bytes(name: &str, bytes: Arc<[u8]>) -> Result<Self, String> {
+        Self::open_media(Media::bytes(name, bytes))
+    }
+
+    fn open_media(media: Media) -> Result<Self, String> {
+        let probed = probe(&media)?;
         Ok(Self {
-            path: path.to_path_buf(),
+            media,
             info: AudioInfo {
                 // Always the adapted rate, never `probed.rate`. Every stream
                 // this source hands out resamples to it.
@@ -66,9 +113,9 @@ impl AudioSource for SymphoniaSource {
     }
 
     fn open(&self) -> Result<Box<dyn AudioStream + '_>, String> {
-        let probed = probe_file(&self.path)?;
+        let probed = probe(&self.media)?;
         Ok(Box::new(SymphoniaStream {
-            label: self.path.display().to_string(),
+            label: self.media.label(),
             format: probed.format,
             decoder: probed.decoder,
             track_id: probed.track_id,
@@ -92,22 +139,34 @@ struct Probed {
     duration: Option<f64>,
 }
 
-/// Opens and probes `path`, building a demuxer and a decoder for its first
+/// Opens and probes `media`, building a demuxer and a decoder for its first
 /// real audio track.
 ///
-/// Called by both [`SymphoniaSource::open_path`] and [`AudioSource::open`],
-/// from the same path with no retained state in between, which is exactly
+/// Called by both [`SymphoniaSource::open_media`] and [`AudioSource::open`],
+/// from the same input with no retained state in between, which is exactly
 /// what makes two opens agree sample for sample.
-fn probe_file(path: &Path) -> Result<Probed, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+fn probe(media: &Media) -> Result<Probed, String> {
+    let label = media.label();
+    // A file (streamed from disk) or a fresh cursor over the retained blob;
+    // either is a `MediaSource` symphonia reads and seeks.
+    let (stream, ext_hint) = match media {
+        Media::Path(path) => {
+            let file = std::fs::File::open(path)
+                .map_err(|e| format!("failed to open {label}: {e}"))?;
+            let ext = path.extension().and_then(|e| e.to_str()).map(str::to_string);
+            (MediaSourceStream::new(Box::new(file), Default::default()), ext)
+        }
+        Media::Bytes { bytes, ext, .. } => {
+            let cursor = Cursor::new(Arc::clone(bytes));
+            (MediaSourceStream::new(Box::new(cursor), Default::default()), ext.clone())
+        }
+    };
 
     // The extension is a hint, not a decision: symphonia still sniffs the
     // actual bytes, so a `.wav` full of MP3 (or of junk, as the tests check)
     // is handled on its contents.
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+    if let Some(ext) = &ext_hint {
         hint.with_extension(ext);
     }
 
@@ -118,20 +177,20 @@ fn probe_file(path: &Path) -> Result<Probed, String> {
     let format_opts = FormatOptions { enable_gapless: true, ..Default::default() };
     let probe = symphonia::default::get_probe()
         .format(&hint, stream, &format_opts, &MetadataOptions::default())
-        .map_err(|e| format!("{} is not a supported audio file: {e}", path.display()))?;
+        .map_err(|e| format!("{label} is not a supported audio file: {e}"))?;
     let format = probe.format;
 
     let track = format
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| format!("{} contains no audio track", path.display()))?;
+        .ok_or_else(|| format!("{label} contains no audio track"))?;
     let track_id = track.id;
     let params = track.codec_params.clone();
 
     let decoder = symphonia::default::get_codecs()
         .make(&params, &DecoderOptions::default())
-        .map_err(|e| format!("no decoder for the audio in {}: {e}", path.display()))?;
+        .map_err(|e| format!("no decoder for the audio in {label}: {e}"))?;
 
     // A hint, so `None` is a real answer rather than a failure -- it drives
     // spinner-vs-bar in progress, and `track::analyze` treats it as optional.
