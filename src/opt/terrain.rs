@@ -324,6 +324,12 @@ pub fn gen_terrain_heightmap<F: Fn(f32) -> bool>(
     if width == 0 || height == 0 {
         return Err("Heightmap is empty".to_string());
     }
+    // A zero cell size would make `layout.half` zero, which divides by zero in
+    // `merge_foundations` (`MAX_HALF_EXTENT / layout.half`) and would emit
+    // zero-extent bricks besides. Refuse it like the other invalid inputs above.
+    if options.size == 0 {
+        return Err("Brick size must be at least 1".to_string());
+    }
 
     // Increased to an even number, with a minimum of 2. A rise of `rise_unit`
     // units becomes a `BrickSize` half height of `rise_unit / 2`. That value
@@ -1077,6 +1083,17 @@ mod tests {
             }
             let (low, high) = (spans[0].0, spans.last().unwrap().1);
             assert!(high > low, "the cell ({x}, {y}) has an empty foundation");
+        }
+    }
+
+    /// A zero brick size must be refused with an error, not a divide-by-zero
+    /// panic in `merge_foundations` (`MAX_HALF_EXTENT / layout.half`).
+    #[test]
+    fn a_zero_brick_size_is_refused_not_a_panic() {
+        let opts = GenOptions { size: 0, ..options() };
+        match gen_terrain_heightmap(&Flat(4, 4, 2), &Grey(4, 4), opts, |_| true) {
+            Err(e) => assert!(e.contains("size"), "unexpected error: {e}"),
+            Ok(_) => panic!("a zero brick size must be refused"),
         }
     }
 }

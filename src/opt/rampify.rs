@@ -490,6 +490,12 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
     if width == 0 || height == 0 {
         return Err("Heightmap is empty".to_string());
     }
+    // A zero cell size would make `layout.half` zero, which divides by zero in
+    // `fill_gaps` (`MAX_HALF_EXTENT / layout.half`) and would emit zero-extent
+    // bricks besides. Refuse it like the other invalid inputs above.
+    if options.size == 0 {
+        return Err("Brick size must be at least 1".to_string());
+    }
 
     // The rise of a ramp is a whole number of plates, so the vertical scale
     // must also be a whole number of plates.
@@ -1036,6 +1042,51 @@ mod tests {
                 (expect_x, expect_y),
                 "the ramp at {rotation:?} is not over its own cells"
             );
+        }
+    }
+
+    /// A zero brick size must be refused with an error, not a divide-by-zero
+    /// panic in `fill_gaps` (`MAX_HALF_EXTENT / layout.half`).
+    #[test]
+    fn a_zero_brick_size_is_refused_not_a_panic() {
+        struct Flat;
+        impl Heightmap for Flat {
+            fn at(&self, _x: u32, _y: u32) -> u32 {
+                2
+            }
+            fn size(&self) -> (u32, u32) {
+                (4, 4)
+            }
+        }
+        struct Grey;
+        impl Colormap for Grey {
+            fn at(&self, _x: u32, _y: u32) -> [u8; 4] {
+                [128, 128, 128, 255]
+            }
+            fn size(&self) -> (u32, u32) {
+                (4, 4)
+            }
+        }
+        let opts = GenOptions {
+            size: 0,
+            scale: 4,
+            asset: PB_DEFAULT_BRICK,
+            cull: false,
+            micro: false,
+            stud: false,
+            snap: false,
+            img: false,
+            glow: false,
+            hdmap: false,
+            lrgb: false,
+            nocollide: false,
+            quadtree: true,
+            greedy: false,
+            surface: SurfaceMode::Rampify,
+        };
+        match gen_rampify_heightmap(&Flat, &Grey, opts, |_| true) {
+            Err(e) => assert!(e.contains("size"), "unexpected error: {e}"),
+            Ok(_) => panic!("a zero brick size must be refused"),
         }
     }
 }
