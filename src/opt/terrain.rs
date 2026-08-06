@@ -383,15 +383,41 @@ pub fn gen_terrain_heightmap<F: Fn(f32) -> bool>(
     }
     progress!(0.5);
 
-    info!("Building terrain assemblies");
     // Centred exactly as the blocky modes centre their output, so switching
     // modes does not move the build.
-    let offset_x = -(width as i32 * half);
-    let offset_y = -(height as i32 * half);
-    // Surface of layer zero, matching where the blocky modes put the top of a
-    // zero-height cell.
-    let z_floor = options.base_height() - 5;
+    let layout = Layout {
+        half,
+        rise_unit,
+        offset_x: -(width as i32 * half),
+        offset_y: -(height as i32 * half),
+        // Surface of layer zero, matching where the blocky modes put the top of
+        // a zero-height cell.
+        z_floor: options.base_height() - 5,
+        glow: options.glow,
+        collision: options.collision(),
+    };
 
+    // How deep a cell's foundation has to reach: below the lowest neighbouring
+    // floor, which is what closes a cliff face from the high side. The `+ 1`
+    // keeps a flat plain one layer thick instead of zero.
+    //
+    // A closure rather than a stored field: it is a pure function of `floors`,
+    // and a map big enough for this to matter is a map where another `i32` per
+    // cell is the thing that hurts.
+    let depth_layers = |x: u32, y: u32| -> i32 {
+        let index = y as usize * width as usize + x as usize;
+        let mut lowest = floors[index];
+        for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            if nx >= 0 && ny >= 0 && (nx as u32) < width && (ny as u32) < height {
+                lowest = lowest.min(floors[ny as usize * width as usize + nx as usize]);
+            }
+        }
+        (floors[index] - lowest).max(0) + 1
+    };
+
+    info!("Building terrain assemblies");
     let mut bricks: Vec<Brick> = Vec::new();
     let mut counts = [0usize; 6];
     for y in 0..height {
@@ -410,32 +436,16 @@ pub fn gen_terrain_heightmap<F: Fn(f32) -> bool>(
                 SurfaceKind::TrianglePair(_) => 5,
             }] += 1;
 
-            // The foundation reaches below the lowest neighbouring floor, which
-            // is what closes a cliff face from the high side. `+ 1` layer keeps
-            // a flat plain one layer thick instead of zero.
-            let mut lowest = floors[index];
-            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-                let nx = x as i32 + dx;
-                let ny = y as i32 + dy;
-                if nx >= 0 && ny >= 0 && (nx as u32) < width && (ny as u32) < height {
-                    lowest = lowest.min(floors[ny as usize * width as usize + nx as usize]);
-                }
-            }
-            let depth = ((floors[index] - lowest).max(0) + 1) * rise_unit;
-
             let color = colormap.at(x, y);
-            emit_cell(
+            emit_slope(
                 &mut bricks,
-                &options,
+                &layout,
                 fit,
                 Position::new(
-                    (x as i32 * 2 + 1) * half + offset_x,
-                    (y as i32 * 2 + 1) * half + offset_y,
-                    z_floor + fit.base * rise_unit,
+                    (x as i32 * 2 + 1) * layout.half + layout.offset_x,
+                    (y as i32 * 2 + 1) * layout.half + layout.offset_y,
+                    layout.z_floor + fit.base * rise_unit,
                 ),
-                half,
-                rise_unit,
-                depth,
                 Color {
                     r: color[0],
                     g: color[1],
@@ -444,9 +454,22 @@ pub fn gen_terrain_heightmap<F: Fn(f32) -> bool>(
             );
         }
         if y % 32 == 0 {
-            progress!(0.5 + 0.45 * (y as f32 / height as f32));
+            progress!(0.5 + 0.35 * (y as f32 / height as f32));
         }
     }
+    let slopes = bricks.len();
+
+    info!("Merging foundations");
+    let foundations = merge_foundations(
+        &mut bricks,
+        &layout,
+        colormap,
+        &floors,
+        &culled,
+        &depth_layers,
+        (width, height),
+        &progress_f,
+    )?;
 
     let area = width as usize * height as usize;
     info!(
@@ -460,7 +483,8 @@ pub fn gen_terrain_heightmap<F: Fn(f32) -> bool>(
         counts[5],
     );
     info!(
-        "Converted {} pixel(s) to {} brick(s) ({:.2} per cell)",
+        "Converted {} pixel(s) to {} brick(s) ({:.2} per cell): {slopes} surface, {foundations} \
+         foundation",
         area,
         bricks.len(),
         bricks.len() as f64 / area.max(1) as f64,
@@ -470,57 +494,184 @@ pub fn gen_terrain_heightmap<F: Fn(f32) -> bool>(
     Ok(bricks)
 }
 
-/// Emit one cell's assembly: the foundation prism, the load-bearing shape, and
-/// the triangle cap or complementary triangle where the fit calls for one.
-///
-/// `anchor` carries the cell's centre in X/Y and the altitude of its LOWEST
-/// surface vertex in Z -- what the geometry contract calls `base`.
-fn emit_cell(
-    out: &mut Vec<Brick>,
-    options: &GenOptions,
-    fit: CellFit,
-    anchor: Position,
+/// Where the terrain's cell grid sits in world units, and how bricks are
+/// styled. Bundled so the surface pass and the foundation pass cannot drift
+/// apart on the centring, the ground plane, or the material.
+struct Layout {
+    /// Half extent of one cell in X and Y, in units.
     half: i32,
+    /// Units per terrain layer. Even, and at least 2.
     rise_unit: i32,
-    depth: i32,
-    color: Color,
-) {
-    let mut piece = |asset, size: BrickSize, z: i32, turn: Turn| {
-        out.push(Brick {
+    offset_x: i32,
+    offset_y: i32,
+    /// World Z of the surface of layer zero.
+    z_floor: i32,
+    glow: bool,
+    collision: brdb::Collision,
+}
+
+impl Layout {
+    fn brick(
+        &self,
+        asset: brdb::BString,
+        size: BrickSize,
+        position: Position,
+        color: Color,
+        turn: Turn,
+    ) -> Brick {
+        Brick {
             asset: BrickType::Procedural { asset, size },
-            position: Position::new(anchor.x, anchor.y, z),
-            collision: options.collision(),
+            position,
+            collision: self.collision,
             color,
             owner_index: None,
             direction: Direction::ZPositive,
             rotation: turn.rotation(),
-            material_intensity: if options.glow { 0 } else { 5 },
-            material: if options.glow { GLOW } else { PLASTIC },
+            material_intensity: if self.glow { 0 } else { 5 },
+            material: if self.glow { GLOW } else { PLASTIC },
             ..Default::default()
-        });
+        }
+    }
+}
+
+/// Emit the foundation layer as as few boxes as the grid allows.
+///
+/// A foundation is a flat-topped prism, so the foundation layer is an ordinary
+/// 2D field of `(colour, top, depth)` and merges the way the blocky renderers
+/// merge their prisms. Without this the surface grammar's one-shape-per-cell
+/// rule leaked into the part of the build nobody can see: a flat plain cost one
+/// brick per PIXEL under `--terrain` while the same plain under `--micro` cost
+/// one brick for the whole region.
+///
+/// Cells join a box only when their colour, top AND depth all match exactly.
+/// Unifying mismatched depths to the deepest one would merge far more
+/// aggressively, but it also hangs solid material below where a shallower cell
+/// ended -- which is invisible on a plain and very visible from inside a
+/// canyon, where the cliff base is the thing being looked at.
+#[allow(clippy::too_many_arguments)]
+fn merge_foundations<F: Fn(f32) -> bool, D: Fn(u32, u32) -> i32>(
+    out: &mut Vec<Brick>,
+    layout: &Layout,
+    colormap: &dyn Colormap,
+    floors: &[i32],
+    culled: &[bool],
+    depth_layers: &D,
+    (width, height): (u32, u32),
+    progress_f: &F,
+) -> Result<usize, String> {
+    let mut taken = vec![false; width as usize * height as usize];
+    // A box may not exceed 500 units on any axis.
+    let max_run = (MAX_HALF_EXTENT / layout.half).max(1) as u32;
+    let mut emitted = 0usize;
+
+    let index = |x: u32, y: u32| y as usize * width as usize + x as usize;
+    let joins = |x: u32, y: u32, top: i32, depth: i32, color: [u8; 4], taken: &[bool]| {
+        let i = index(x, y);
+        !culled[i]
+            && !taken[i]
+            && floors[i] == top
+            && depth_layers(x, y) == depth
+            && colormap.at(x, y) == color
     };
 
-    // The foundation, top flush with `base`, split into 500-unit pieces because
-    // that is the tallest procedural brick the format can carry.
-    let mut remaining = depth.max(2);
-    let mut top = anchor.z;
-    while remaining > 0 {
-        let slab = remaining.min(MAX_HALF_EXTENT * 2);
-        piece(
-            PB_DEFAULT_MICRO_BRICK,
-            BrickSize::new(half as u16, half as u16, (slab / 2) as u16),
-            top - slab / 2,
-            Turn(0),
-        );
-        remaining -= slab;
-        top -= slab;
+    for y in 0..height {
+        for x in 0..width {
+            let i = index(x, y);
+            if culled[i] || taken[i] {
+                continue;
+            }
+            let top = floors[i];
+            let depth = depth_layers(x, y);
+            let color = colormap.at(x, y);
+
+            let mut run_x = 1;
+            while run_x < max_run
+                && x + run_x < width
+                && joins(x + run_x, y, top, depth, color, &taken)
+            {
+                run_x += 1;
+            }
+
+            let mut run_y = 1;
+            'rows: while run_y < max_run && y + run_y < height {
+                for dx in 0..run_x {
+                    if !joins(x + dx, y + run_y, top, depth, color, &taken) {
+                        // A partial row is discarded whole: the box has to stay
+                        // rectangular.
+                        break 'rows;
+                    }
+                }
+                run_y += 1;
+            }
+
+            for dy in 0..run_y {
+                for dx in 0..run_x {
+                    taken[index(x + dx, y + dy)] = true;
+                }
+            }
+
+            // Top flush with the cell floor, split into 500-unit slabs because
+            // that is the tallest procedural brick the format can carry.
+            let mut remaining = (depth * layout.rise_unit).max(2);
+            let mut top_units = layout.z_floor + top * layout.rise_unit;
+            while remaining > 0 {
+                let slab = remaining.min(MAX_HALF_EXTENT * 2);
+                out.push(layout.brick(
+                    PB_DEFAULT_MICRO_BRICK,
+                    BrickSize::new(
+                        (run_x as i32 * layout.half) as u16,
+                        (run_y as i32 * layout.half) as u16,
+                        (slab / 2) as u16,
+                    ),
+                    Position::new(
+                        (x as i32 * 2 + run_x as i32) * layout.half + layout.offset_x,
+                        (y as i32 * 2 + run_y as i32) * layout.half + layout.offset_y,
+                        top_units - slab / 2,
+                    ),
+                    Color {
+                        r: color[0],
+                        g: color[1],
+                        b: color[2],
+                    },
+                    Turn(0),
+                ));
+                emitted += 1;
+                remaining -= slab;
+                top_units -= slab;
+            }
+        }
+        if y % 32 == 0 && !progress_f(0.85 + 0.1 * (y as f32 / height as f32)) {
+            return Err("Stopped by user".to_string());
+        }
     }
+    Ok(emitted)
+}
+
+/// Emit one cell's SURFACE: the load-bearing shape, plus the triangle cap or
+/// complementary triangle where the fit calls for one. The foundation under it
+/// is not emitted here -- foundations are flat-topped prisms and merge across
+/// cells, so [`merge_foundations`] lays the whole layer at once.
+///
+/// `anchor` carries the cell's centre in X/Y and the altitude of its LOWEST
+/// surface vertex in Z -- what the geometry contract calls `base`. A flat cell
+/// emits nothing at all: its foundation's top face IS its surface.
+fn emit_slope(out: &mut Vec<Brick>, layout: &Layout, fit: CellFit, anchor: Position, color: Color) {
+    let half = layout.half as u16;
+    let mut piece = |asset, size: BrickSize, z: i32, turn: Turn| {
+        out.push(layout.brick(
+            asset,
+            size,
+            Position::new(anchor.x, anchor.y, z),
+            color,
+            turn,
+        ));
+    };
 
     // A rise is CLAMPED, never rounded up: raising it would push the surface
     // above a sampled vertex and break the fit-from-below guarantee that keeps
     // one cell from protruding through its neighbour.
-    let rise = (fit.rise * rise_unit).min(MAX_HALF_EXTENT * 2);
-    let cap = (fit.cap_rise * rise_unit).min(MAX_HALF_EXTENT * 2);
+    let rise = (fit.rise * layout.rise_unit).min(MAX_HALF_EXTENT * 2);
+    let cap = (fit.cap_rise * layout.rise_unit).min(MAX_HALF_EXTENT * 2);
     let (asset, turn, second) = match fit.kind {
         SurfaceKind::Flat => return,
         SurfaceKind::Ramp(t) => (PB_DEFAULT_MICRO_RAMP, t, None),
@@ -543,7 +694,7 @@ fn emit_cell(
     }
     piece(
         asset,
-        BrickSize::new(half as u16, half as u16, (rise / 2) as u16),
+        BrickSize::new(half, half, (rise / 2) as u16),
         anchor.z + rise / 2,
         turn,
     );
@@ -556,7 +707,7 @@ fn emit_cell(
         // independently, from the middle level to the top one.
         SurfaceKind::OuterTriangle(_) if cap >= 2 => piece(
             PB_DEFAULT_MICRO_WEDGE_TRIANGLE_CORNER,
-            BrickSize::new(half as u16, half as u16, (cap / 2) as u16),
+            BrickSize::new(half, half, (cap / 2) as u16),
             anchor.z + rise + cap / 2,
             second_turn,
         ),
@@ -564,7 +715,7 @@ fn emit_cell(
         // their rotations differ, and together they tile the square.
         SurfaceKind::TrianglePair(_) => piece(
             PB_DEFAULT_MICRO_WEDGE_TRIANGLE_CORNER,
-            BrickSize::new(half as u16, half as u16, (rise / 2) as u16),
+            BrickSize::new(half, half, (rise / 2) as u16),
             anchor.z + rise / 2,
             second_turn,
         ),
@@ -761,6 +912,169 @@ mod tests {
             representable > 40,
             "the sweep must actually cover the grammar"
         );
+    }
+
+    /// A constant-height, constant-colour heightmap, for exercising the
+    /// foundation merge against the case it exists for.
+    struct Flat(u32, u32, u32);
+    impl Heightmap for Flat {
+        fn at(&self, _x: u32, _y: u32) -> u32 {
+            self.2
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.0, self.1)
+        }
+    }
+    /// A height field with one step across the middle, so foundations have two
+    /// different depths and must not merge across the break.
+    struct Step(u32, u32);
+    impl Heightmap for Step {
+        fn at(&self, x: u32, _y: u32) -> u32 {
+            if x < self.0 / 2 { 0 } else { 8 }
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.0, self.1)
+        }
+    }
+    struct Grey(u32, u32);
+    impl Colormap for Grey {
+        fn at(&self, _x: u32, _y: u32) -> [u8; 4] {
+            [128, 128, 128, 255]
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.0, self.1)
+        }
+    }
+    /// One distinct colour per pixel: nothing may merge.
+    struct Rainbow(u32, u32);
+    impl Colormap for Rainbow {
+        fn at(&self, x: u32, y: u32) -> [u8; 4] {
+            [x as u8, y as u8, (x ^ y) as u8, 255]
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.0, self.1)
+        }
+    }
+
+    fn options() -> GenOptions {
+        GenOptions {
+            size: 5,
+            scale: 2,
+            asset: PB_DEFAULT_MICRO_BRICK,
+            cull: false,
+            micro: false,
+            stud: false,
+            snap: false,
+            img: false,
+            glow: false,
+            hdmap: false,
+            lrgb: false,
+            nocollide: false,
+            quadtree: true,
+            greedy: false,
+            surface: SurfaceMode::Terrain,
+        }
+    }
+
+    /// The whole point of the merge pass: a flat plain is one flat-topped
+    /// prism, not one per pixel. Before it existed this render cost 1024
+    /// bricks.
+    #[test]
+    fn a_uniform_plain_collapses_to_a_handful_of_foundation_boxes() {
+        let bricks =
+            gen_terrain_heightmap(&Flat(32, 32, 4), &Grey(32, 32), options(), |_| true).unwrap();
+        assert!(
+            bricks.len() < 8,
+            "1024 identical cells collapsed to only {} brick(s)",
+            bricks.len()
+        );
+        // ...and it really is flat, so nothing paid for a wedge either.
+        assert!(bricks.iter().all(|b| {
+            let BrickType::Procedural { asset, .. } = &b.asset else {
+                unreachable!()
+            };
+            asset.as_ref() == "PB_DefaultMicroBrick"
+        }));
+    }
+
+    /// The merge must be driven by the field, not by luck: a colormap with a
+    /// different colour on every pixel has nothing to merge, and must still
+    /// cover every cell.
+    #[test]
+    fn a_per_pixel_colormap_merges_nothing_and_still_covers_every_cell() {
+        let bricks =
+            gen_terrain_heightmap(&Flat(16, 16, 4), &Rainbow(16, 16), options(), |_| true).unwrap();
+        assert_eq!(
+            bricks.len(),
+            256,
+            "distinct colours cannot share a box, so every cell needs its own"
+        );
+    }
+
+    /// Foundations of different depths must not join. A box spanning the step
+    /// would either leave the cliff face open or hang material below the low
+    /// side.
+    #[test]
+    fn foundations_never_merge_across_a_change_in_depth() {
+        let bricks =
+            gen_terrain_heightmap(&Step(16, 16), &Grey(16, 16), options(), |_| true).unwrap();
+        let cell = 10; // options().size is a half extent, so a cell is 10 units
+        let left_edge = -(16 * 5);
+        // No foundation may straddle the seam at the middle of the map.
+        let seam = left_edge + 8 * cell;
+        for brick in &bricks {
+            let BrickType::Procedural { asset, size } = &brick.asset else {
+                unreachable!()
+            };
+            if asset.as_ref() != "PB_DefaultMicroBrick" {
+                continue;
+            }
+            let low = brick.position.x - size.x as i32;
+            let high = brick.position.x + size.x as i32;
+            assert!(
+                low >= seam || high <= seam,
+                "a foundation spans the step from {low} to {high} (seam at {seam})"
+            );
+        }
+    }
+
+    /// The merge is an optimization, so it must not change what is solid. Every
+    /// cell's foundation column has to come back covered, exactly once, from
+    /// its own top down to its own depth.
+    #[test]
+    fn merging_covers_the_same_volume_one_cell_at_a_time_would_have() {
+        let bricks =
+            gen_terrain_heightmap(&Step(12, 12), &Grey(12, 12), options(), |_| true).unwrap();
+        let cell = 10;
+        let origin = -(12 * 5);
+        let mut covered = std::collections::HashMap::<(i32, i32), (i32, i32)>::new();
+        for brick in &bricks {
+            let BrickType::Procedural { asset, size } = &brick.asset else {
+                unreachable!()
+            };
+            if asset.as_ref() != "PB_DefaultMicroBrick" {
+                continue;
+            }
+            let x0 = (brick.position.x - size.x as i32 - origin) / cell;
+            let y0 = (brick.position.y - size.y as i32 - origin) / cell;
+            for dx in 0..(size.x as i32 * 2 / cell) {
+                for dy in 0..(size.y as i32 * 2 / cell) {
+                    let span = (
+                        brick.position.z - size.z as i32,
+                        brick.position.z + size.z as i32,
+                    );
+                    let entry = covered.entry((x0 + dx, y0 + dy)).or_insert(span);
+                    *entry = (entry.0.min(span.0), entry.1.max(span.1));
+                }
+            }
+        }
+        assert_eq!(covered.len(), 144, "every cell must carry a foundation");
+        // A uniform half of the map is one depth and the other half another, so
+        // both cases are represented; what matters is that each column is a
+        // single contiguous span reaching its own surface.
+        for ((x, y), (low, high)) in &covered {
+            assert!(high > low, "cell ({x}, {y}) has an empty foundation");
+        }
     }
 
     #[test]

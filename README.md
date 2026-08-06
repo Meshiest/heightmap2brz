@@ -75,8 +75,10 @@ family (ramp, wedge corner, inner corner, or a stacked outer corner plus
 triangle) that best matches its four corner heights. Neighbouring cells quote
 the same vertices, so their surfaces meet rather than step. Every candidate is
 fitted *from below*, so no cell can protrude through its neighbour and a clean
-cliff comes out as one exact steep ramp instead of a shelf. Costs roughly 1.5
-to 2.5 bricks per pixel. Under `--terrain`, `--vertical` is the height of one
+cliff comes out as one exact steep ramp instead of a shelf. Foundations are a
+flat-topped field, so they are greedy-merged into boxes rather than left one per
+pixel. Costs roughly 0.7 to 2.5 bricks per pixel, depending on how much of the
+map is flat and uniformly coloured. Under `--terrain`, `--vertical` is the height of one
 shade of grey in units, rounded up to an even number (a wedge's half height has
 to be a whole unit).
 
