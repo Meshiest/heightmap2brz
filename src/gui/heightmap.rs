@@ -350,26 +350,31 @@ impl HeightmapApp {
             }
 
             t.row_hover(ui, "Optimization", Some("Algorithm used to reduce brick count"), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    widgets::radio(ui, &mut self.optimization, OptimizationMode::None, "None")
-                        .on_hover_text("No optimization (~one brick per pixel)");
-                    widgets::radio(ui, &mut self.optimization, OptimizationMode::Quad, "Quadtree")
-                        .on_hover_text("Use quadtree based optimization. Looks prettier. May use more bricks. Uses a lot of memory for larger maps");
-                    widgets::radio(ui, &mut self.optimization, OptimizationMode::Greedy, "Greedy")
-                        .on_hover_text("Use greedy mesh for each height level. Uses fewer bricks but slower for images with many colors/heights");
+                // Vertical for the same reason as the Brick Type row below: the
+                // control column is horizontal, so these two notes went to the
+                // RIGHT of the buttons and each wrapped into a narrow column.
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::radio(ui, &mut self.optimization, OptimizationMode::None, "None")
+                            .on_hover_text("No optimization (~one brick per pixel)");
+                        widgets::radio(ui, &mut self.optimization, OptimizationMode::Quad, "Quadtree")
+                            .on_hover_text("Use quadtree based optimization. Looks prettier. May use more bricks. Uses a lot of memory for larger maps");
+                        widgets::radio(ui, &mut self.optimization, OptimizationMode::Greedy, "Greedy")
+                            .on_hover_text("Use greedy mesh for each height level. Uses fewer bricks but slower for images with many colors/heights");
+                    });
+                    if self.optimization == OptimizationMode::Greedy && !self.heightmaps.is_empty() {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 200, 100),
+                            "Note: Greedy meshing does not properly calculate brick heights based on neighbor heights",
+                        );
+                    }
+                    if self.optimization == OptimizationMode::Greedy && self.has_large_image() {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 100, 100),
+                            "Warning: Large images (>1024px) may use excessive memory with greedy optimization",
+                        );
+                    }
                 });
-                if self.optimization == OptimizationMode::Greedy && !self.heightmaps.is_empty() {
-                    ui.colored_label(
-                        Color32::from_rgb(255, 200, 100),
-                        "Note: Greedy meshing does not properly calculate brick heights based on neighbor heights",
-                    );
-                }
-                if self.optimization == OptimizationMode::Greedy && self.has_large_image() {
-                    ui.colored_label(
-                        Color32::from_rgb(255, 100, 100),
-                        "Warning: Large images (>1024px) may use excessive memory with greedy optimization",
-                    );
-                }
             });
 
             t.row_hover(ui, "Options", Some("A list of options for modifying how the generator works"), |ui| {
@@ -394,39 +399,47 @@ impl HeightmapApp {
             });
 
             t.row_hover(ui, "Brick Type", Some("Change which brick type is used for the save file"), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    widgets::radio(ui, &mut self.mode, BrickMode::Default, "Default")
-                        .on_hover_text("Use default bricks");
-                    widgets::radio(ui, &mut self.mode, BrickMode::Tile, "Tile")
-                        .on_hover_text("Use tile bricks");
-                    widgets::radio(ui, &mut self.mode, BrickMode::SmoothTile, "Smooth")
-                        .on_hover_text("Use smooth tile bricks");
-                    widgets::radio(ui, &mut self.mode, BrickMode::Stud, "Stud")
-                        .on_hover_text("Use studded bricks");
-                    widgets::radio(ui, &mut self.mode, BrickMode::Micro, "Micro")
-                        .on_hover_text("Use micro bricks");
-                    widgets::radio(ui, &mut self.mode, BrickMode::Terrain, "Smooth Terrain")
-                        .on_hover_text(
-                            "Build a SMOOTH surface out of micro wedges instead of flat-topped tiles: \n\
-                             every pixel gets a sloped top fitted to the heights of the four shared \n\
-                             grid vertices around it, so neighbouring cells meet instead of stepping.\n\
-                             Uses roughly 1.5 to 2.5 bricks per pixel",
+                // `row_hover` gives the control a HORIZONTAL layout, so a note
+                // after the buttons becomes the next item in that flow and goes
+                // to the RIGHT of them. The space that stays is a few
+                // characters wide, and the note then wraps into a tall, narrow
+                // column. This vertical layout puts the note below the buttons,
+                // where it gets the full width of the control column.
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::radio(ui, &mut self.mode, BrickMode::Default, "Default")
+                            .on_hover_text("Use default bricks");
+                        widgets::radio(ui, &mut self.mode, BrickMode::Tile, "Tile")
+                            .on_hover_text("Use tile bricks");
+                        widgets::radio(ui, &mut self.mode, BrickMode::SmoothTile, "Smooth")
+                            .on_hover_text("Use smooth tile bricks");
+                        widgets::radio(ui, &mut self.mode, BrickMode::Stud, "Stud")
+                            .on_hover_text("Use studded bricks");
+                        widgets::radio(ui, &mut self.mode, BrickMode::Micro, "Micro")
+                            .on_hover_text("Use micro bricks");
+                        widgets::radio(ui, &mut self.mode, BrickMode::Terrain, "Smooth Terrain")
+                            .on_hover_text(
+                                "Build a SMOOTH surface out of micro wedges instead of flat-topped tiles: \n\
+                                 every pixel gets a sloped top fitted to the heights of the four shared \n\
+                                 grid vertices around it, so neighbouring cells meet instead of stepping.\n\
+                                 Uses roughly 1.5 to 2.5 bricks per pixel",
+                            );
+                        widgets::radio(ui, &mut self.mode, BrickMode::Rampify, "Rampify")
+                            .on_hover_text(
+                                "Smooth the surface with Wrapperup's rampifier: fit full-size ramps, \n\
+                                 wedges and ramp corners onto the height columns and fill the rest with \n\
+                                 plain bricks. Coarser than Smooth Terrain (one plate of vertical \n\
+                                 resolution) but builds from ordinary bricks",
+                            );
+                    });
+                    if self.mode.surface() != SurfaceMode::Blocks {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 200, 100),
+                            "Note: this mode picks its own bricks per cell, so the Optimization and \
+                             Snap settings above do not apply",
                         );
-                    widgets::radio(ui, &mut self.mode, BrickMode::Rampify, "Rampify")
-                        .on_hover_text(
-                            "Smooth the surface with Wrapperup's rampifier: fit full-size ramps, \n\
-                             wedges and ramp corners onto the height columns and fill the rest with \n\
-                             plain bricks. Coarser than Smooth Terrain (one plate of vertical \n\
-                             resolution) but builds from ordinary bricks",
-                        );
+                    }
                 });
-                if self.mode.surface() != SurfaceMode::Blocks {
-                    ui.colored_label(
-                        Color32::from_rgb(255, 200, 100),
-                        "Note: this mode picks its own bricks per cell, so the Optimization and \
-                         Snap settings above do not apply",
-                    );
-                }
             });
         });
     }
@@ -675,6 +688,93 @@ mod tests {
             finish(Err(halt)),
             Err("failed to write file".to_string()),
             "a converted error must still be reported to the user"
+        );
+    }
+
+    /// The Brick Type and Optimization notes must sit BELOW their buttons, at
+    /// the full width of the control column.
+    ///
+    /// `SettingsTable::row_hover` gives the control a HORIZONTAL layout. A note
+    /// added after the buttons is thus the next item in that flow and goes to
+    /// the RIGHT of them, in the few characters of space that stay. It then
+    /// wraps into a tall, narrow column. The correction is one `ui.vertical`
+    /// around each control body, which no type or compile check can hold, and
+    /// which a person could remove during a tidy of the code.
+    ///
+    /// The test drives a real `egui::Context` and reads the text that the pane
+    /// paints. egui needs no window for this.
+    #[test]
+    fn a_mode_note_is_painted_below_the_buttons_and_not_beside_them() {
+        const NOTE: &str = "Note: this mode picks its own bricks per cell, so the Optimization \
+                            and Snap settings above do not apply";
+
+        let ctx = Context::default();
+        crate::gui::theme::install(&ctx);
+        let mut app = HeightmapApp::default();
+        app.mode = BrickMode::Terrain;
+        let mut shared = SharedOptions::default();
+
+        let mut texts: Vec<(egui::Rect, String)> = Vec::new();
+        // Four frames to settle: a table learns its column widths from the
+        // frame before, so the first frame is not representative.
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 2400.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_settings(ui, &mut shared, false);
+                });
+            });
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::epaint::Shape::Text(t) => Some((
+                        egui::Rect::from_min_size(t.pos, t.galley.rect.size()),
+                        t.galley.text().to_string(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+        }
+
+        let rect = |want: &str| {
+            texts
+                .iter()
+                .find(|(_, s)| s == want)
+                .map(|(r, _)| *r)
+                .unwrap_or_else(|| panic!("the pane painted no text {want:?}"))
+        };
+        let note = rect(NOTE);
+        let rampify = rect("Rampify");
+
+        assert!(
+            note.top() >= rampify.bottom(),
+            "the note is beside the buttons: the note is at y {}..{} and the last button is at \
+             y {}..{}",
+            note.top(),
+            note.bottom(),
+            rampify.top(),
+            rampify.bottom(),
+        );
+        assert!(
+            note.left() <= rampify.left() + 1.0,
+            "the note starts at x {} but the buttons start at x {}, so it is in a column to \
+             their right",
+            note.left(),
+            rampify.left(),
+        );
+        // The narrow column is what looks incorrect, so measure it: a note that
+        // gets the width of the control column is wide and short.
+        assert!(
+            note.width() > 300.0,
+            "the note is {} wide in a pane of 900, so it still wraps too much",
+            note.width(),
         );
     }
 }
