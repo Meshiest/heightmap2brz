@@ -1,6 +1,28 @@
-use brdb::{BString, Brick, World};
+use brdb::{BString, Brick, Collision, World};
 use std::ffi::OsStr;
 use std::path::PathBuf;
+
+/// How the heightmap's SURFACE is built, as opposed to which brick asset the
+/// blocky modes stack.
+///
+/// [`SurfaceMode::Blocks`] is every renderer that existed before sloped output
+/// did: one prism per (optimized) region, top face flat, asset chosen by
+/// `GenOptions::asset`. The other two replace that emission step entirely and
+/// pick their own assets, so `asset`/`micro`/`stud`/`snap`/`quadtree`/`greedy`
+/// mean nothing to them -- the CLI and the GUI both say so rather than letting
+/// a flag look honoured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SurfaceMode {
+    /// Stacked prisms (quadtree or greedy). The historical behaviour.
+    #[default]
+    Blocks,
+    /// Smooth micro-wedge terrain: one shared-vertex grid, one calibrated
+    /// shape per cell. See `opt::terrain`.
+    Terrain,
+    /// Wrapperup's rampifier over the height column field: full-size ramps,
+    /// wedges and ramp corners fitted onto the surface. See `opt::rampify`.
+    Rampify,
+}
 
 pub struct GenOptions {
     pub size: u16,
@@ -17,6 +39,10 @@ pub struct GenOptions {
     pub nocollide: bool,
     pub quadtree: bool,
     pub greedy: bool,
+    /// Which surface renderer runs. Defaults to [`SurfaceMode::Blocks`], the
+    /// pre-existing behaviour, so an untouched `GenOptions` renders exactly as
+    /// it always did.
+    pub surface: SurfaceMode,
 }
 
 impl GenOptions {
@@ -27,6 +53,19 @@ impl GenOptions {
             1
         } else {
             2
+        }
+    }
+
+    /// The collision flags every renderer in this crate builds from
+    /// `--nocollide`, in one place so the sloped modes cannot drift from the
+    /// blocky ones.
+    pub fn collision(&self) -> Collision {
+        Collision {
+            player: !self.nocollide,
+            weapon: !self.nocollide,
+            interact: !self.nocollide,
+            tool: !self.nocollide,
+            ..Default::default()
         }
     }
 }

@@ -69,6 +69,9 @@ enum PickTarget {
     Colormap,
 }
 
+/// What the Brick Type row picks. The first five choose which asset the blocky
+/// renderer stacks; the last two replace the renderer, because a sloped surface
+/// is not built out of one repeated brick.
 #[derive(PartialEq, Clone)]
 enum BrickMode {
     Default,
@@ -76,6 +79,20 @@ enum BrickMode {
     SmoothTile,
     Stud,
     Micro,
+    /// Smooth micro-wedge terrain (`opt::terrain`).
+    Terrain,
+    /// Wrapperup's rampifier over the height columns (`opt::rampify`).
+    Rampify,
+}
+
+impl BrickMode {
+    fn surface(&self) -> SurfaceMode {
+        match self {
+            BrickMode::Terrain => SurfaceMode::Terrain,
+            BrickMode::Rampify => SurfaceMode::Rampify,
+            _ => SurfaceMode::Blocks,
+        }
+    }
 }
 
 #[derive(PartialEq, Clone)]
@@ -167,7 +184,18 @@ impl HeightmapApp {
     }
 
     fn options(&self, img_only: bool) -> GenOptions {
+        let img = img_only || (self.heightmaps.is_empty() && self.colormap.is_some());
+        // The sloped renderers only exist for a heightmap; a flat image has no
+        // terrain to slope, so the Image2Brick pane falls back to blocks rather
+        // than paving an unchanging plane in wedges.
+        let surface = if img {
+            SurfaceMode::Blocks
+        } else {
+            self.mode.surface()
+        };
         GenOptions {
+            // `--size` counts STUDS everywhere except the blocky micro mode,
+            // which reinterprets it as micro units.
             size: if self.mode == BrickMode::Micro {
                 self.horizontal_size
             } else {
@@ -181,17 +209,21 @@ impl HeightmapApp {
                 BrickMode::SmoothTile => PB_DEFAULT_SMOOTH_TILE,
                 BrickMode::Stud => PB_DEFAULT_STUDDED,
                 BrickMode::Micro => PB_DEFAULT_MICRO_BRICK,
+                // Both sloped renderers choose their own assets per cell and
+                // never read this one.
+                BrickMode::Terrain | BrickMode::Rampify => PB_DEFAULT_MICRO_BRICK,
             },
             micro: self.mode == BrickMode::Micro,
             stud: self.mode == BrickMode::Stud,
             snap: self.opt_snap,
-            img: img_only || (self.heightmaps.is_empty() && self.colormap.is_some()),
+            img,
             glow: self.opt_glow,
             hdmap: self.opt_hdmap,
             lrgb: self.opt_lrgb,
             nocollide: self.opt_nocollide,
             quadtree: self.optimization == OptimizationMode::Quad,
             greedy: self.optimization == OptimizationMode::Greedy,
+            surface,
         }
     }
 
@@ -372,7 +404,28 @@ impl HeightmapApp {
                         .on_hover_text("Use studded bricks");
                     widgets::radio(ui, &mut self.mode, BrickMode::Micro, "Micro")
                         .on_hover_text("Use micro bricks");
+                    widgets::radio(ui, &mut self.mode, BrickMode::Terrain, "Smooth Terrain")
+                        .on_hover_text(
+                            "Build a SMOOTH surface out of micro wedges instead of flat-topped tiles: \n\
+                             every pixel gets a sloped top fitted to the heights of the four shared \n\
+                             grid vertices around it, so neighbouring cells meet instead of stepping.\n\
+                             Uses roughly 1.5 to 2.5 bricks per pixel",
+                        );
+                    widgets::radio(ui, &mut self.mode, BrickMode::Rampify, "Rampify")
+                        .on_hover_text(
+                            "Smooth the surface with Wrapperup's rampifier: fit full-size ramps, \n\
+                             wedges and ramp corners onto the height columns and fill the rest with \n\
+                             plain bricks. Coarser than Smooth Terrain (one plate of vertical \n\
+                             resolution) but builds from ordinary bricks",
+                        );
                 });
+                if self.mode.surface() != SurfaceMode::Blocks {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 200, 100),
+                        "Note: this mode picks its own bricks per cell, so the Optimization and \
+                         Snap settings above do not apply",
+                    );
+                }
             });
         });
     }
