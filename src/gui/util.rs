@@ -168,12 +168,27 @@ pub fn section(
     } else {
         egui::CornerRadius::same(r)
     };
+
+    // Draw the header and body with NO vertical item-spacing between them, so the
+    // body sits flush UNDER the header band (the two read as one card). egui adds
+    // item_spacing AFTER each widget using the value in effect when THAT widget
+    // is placed, so the header->body gap is governed by the spacing set before
+    // the HEADER -- zero it here and restore it once the body is placed.
+    let prev_gap = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    // A gap ABOVE the accordion so successive ones read as separate cards (the
+    // header+body pair inside each stays flush). Added AFTER zeroing the spacing
+    // so this space itself carries no extra trailing gap.
+    ui.add_space(prev_gap);
     let header = egui::Frame::new()
         .fill(theme::SURFACE_HEADER)
         .corner_radius(header_radius)
         .inner_margin(egui::Margin { left: pad, right: pad, top: 4, bottom: 4 })
         .show(ui, |ui| {
             ui.set_min_width(width - 2.0 * widgets::CELL_PAD);
+            // Restore a vertical gap for wrapped chip lines (the outer spacing was
+            // zeroed above only to flush the body under the header).
+            ui.spacing_mut().item_spacing.y = 4.0;
             ui.horizontal_wrapped(|ui| {
                 // Fixed-width (1.5em) centered chevron so the title never shifts
                 // horizontally when the icon swaps between right/down.
@@ -211,18 +226,18 @@ pub fn section(
         state.toggle(ui);
     }
 
-    // Body: a lighter card flush UNDER the header band -- kill the inter-widget
-    // gap so the two touch, and round only its bottom corners so header + body
+    // Body: a lighter card flush UNDER the header band (the zeroed item-spacing
+    // above keeps them touching); round only its bottom corners so header + body
     // read as one card.
-    let prev_gap = ui.spacing().item_spacing.y;
-    ui.spacing_mut().item_spacing.y = 0.0;
     state.show_body_unindented(ui, |ui| {
         egui::Frame::new()
             // Darker than the surrounding Settings card so the accordion body
             // reads as a distinct nested card.
             .fill(theme::BG_SECONDARY_ALT)
             .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: r, se: r })
-            .inner_margin(egui::Margin::same(pad))
+            // No TOP padding: the content sits flush under the header band (which
+            // already caps it), with the breathing room on the BOTTOM instead.
+            .inner_margin(egui::Margin { left: pad, right: pad, top: 0, bottom: pad })
             .show(ui, |ui| {
                 ui.set_min_width(width - 2.0 * widgets::CELL_PAD);
                 ui.spacing_mut().item_spacing.y = 2.0;

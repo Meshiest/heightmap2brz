@@ -427,7 +427,18 @@ pub fn full_bleed<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     let pad = CELL_PAD as i8;
     Frame::new()
         .outer_margin(Margin { left: -pad, right: -pad, top: 0, bottom: 0 })
-        .show(ui, |ui| add(ui))
+        .show(ui, |ui| {
+            // `egui_extras` paints each striped row background expanded by HALF
+            // the horizontal item spacing (so adjacent cells' stripes meet with
+            // no seam), which pushes the OUTER stripes a few px past this frame
+            // and out onto the page. Clip horizontally to the frame's own width
+            // so the stripes stop exactly at the card edges; the vertical clip is
+            // left alone so rows still lay out and the page still scrolls.
+            let y = ui.clip_rect().y_range();
+            let x = ui.max_rect().x_range();
+            ui.set_clip_rect(egui::Rect::from_x_y_ranges(x, y));
+            add(ui)
+        })
         .inner
 }
 
