@@ -1,4 +1,6 @@
-use super::{BitMask, QuadTree, greedy_mesh_binary_plane};
+use super::{
+    BitMask, QuadTree, gen_rampify_heightmap, gen_terrain_heightmap, greedy_mesh_binary_plane,
+};
 use crate::map::*;
 use crate::util::*;
 use brdb::{
@@ -34,6 +36,21 @@ pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
     options: GenOptions,
     progress_f: F,
 ) -> Result<Vec<Brick>, String> {
+    // The sloped renderers replace the full step that makes the bricks. They
+    // select their own assets from a set of shapes and do not use
+    // `options.asset`. The code thus selects them BEFORE the quadtree or
+    // greedy choice, which is a choice between two ways to join boxes with
+    // flat tops.
+    match options.surface {
+        SurfaceMode::Terrain => {
+            return gen_terrain_heightmap(heightmap, colormap, options, progress_f);
+        }
+        SurfaceMode::Rampify => {
+            return gen_rampify_heightmap(heightmap, colormap, options, progress_f);
+        }
+        SurfaceMode::Blocks => {}
+    }
+
     // Use greedy mesh if requested
     if options.greedy {
         return gen_greedy_heightmap(heightmap, colormap, options, progress_f);

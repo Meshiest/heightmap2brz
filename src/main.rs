@@ -92,6 +92,9 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg smooth: --smooth "Render bricks as smooth tiles")
         (@arg micro: --micro "Render bricks as micro bricks")
         (@arg stud: --stud "Render bricks as stud cubes")
+        (@arg terrain: --terrain "Render the terrain as SMOOTH micro bricks instead of flat-topped tiles: every pixel gets a sloped top chosen from Brickadia's micro wedge family (ramp, wedge corner, inner corner, and the stacked diagonal corner+triangle), fitted to the four shared vertex heights around it. Heights are sampled on a shared (w+1)x(h+1) vertex grid so neighbouring cells MEET rather than step. Replaces --tile/--smooth/--micro/--stud and the optimizers, which have no meaning once the top face is not flat")
+        (@arg rampify: --rampify "Rampify the terrain with Wrapperup's rampifier: fit full-size ramps, wedges and ramp corners onto the height column surface and fill the rest with plain bricks. Coarser than --terrain (one plate of vertical resolution, runs of at most 4 studs) but uses ordinary bricks rather than micro pieces. Replaces --tile/--smooth/--micro/--stud and the optimizers")
+        (@arg prefab: --prefab "Heightmap/image renders: write a PREFAB bundle instead of a world, so the save can be dropped in Brickadia's Prefabs folder and spawned from the prefab browser rather than loaded as a level")
         (@arg snap: --snap "Snap bricks to the brick grid")
         (@arg lrgb: --lrgb "Use linear rgb input color instead of sRGB")
         (@arg img: -i --img "Make the heightmap flat and render an image")
@@ -311,6 +314,24 @@ fn main() {
             "--anim-mode takes precedence over --text; this render is the ANIMATED wired \
              build, not the static text export. Pass one output mode"
         );
+    }
+
+    // These options apply to the heightmap only. If another renderer wins the
+    // selection below, the code tells the user. This is the rule that
+    // `--subtitles` above uses: a user who gives `--terrain --text` and gets a
+    // text export would think that the terrain renderer is defective.
+    if ["midi", "audiomode", "animmode", "text"]
+        .iter()
+        .any(|m| matches.is_present(m))
+    {
+        for flag in ["terrain", "rampify", "prefab"] {
+            if matches.is_present(flag) {
+                warn!(
+                    "--{flag} applies to heightmap and --img renders only; this render is \
+                     built by another mode and ignores it"
+                );
+            }
+        }
     }
 
     if matches.is_present("midi") {
@@ -1412,9 +1433,57 @@ fn run_heightmap(
         Err(e) => fail(e),
     };
 
+    // The two sloped renderers. The code refuses both together and does not
+    // select one of them. They are different methods with different bricks.
+    // A user who gives both must select one of them.
+    let surface = match (matches.is_present("terrain"), matches.is_present("rampify")) {
+        (true, true) => fail!(
+            "--terrain and --rampify are two different smoothing techniques and cannot be \
+             combined: --terrain fits micro wedges to a shared vertex grid, --rampify fits \
+             full-size ramps to the height columns. Pass exactly one"
+        ),
+        (true, false) => SurfaceMode::Terrain,
+        (false, true) => SurfaceMode::Rampify,
+        (false, false) => SurfaceMode::Blocks,
+    };
+    // Each option below controls a box with a FLAT TOP, which is the one
+    // thing that a sloped renderer does not make. The code names each option,
+    // in the same way as the audio part names the options that it cannot use.
+    // A render that ignored `--greedy` without a message would appear
+    // correct.
+    if surface != SurfaceMode::Blocks {
+        let mode = if surface == SurfaceMode::Terrain { "--terrain" } else { "--rampify" };
+        for (flag, name) in [
+            ("--tile", "tile"),
+            ("--smooth", "smooth"),
+            ("--stud", "stud"),
+            ("--greedy", "greedy"),
+            ("--snap", "snap"),
+        ] {
+            if matches.is_present(name) {
+                warn!(
+                    "{mode} ignores {flag}: it picks its own bricks from a shape grammar rather \
+                     than stacking one asset, so there is no brick style or optimizer to choose"
+                );
+            }
+        }
+        // `--micro` also changes what `--size` COUNTS, so it gets its own
+        // message. To obey it would make the map 5 times smaller.
+        if matches.is_present("micro") {
+            warn!(
+                "{mode} ignores --micro; --size stays a count of STUDS per pixel. --terrain \
+                 already builds from micro bricks, and --rampify needs full-size ramp assets"
+            );
+        }
+        if matches.is_present("img") {
+            warn!("{mode} ignores --img: a flat image has no terrain to slope");
+        }
+    }
+    let blocks = surface == SurfaceMode::Blocks;
+
     // output options
     let options = GenOptions {
-        size: size * if matches.is_present("micro") { 1 } else { 5 },
+        size: size * if matches.is_present("micro") && blocks { 1 } else { 5 },
         scale,
         cull: matches.is_present("cull"),
         asset: if matches.is_present("micro") {
@@ -1428,16 +1497,17 @@ fn run_heightmap(
         } else {
             PB_DEFAULT_BRICK
         },
-        micro: matches.is_present("micro"),
-        stud: matches.is_present("stud"),
+        micro: matches.is_present("micro") && blocks,
+        stud: matches.is_present("stud") && blocks,
         snap: matches.is_present("snap"),
-        img: matches.is_present("img"),
+        img: matches.is_present("img") && blocks,
         glow: matches.is_present("glow"),
         hdmap: matches.is_present("hdmap"),
         lrgb: matches.is_present("lrgb"),
         nocollide: matches.is_present("nocollide"),
         quadtree: true,
         greedy: matches.is_present("greedy"),
+        surface,
     };
 
     info!("Reading image files");
@@ -1493,7 +1563,14 @@ fn run_heightmap(
     };
 
     info!("Writing Save to {}", out_file);
-    let data = bricks_to_save(bricks);
+    let mut data = bricks_to_save(bricks);
+    // A prefab bundle and a world bundle differ in their metadata only. The
+    // difference is `level_type` and the block of pivots and bounds that
+    // `make_prefab` calculates from the brick positions. The code thus changes
+    // the completed world and does not send this option to each generator.
+    if matches.is_present("prefab") {
+        data.make_prefab();
+    }
     if let Err(e) = write_world(&data, &out_file) {
         fail!("{e}");
     }

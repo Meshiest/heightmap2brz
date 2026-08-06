@@ -1,6 +1,30 @@
-use brdb::{BString, Brick, World};
+use brdb::{BString, Brick, Collision, World};
 use std::ffi::OsStr;
 use std::path::PathBuf;
+
+/// How the code makes the SURFACE of the heightmap. This is different from the
+/// brick asset that the other modes use.
+///
+/// [`SurfaceMode::Blocks`] is each renderer that came before the sloped modes.
+/// It makes one box for each area, the top face is flat, and
+/// `GenOptions::asset` gives the asset. The other two modes replace that step
+/// and select their own assets. To them `asset`, `micro`, `stud`, `snap`,
+/// `quadtree` and `greedy` have no meaning. The CLI and the GUI both tell the
+/// user this, because an option that appears to work but does nothing is
+/// worse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SurfaceMode {
+    /// Boxes above boxes, with the quadtree method or the greedy method. This
+    /// is the earlier behavior.
+    #[default]
+    Blocks,
+    /// Smooth micro wedge terrain: one grid of shared vertices, and one
+    /// calibrated shape for each cell. Refer to `opt::terrain`.
+    Terrain,
+    /// The Wrapperup rampifier over the height columns: usual ramps, wedges
+    /// and corner ramps on the surface. Refer to `opt::rampify`.
+    Rampify,
+}
 
 pub struct GenOptions {
     pub size: u16,
@@ -17,6 +41,10 @@ pub struct GenOptions {
     pub nocollide: bool,
     pub quadtree: bool,
     pub greedy: bool,
+    /// The surface renderer that runs. The default is
+    /// [`SurfaceMode::Blocks`], which is the earlier behavior. A `GenOptions`
+    /// that you do not change thus gives the same result as before.
+    pub surface: SurfaceMode,
 }
 
 impl GenOptions {
@@ -27,6 +55,19 @@ impl GenOptions {
             1
         } else {
             2
+        }
+    }
+
+    /// The collision values that each renderer makes from `--nocollide`. They
+    /// are in one function, so the sloped modes always agree with the other
+    /// modes.
+    pub fn collision(&self) -> Collision {
+        Collision {
+            player: !self.nocollide,
+            weapon: !self.nocollide,
+            interact: !self.nocollide,
+            tool: !self.nocollide,
+            ..Default::default()
         }
     }
 }
