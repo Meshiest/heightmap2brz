@@ -2,25 +2,27 @@ use brdb::{BString, Brick, Collision, World};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-/// How the heightmap's SURFACE is built, as opposed to which brick asset the
-/// blocky modes stack.
+/// How the code makes the SURFACE of the heightmap. This is different from the
+/// brick asset that the other modes use.
 ///
-/// [`SurfaceMode::Blocks`] is every renderer that existed before sloped output
-/// did: one prism per (optimized) region, top face flat, asset chosen by
-/// `GenOptions::asset`. The other two replace that emission step entirely and
-/// pick their own assets, so `asset`/`micro`/`stud`/`snap`/`quadtree`/`greedy`
-/// mean nothing to them -- the CLI and the GUI both say so rather than letting
-/// a flag look honoured.
+/// [`SurfaceMode::Blocks`] is each renderer that came before the sloped modes.
+/// It makes one box for each area, the top face is flat, and
+/// `GenOptions::asset` gives the asset. The other two modes replace that step
+/// and select their own assets. To them `asset`, `micro`, `stud`, `snap`,
+/// `quadtree` and `greedy` have no meaning. The CLI and the GUI both tell the
+/// user this, because an option that appears to work but does nothing is
+/// worse.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SurfaceMode {
-    /// Stacked prisms (quadtree or greedy). The historical behaviour.
+    /// Boxes above boxes, with the quadtree method or the greedy method. This
+    /// is the earlier behavior.
     #[default]
     Blocks,
-    /// Smooth micro-wedge terrain: one shared-vertex grid, one calibrated
-    /// shape per cell. See `opt::terrain`.
+    /// Smooth micro wedge terrain: one grid of shared vertices, and one
+    /// calibrated shape for each cell. Refer to `opt::terrain`.
     Terrain,
-    /// Wrapperup's rampifier over the height column field: full-size ramps,
-    /// wedges and ramp corners fitted onto the surface. See `opt::rampify`.
+    /// The Wrapperup rampifier over the height columns: usual ramps, wedges
+    /// and corner ramps on the surface. Refer to `opt::rampify`.
     Rampify,
 }
 
@@ -39,9 +41,9 @@ pub struct GenOptions {
     pub nocollide: bool,
     pub quadtree: bool,
     pub greedy: bool,
-    /// Which surface renderer runs. Defaults to [`SurfaceMode::Blocks`], the
-    /// pre-existing behaviour, so an untouched `GenOptions` renders exactly as
-    /// it always did.
+    /// The surface renderer that runs. The default is
+    /// [`SurfaceMode::Blocks`], which is the earlier behavior. A `GenOptions`
+    /// that you do not change thus gives the same result as before.
     pub surface: SurfaceMode,
 }
 
@@ -56,9 +58,9 @@ impl GenOptions {
         }
     }
 
-    /// The collision flags every renderer in this crate builds from
-    /// `--nocollide`, in one place so the sloped modes cannot drift from the
-    /// blocky ones.
+    /// The collision values that each renderer makes from `--nocollide`. They
+    /// are in one function, so the sloped modes always agree with the other
+    /// modes.
     pub fn collision(&self) -> Collision {
         Collision {
             player: !self.nocollide,

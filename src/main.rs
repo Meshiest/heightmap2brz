@@ -316,10 +316,10 @@ fn main() {
         );
     }
 
-    // The heightmap-only flags, named out loud when another renderer has
-    // already won the dispatch below. Same policy as `--subtitles` above: a
-    // user who passed `--terrain --text` and got a glyph export would
-    // reasonably conclude the terrain renderer was broken.
+    // These options apply to the heightmap only. If another renderer wins the
+    // selection below, the code tells the user. This is the rule that
+    // `--subtitles` above uses: a user who gives `--terrain --text` and gets a
+    // text export would think that the terrain renderer is defective.
     if ["midi", "audiomode", "animmode", "text"]
         .iter()
         .any(|m| matches.is_present(m))
@@ -1433,9 +1433,9 @@ fn run_heightmap(
         Err(e) => fail(e),
     };
 
-    // The two sloped surface renderers. Refused together rather than silently
-    // preferring one: they are different techniques with different brick
-    // families, and a user who passed both has one of them in mind.
+    // The two sloped renderers. The code refuses both together and does not
+    // select one of them. They are different methods with different bricks.
+    // A user who gives both must select one of them.
     let surface = match (matches.is_present("terrain"), matches.is_present("rampify")) {
         (true, true) => fail!(
             "--terrain and --rampify are two different smoothing techniques and cannot be \
@@ -1446,10 +1446,11 @@ fn run_heightmap(
         (false, true) => SurfaceMode::Rampify,
         (false, false) => SurfaceMode::Blocks,
     };
-    // Every flag below shapes a FLAT-TOPPED prism, which is the one thing a
-    // sloped renderer does not build. Named out loud one at a time rather than
-    // dropped, the same way the audio branch names the flags it cannot honour:
-    // a render that silently ignored `--greedy` would look like it worked.
+    // Each option below controls a box with a FLAT TOP, which is the one
+    // thing that a sloped renderer does not make. The code names each option,
+    // in the same way as the audio part names the options that it cannot use.
+    // A render that ignored `--greedy` without a message would appear
+    // correct.
     if surface != SurfaceMode::Blocks {
         let mode = if surface == SurfaceMode::Terrain { "--terrain" } else { "--rampify" };
         for (flag, name) in [
@@ -1466,8 +1467,8 @@ fn run_heightmap(
                 );
             }
         }
-        // `--micro` is the one that also changes what `--size` COUNTS, so it
-        // gets its own message: taken literally it would shrink the map 5x.
+        // `--micro` also changes what `--size` COUNTS, so it gets its own
+        // message. To obey it would make the map 5 times smaller.
         if matches.is_present("micro") {
             warn!(
                 "{mode} ignores --micro; --size stays a count of STUDS per pixel. --terrain \
@@ -1563,10 +1564,10 @@ fn run_heightmap(
 
     info!("Writing Save to {}", out_file);
     let mut data = bricks_to_save(bricks);
-    // A prefab bundle and a world bundle differ only in metadata (`level_type`
-    // plus the pivot/bounds block `make_prefab` computes from the brick
-    // bounding box), so this is applied to the finished world rather than
-    // threaded through every generator.
+    // A prefab bundle and a world bundle differ in their metadata only. The
+    // difference is `level_type` and the block of pivots and bounds that
+    // `make_prefab` calculates from the brick positions. The code thus changes
+    // the completed world and does not send this option to each generator.
     if matches.is_present("prefab") {
         data.make_prefab();
     }

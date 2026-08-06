@@ -36,10 +36,11 @@ pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
     options: GenOptions,
     progress_f: F,
 ) -> Result<Vec<Brick>, String> {
-    // The sloped renderers replace brick emission wholesale -- they pick their
-    // own assets from a shape grammar rather than stacking `options.asset` --
-    // so they are chosen BEFORE the quadtree/greedy split, which is a choice
-    // between two ways of merging flat-topped prisms.
+    // The sloped renderers replace the full step that makes the bricks. They
+    // select their own assets from a set of shapes and do not use
+    // `options.asset`. The code thus selects them BEFORE the quadtree or
+    // greedy choice, which is a choice between two ways to join boxes with
+    // flat tops.
     match options.surface {
         SurfaceMode::Terrain => {
             return gen_terrain_heightmap(heightmap, colormap, options, progress_f);

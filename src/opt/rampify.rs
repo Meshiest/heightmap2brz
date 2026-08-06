@@ -1,30 +1,35 @@
-//! Wrapperup's rampifier, over a heightmap's column field.
+//! The Wrapperup rampifier, over the height columns of a heightmap.
 //!
-//! The slope-selection algorithm is Wrapperup/rampifier's, by way of the
-//! BRDB-native port in `obj2brz` (`crates/obj2brz/src/rampify.rs`): scan the
-//! surface, fit the longest ramp that meets the terrain rising in front of it,
-//! prefer corner ramps at convex and concave turns, then fill whatever is left
-//! with plain bricks. The fitting rules, the run/rise limits and the brick
-//! geometry are all carried over unchanged.
+//! The algorithm that selects the slopes is the Wrapperup/rampifier
+//! algorithm. It comes here from the BRDB version in `obj2brz`
+//! (`crates/obj2brz/src/rampify.rs`): examine the surface, fit the longest
+//! ramp that touches the ground that goes up in front of it, use corner ramps
+//! at convex turns and at concave turns, then fill the remainder with usual
+//! bricks. The fit rules, the limits on the run and the rise, and the brick
+//! geometry are all the same as in that version.
 //!
-//! What is NOT carried over is the dense voxel grid. `obj2brz` rampifies an
-//! arbitrary mesh, so it materialises one cell per voxel of the bounding box
-//! and caps the model at 64M of them. A heightmap is a HEIGHT FIELD -- a column
-//! is solid from the ground to its top and empty above -- so occupancy is a
-//! comparison rather than a lookup, and a 4096x4096 map at 255 plates costs a
-//! `Vec<i32>` per column instead of the four terabytes its bounding box would
-//! ask for. Two consequences fall out of that and are relied on below:
+//! The dense grid of voxels is NOT the same. `obj2brz` makes ramps from any
+//! mesh, so it makes one cell for each voxel of the bounding box and refuses a
+//! model of more than 64M cells. A heightmap is a HEIGHT FIELD: a column is
+//! solid from the ground to its top and is empty above the top. To find the
+//! material is thus a comparison and not a lookup, and a map of 4096x4096 at
+//! 255 plates costs one `Vec<i32>` for each column. The bounding box would
+//! ask for four terabytes. Two results of this come from that fact and the
+//! code below uses them:
 //!
-//! * **Only the top cell of a column can anchor a slope.** Both `fit_ramp` and
-//!   `fit_corner` refuse a cell with anything above it, so the whole
-//!   ascending-Z scan reduces to visiting each column once, in height order.
-//! * **There is no enclosed air and no underside.** The mesh rampifier floods
-//!   air to find the inside of a watertight model and fits upside-down ramps
-//!   under overhangs; a height field has neither, so only the floor pass runs.
+//! * **Only the top cell of a column can hold a slope.** `fit_ramp` and
+//!   `fit_corner` both refuse a cell that has material above it. The full scan
+//!   up the Z axis thus becomes one visit to each column, in the sequence of
+//!   the heights.
+//! * **There is no closed air and no lower face.** The mesh rampifier fills
+//!   air to find the inside of a closed model, and it puts ramps upside down
+//!   below an overhang. A height field has neither, so only the floor pass
+//!   runs.
 //!
 //! One voxel is one pixel wide (`GenOptions::size` half extents) and one plate
-//! tall (4 units). `--vertical` is read as units and rounded to a whole number
-//! of plates, because a `PB_DefaultRamp`'s rise is quantized to plates.
+//! high (4 units). The code reads `--vertical` as units and changes it to a
+//! whole number of plates, because the rise of a `PB_DefaultRamp` must be a
+//! whole number of plates.
 
 use crate::map::*;
 use crate::util::*;
@@ -41,17 +46,17 @@ use brdb::{
 use log::info;
 use std::collections::HashMap;
 
-/// Longest run a ramp may span, in cells. Wrapperup's value.
+/// The longest run of a ramp, in cells. This is the Wrapperup value.
 const RAMP_MAX_RUN: i32 = 4;
-/// Tallest rise a ramp may span, in cells. Wrapperup's value.
+/// The largest rise of a ramp, in cells. This is the Wrapperup value.
 const RAMP_MAX_RISE: i32 = 12;
-/// Vertical units in one cell: a plate.
+/// The number of vertical units in one cell. One cell is one plate.
 const CELL_UNITS: i32 = 4;
-/// The largest half extent a procedural brick may carry.
+/// The largest half extent that a procedural brick can hold.
 const MAX_HALF_EXTENT: i32 = 250;
 
-/// A cell coordinate. X and Y index the pixel grid; Z counts plates up from the
-/// ground.
+/// One cell position. X and Y give the pixel, and Z counts the plates above
+/// the ground.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Cell(i32, i32, i32);
 
@@ -77,9 +82,9 @@ impl std::ops::Mul<i32> for Cell {
 }
 
 impl Cell {
-    /// Which way a ramp of this rotation runs UPHILL. Rotation zero steps down
-    /// toward `+X`, so its uphill direction is `-X`; the rest are quarter turns
-    /// counter-clockwise around `+Z`.
+    /// The direction in which a ramp with this rotation goes UP. Rotation zero
+    /// goes down at `+X`, so it goes up at `-X`. The other rotations are
+    /// quarter turns counterclockwise around `+Z`.
     fn forward(rotation: Rotation) -> Self {
         match rotation {
             Rotation::Deg0 => Self(-1, 0, 0),
@@ -99,17 +104,17 @@ fn next_rotation(rotation: Rotation) -> Rotation {
     }
 }
 
-/// The height field the rampifier reads, plus the cells already claimed by a
-/// slope.
+/// The height field that the rampifier reads, with the cells that a slope
+/// already uses.
 struct Field {
     width: i32,
     height: i32,
-    /// Solid cells in each column: the column occupies `0..cells`.
+    /// The number of solid cells in each column. The column fills `0..cells`.
     cells: Vec<i32>,
     colors: Vec<[u8; 4]>,
-    /// Inclusive Z ranges consumed by an emitted slope, per column. A column
-    /// carries at most a handful, so a small `Vec` beats a per-cell bitmap by
-    /// orders of magnitude on a real map.
+    /// The Z ranges of each column that a slope uses, with both ends included.
+    /// A column holds only a small number of these, so a short `Vec` uses much
+    /// less memory than one bit for each cell on a real map.
     claimed: Vec<Vec<(i32, i32)>>,
 }
 
@@ -135,9 +140,9 @@ impl Field {
         })
     }
 
-    /// How many cells of solid material sit at and above `cell`, capped at 31.
-    /// `i32::MIN` when the cell itself is air, so an empty neighbour can never
-    /// win the `max_by_key` in [`Self::best_rotation`].
+    /// The number of solid cells at `cell` and above it, to a maximum of 31.
+    /// The result is `i32::MIN` if the cell is empty. An empty adjacent cell
+    /// can thus never win the `max_by_key` in [`Self::best_rotation`].
     fn slope_height(&self, cell: Cell) -> i32 {
         if !self.exists(cell) {
             return i32::MIN;
@@ -145,8 +150,9 @@ impl Field {
         (self.column(cell) - cell.2).min(31)
     }
 
-    /// The direction whose terrain rises highest in front of `cell` while the
-    /// cell BEHIND it is open, i.e. the way a ramp here should climb.
+    /// The direction in which the ground in front of `cell` goes up the most,
+    /// while the cell BEHIND it is empty. A ramp at this cell must go up in
+    /// that direction.
     fn best_rotation(&self, cell: Cell) -> Option<Rotation> {
         if self.exists(cell + Cell(0, 0, 1)) {
             return None;
@@ -164,8 +170,8 @@ impl Field {
         .and_then(|(height, rotation)| (height > 0).then_some(rotation))
     }
 
-    /// The run and rise of the straight ramp anchored at `cell` climbing
-    /// `rotation`, or `None` where no ramp fits.
+    /// The run and the rise of the straight ramp that starts at `cell` and
+    /// goes up at `rotation`. The result is `None` if no ramp fits.
     fn fit_ramp(&self, cell: Cell, rotation: Rotation) -> Option<(i32, i32)> {
         let forward = Cell::forward(rotation);
         let up = Cell(0, 0, 1);
@@ -194,8 +200,8 @@ impl Field {
                 break;
             }
         }
-        // A summit the ramp runs off the far side of gets one more cell of
-        // rise, so a ridge is capped rather than left a plate short.
+        // A top that the ramp goes over gets one more cell of rise. A ridge
+        // thus gets a full top and does not stay one plate too low.
         let mut add_one = 0;
         for step in 1..RAMP_MAX_RUN {
             let beyond = cell + up * rise + forward * (run + step);
@@ -210,15 +216,16 @@ impl Field {
         (rise > 1).then_some((run + 1, rise - 1))
     }
 
-    /// The runs along each wall axis and the rise of a corner ramp whose two
-    /// high walls face `rotation` and `rotation + 90`, with `cell` as the low
-    /// outer corner.
+    /// The runs along each wall axis and the rise of a corner ramp. The two
+    /// high walls point at `rotation` and at `rotation + 90`, and `cell` is
+    /// the low outer corner.
     ///
-    /// An OUTER corner (a convex contour turn) has open cells behind both wall
-    /// axes and rising terrain only past the far diagonal. An INNER corner (a
-    /// concave turn) sits where the edge wraps the other way: the cells behind
-    /// it are still edge, only the diagonal between them is open, and the
-    /// terrain rises along the whole far row and column.
+    /// An OUTER corner is a convex turn. It has empty cells behind both wall
+    /// axes, and the ground goes up only after the far diagonal cell. An INNER
+    /// corner is a concave turn. The edge turns the other way there: the cells
+    /// behind it are still part of the edge, only the diagonal between them is
+    /// empty, and the ground goes up along the full far row and the full far
+    /// column.
     fn fit_corner(&self, cell: Cell, rotation: Rotation, inner: bool) -> Option<(i32, i32, i32)> {
         let up = Cell(0, 0, 1);
         let forward_a = Cell::forward(rotation);
@@ -238,15 +245,16 @@ impl Field {
         }
         let (run_a, rise_a) = self.fit_ramp(cell, rotation)?;
         let (run_b, rise_b) = self.fit_ramp(cell, next_rotation(rotation))?;
-        // The two edge fits rarely agree exactly on rough terrain; the lower
-        // rise still meets both neighbouring slopes.
+        // On rough ground the two edge fits are usually different. The lower
+        // rise still touches both adjacent slopes.
         let rise = rise_a.min(rise_b);
 
-        // An outer corner's surface is the INTERSECTION of the two straight
-        // ramps, so it only reaches full height at the far diagonal cell; an
-        // inner corner's is their UNION and is full height along the whole far
-        // row and column. Those cells may hold the rising terrain; everywhere
-        // else the footprint must be flat with air above it.
+        // The surface of an outer corner is where the two straight ramps
+        // AGREE, so it is at the full height only at the far diagonal cell.
+        // The surface of an inner corner is where EITHER ramp is high, so it
+        // is at the full height along the full far row and the full far
+        // column. Those cells can hold the ground that goes up. At each other
+        // cell the area must be flat, with air above it.
         let clear = |cells_a: i32, cells_b: i32| {
             for i in 0..cells_a {
                 for j in 0..cells_b {
@@ -268,8 +276,9 @@ impl Field {
             }
             true
         };
-        // The full-run footprint is often obstructed on rough terrain, so fall
-        // back to the largest clear rectangle that still makes a corner (2x2).
+        // On rough ground something usually blocks the area of the full run.
+        // The code then uses the largest empty rectangle that is still a
+        // corner, which is 2x2.
         let mut best: Option<(i32, i32)> = None;
         for cells_a in 2..=run_a {
             for cells_b in 2..=run_b {
@@ -281,9 +290,9 @@ impl Field {
         best.map(|(cells_a, cells_b)| (cells_a, cells_b, rise))
     }
 
-    /// Claim every cell in a box and report the colour that dominates the solid
-    /// ones. A slope covers several columns, and taking the anchor's colour
-    /// instead would tint every ramp with the colour of its lowest pixel.
+    /// Use each cell in a box, and give the color that occurs most in the
+    /// solid cells. A slope covers more than one column. To use the color of
+    /// the first cell would give each ramp the color of its lowest pixel.
     fn claim(&mut self, origin: Cell, axes: [(Cell, i32); 2], rise: i32) -> Color {
         let mut counts = HashMap::<[u8; 4], usize>::new();
         for i in 0..axes[0].1 {
@@ -314,14 +323,15 @@ impl Field {
     }
 }
 
-/// Where the rampifier's cell grid sits in world units, and how bricks are
-/// styled. Split out so the geometry can be exercised without a `GenOptions`.
+/// The position of the cell grid in world units, and the appearance of the
+/// bricks. It is a separate type, so a test can use the geometry without a
+/// `GenOptions`.
 struct Layout {
-    /// Half extent of one cell in X and Y, in units.
+    /// The half extent of one cell in X and Y, in units.
     half: i32,
     offset_x: i32,
     offset_y: i32,
-    /// World Z of the bottom of cell layer zero.
+    /// The world Z of the bottom of cell layer zero.
     z_floor: i32,
     glow: bool,
     collision: brdb::Collision,
@@ -351,13 +361,14 @@ impl Layout {
     }
 }
 
-/// Emit a straight ramp (or a one-cell wedge) anchored at `cell`.
+/// Make a straight ramp at `cell`, or a wedge if the run is one cell.
 ///
-/// The anchor is the ramp's LOW end and the piece extends `run` cells along the
-/// rotation's forward axis, which for two of the four rotations runs toward
-/// NEGATIVE X or Y. The per-rotation offsets below place the brick's centre
-/// accordingly; they are the ported `create_ramp` offsets with `obj2brz`'s
-/// hard-coded stud (5 units half, 10 full) generalised to `Layout::half`.
+/// `cell` is the LOW end of the ramp. The brick continues for `run` cells
+/// along the forward axis of the rotation. For two of the four rotations that
+/// axis points at NEGATIVE X or NEGATIVE Y. The values below put the center of
+/// the brick at the correct position for each rotation. They come from
+/// `create_ramp`, but the fixed stud of `obj2brz` (5 units for a half, 10 for
+/// the full width) becomes `Layout::half`.
 fn ramp_brick(
     layout: &Layout,
     cell: Cell,
@@ -397,7 +408,8 @@ fn ramp_brick(
     }
     position.z += size.z as i32;
     layout.brick(
-        // A single-cell run has no ramp asset; the wedge is its one-cell form.
+        // There is no ramp asset for a run of one cell. The wedge is the ramp
+        // of one cell.
         if run < 2 {
             PB_DEFAULT_WEDGE
         } else {
@@ -410,7 +422,7 @@ fn ramp_brick(
     )
 }
 
-/// Emit a corner ramp anchored at its low outer corner.
+/// Make a corner ramp. Its position is its low outer corner.
 fn corner_brick(
     layout: &Layout,
     cell: Cell,
@@ -422,8 +434,8 @@ fn corner_brick(
     let forward_a = Cell::forward(rotation);
     let forward_b = Cell::forward(next_rotation(rotation));
     let far = cell + forward_a * (run_a - 1) + forward_b * (run_b - 1);
-    // Local X follows the first wall axis, so a quarter turn swaps which run
-    // spans world X.
+    // The local X axis follows the first wall axis. A quarter turn thus
+    // changes which run is along the world X axis.
     let (x_cells, y_cells) = if forward_a.0 != 0 {
         (run_a, run_b)
     } else {
@@ -453,8 +465,8 @@ fn corner_brick(
     )
 }
 
-/// Generate a rampified heightmap: full-size ramps, wedges and ramp corners
-/// fitted onto the column field's surface, with plain bricks under and beside
+/// Make a heightmap with ramps: usual ramps, wedges and corner ramps on the
+/// surface of the column field, with plain bricks below them and beside
 /// them.
 pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
     heightmap: &dyn Heightmap,
@@ -479,7 +491,8 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
         return Err("Heightmap is empty".to_string());
     }
 
-    // A ramp's rise is quantized to plates, so the vertical scale is too.
+    // The rise of a ramp is a whole number of plates, so the vertical scale
+    // must also be a whole number of plates.
     let plates_per_shade = ((options.scale as i32 + CELL_UNITS / 2) / CELL_UNITS).max(1);
     let effective = plates_per_shade * CELL_UNITS;
     if effective != options.scale as i32 {
@@ -508,8 +521,9 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
             field.cells[index] = if options.cull && (shade == 0 || color[3] == 0) {
                 0
             } else {
-                // `+ 1` so a black pixel is still one plate of ground rather
-                // than a hole, matching the minimum slab the blocky modes emit.
+                // The `+ 1` gives a black pixel one plate of ground and not a
+                // hole. This agrees with the smallest brick that the other
+                // modes make.
                 (shade.saturating_mul(plates_per_shade)).saturating_add(1)
             };
         }
@@ -520,18 +534,18 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
         half: options.size as i32,
         offset_x: -(width as i32 * options.size as i32),
         offset_y: -(height as i32 * options.size as i32),
-        // A one-plate column's TOP lands where the blocky modes put the top of
-        // a zero-height cell, so the two modes share a ground plane.
+        // The TOP of a column of one plate is where the other modes put the
+        // top of a cell of height zero. The modes thus share a ground level.
         z_floor: options.base_height() - 5 - CELL_UNITS,
         glow: options.glow,
         collision: options.collision(),
     };
 
-    // The full ascending-Z scan of the mesh rampifier, reduced to its only
-    // productive cells: `fit_ramp` and `fit_corner` both refuse a cell with
-    // anything above it, so on a height field the sole candidate per column is
-    // its top. Sorting by (height, y, x) visits them in exactly the order the
-    // z/y/x loop nest would have.
+    // The mesh rampifier scans up the Z axis. Only some cells can give a
+    // result: `fit_ramp` and `fit_corner` both refuse a cell that has material
+    // above it, so on a height field the only candidate in a column is its
+    // top. To sort by height and then by position visits the cells in the same
+    // sequence as the loops over z, y and x.
     let mut anchors: Vec<u32> = (0..count as u32)
         .filter(|i| field.cells[*i as usize] > 0)
         .collect();
@@ -544,8 +558,8 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
     let mut ramps = 0usize;
     let mut corners = 0usize;
 
-    // Corners run first: a straight ramp along either edge next to a convex
-    // corner would otherwise consume the corner's own footprint.
+    // The corners come first. If they did not, a straight ramp along an edge
+    // beside a convex corner would use the cells of the corner.
     info!("Fitting corner ramps");
     for (n, index) in anchors.iter().enumerate() {
         let index = *index as usize;
@@ -629,14 +643,14 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
     Ok(bricks)
 }
 
-/// Fill everything the slopes did not claim with plain bricks, merging equal
-/// spans across neighbouring columns.
+/// Fill each cell that the slopes did not use with plain bricks, and join
+/// equal Z ranges in adjacent columns.
 ///
-/// The mesh rampifier grows a box cell by cell because its colours vary in Z.
-/// A height field's colour is a property of the COLUMN, so what is left of a
-/// column after the slopes is a handful of Z spans, and two neighbouring
-/// columns merge exactly when a span and a colour both match. That turns the
-/// per-cell growth into one pass over spans.
+/// The mesh rampifier makes a box one cell at a time, because its colors
+/// change along Z. But in a height field the color belongs to the COLUMN. What
+/// stays after the slopes is thus a small number of Z ranges in each column,
+/// and two adjacent columns join if a range and a color both agree. One pass
+/// over the ranges then replaces the growth cell by cell.
 fn fill_gaps<F: Fn(f32) -> bool>(
     field: &Field,
     layout: &Layout,
@@ -654,9 +668,9 @@ fn fill_gaps<F: Fn(f32) -> bool>(
     let max_run = (MAX_HALF_EXTENT / layout.half).max(1);
     let mut emitted = 0usize;
 
-    // A neighbouring column joins this box only when it offers the SAME span,
-    // still unclaimed, under the same colour. Spans within one column are
-    // disjoint, so at most one can match.
+    // An adjacent column joins this box only if it has the SAME range, if no
+    // brick uses that range, and if the color agrees. The ranges in one column
+    // do not touch, so one range at most can agree.
     let matching =
         |index: usize, span: (i32, i32), color: [u8; 4], taken: &[Vec<bool>]| -> Option<usize> {
             if field.colors[index] != color {
@@ -699,8 +713,8 @@ fn fill_gaps<F: Fn(f32) -> bool>(
                             index + (run_y as usize * field.width as usize) + dx as usize;
                         match matching(neighbour, span, color, &taken) {
                             Some(j) => row.push((neighbour, j)),
-                            // A partial row is discarded whole: the box has to
-                            // stay rectangular.
+                            // The code rejects the full row, because the box
+                            // must stay rectangular.
                             None => break 'rows,
                         }
                     }
@@ -744,8 +758,9 @@ fn fill_gaps<F: Fn(f32) -> bool>(
     Ok(emitted)
 }
 
-/// One column's solid Z spans minus everything a slope claimed, split so no
-/// span exceeds the tallest brick the format can carry.
+/// The solid Z ranges of one column, less each range that a slope uses. The
+/// code divides a range that is higher than the largest brick that the format
+/// holds.
 fn unclaimed_spans(field: &Field, index: usize) -> Vec<(i32, i32)> {
     let top = field.cells[index];
     if top <= 0 {
@@ -788,8 +803,8 @@ fn unclaimed_spans(field: &Field, index: usize) -> Vec<(i32, i32)> {
 mod tests {
     use super::*;
 
-    /// A field built from a closure over `(x, y)` giving each column's plate
-    /// count, all one colour.
+    /// A field where a closure gives the number of plates in each column. Each
+    /// column has the same color.
     fn field(width: i32, height: i32, column: impl Fn(i32, i32) -> i32) -> Field {
         let count = (width * height) as usize;
         let mut cells = vec![0; count];
@@ -818,8 +833,7 @@ mod tests {
         }
     }
 
-    /// `brdb::Rotation` carries no `PartialEq`, so assertions compare quarter
-    /// turns instead.
+    /// `brdb::Rotation` has no `PartialEq`, so the tests compare quarter turns.
     fn turn(rotation: Option<Rotation>) -> Option<u8> {
         rotation.map(|r| match r {
             Rotation::Deg0 => 0,
@@ -833,42 +847,59 @@ mod tests {
         Cell(x, y, field.cells[(y * field.width + x) as usize] - 1)
     }
 
-    /// The rampifier's whole premise: a staircase becomes a slope. A ramp must
-    /// fit at the foot of a rising run, and it must climb toward the rise.
+    fn rotations() -> [Rotation; 4] {
+        [
+            Rotation::Deg0,
+            Rotation::Deg90,
+            Rotation::Deg180,
+            Rotation::Deg270,
+        ]
+    }
+
+    fn asset(brick: &Brick) -> &str {
+        let BrickType::Procedural { asset, .. } = &brick.asset else {
+            panic!("rampify makes procedural bricks only")
+        };
+        asset.as_ref()
+    }
+
+    /// The purpose of the rampifier: steps become a slope. A ramp must fit at
+    /// the bottom of a run that goes up, and it must go up at the high side.
     #[test]
     fn a_rising_staircase_fits_a_ramp_climbing_it() {
-        // Columns get taller with +X, so the uphill direction is +X: rotation
-        // 180, whose forward is (1, 0, 0).
+        // The columns get higher at +X, so the ramp goes up at +X. That is
+        // rotation 180, whose forward direction is (1, 0, 0).
         let field = field(8, 3, |x, _| 1 + x);
         let anchor = top(&field, 0, 1);
         assert_eq!(turn(field.best_rotation(anchor)), Some(2));
         let (run, rise) = field
             .fit_ramp(anchor, Rotation::Deg180)
-            .expect("a ramp fits at the foot of a staircase");
-        assert!(run >= 2 && rise >= 1, "got run {run}, rise {rise}");
+            .expect("a ramp fits at the bottom of the steps");
+        assert!(run >= 2 && rise >= 1, "the fit gave run {run} and rise {rise}");
     }
 
-    /// A cell with material above it can never anchor a slope. This is what
-    /// licenses visiting one anchor per column instead of scanning every Z.
+    /// A cell that has material above it can never hold a slope. This rule
+    /// permits one visit to each column in place of a scan of each Z value.
     #[test]
     fn only_the_top_cell_of_a_column_can_anchor_a_slope() {
         let field = field(8, 3, |x, _| 1 + x);
         let buried = Cell(3, 1, 0);
         assert!(
             field.exists(buried + Cell(0, 0, 1)),
-            "the test cell must be buried"
+            "the test cell must have material above it"
         );
         assert_eq!(turn(field.best_rotation(buried)), None);
         assert_eq!(field.fit_corner(buried, Rotation::Deg0, false), None);
         assert_eq!(field.fit_corner(buried, Rotation::Deg0, true), None);
     }
 
-    /// Inside a flat plain there is nothing to climb, so no cell may slope.
+    /// Inside a flat plain there is nothing to go up, so no cell can slope.
     ///
-    /// The RIM is deliberately excluded: a column at the map's edge has open
-    /// air behind it and material in front, which is a one-plate step, and the
-    /// rampifier bevels it exactly as the mesh version bevels the edge of a
-    /// slab. That is a property of the edge, not of the plain.
+    /// The edge of the map is not part of this test. A column at the edge has
+    /// air behind it and material in front of it, which is a step of one
+    /// plate. The rampifier cuts that edge, in the same way as the mesh
+    /// version cuts the edge of a slab. That is a property of the edge and not
+    /// of the plain, and the last line holds it.
     #[test]
     fn the_interior_of_a_flat_plain_fits_no_ramp_at_all() {
         let field = field(8, 8, |_, _| 3);
@@ -877,55 +908,41 @@ mod tests {
                 assert_eq!(
                     turn(field.best_rotation(top(&field, x, y))),
                     None,
-                    "({x}, {y}) is surrounded by its own height and must not slope"
+                    "the cell ({x}, {y}) has the same height as each adjacent cell"
                 );
             }
         }
-        // ...and the rim really does bevel, so the exclusion above is a
-        // statement about this renderer rather than a hole in the test.
         assert!(turn(field.best_rotation(top(&field, 0, 4))).is_some());
     }
 
-    /// A convex plateau turn is what the corner asset exists for; a straight
-    /// edge must never match one, or corners would eat the whole ridge.
+    /// A corner asset is for a convex turn. A straight edge must never fit
+    /// one, or the corners would use the full ridge.
     #[test]
     fn a_convex_plateau_turn_fits_a_corner_and_a_straight_edge_does_not() {
-        // A 12x12 plain with a raised quadrant, so the plateau's outer corner
-        // is a convex turn and its edges are straight. The anchor is the
-        // plateau's own corner cell -- a corner ramp BEVELS the turn it sits
-        // on, it does not sit on the ground beside it.
+        // A plain of 12x12 with one high quarter. The outer corner of the high
+        // part is a convex turn, and its edges are straight. The test starts
+        // at the corner cell of the high part, because a corner ramp cuts the
+        // turn that it is on. It does not sit on the ground beside it.
         let field = field(12, 12, |x, y| if x >= 6 && y >= 6 { 4 } else { 1 });
         let corner = top(&field, 6, 6);
-        let fits = [
-            Rotation::Deg0,
-            Rotation::Deg90,
-            Rotation::Deg180,
-            Rotation::Deg270,
-        ]
-        .into_iter()
-        .any(|r| field.fit_corner(corner, r, false).is_some());
         assert!(
-            fits,
-            "the convex plateau corner must fit an outer corner ramp"
+            rotations()
+                .into_iter()
+                .any(|r| field.fit_corner(corner, r, false).is_some()),
+            "the convex corner of the high part must fit an outer corner ramp"
         );
 
         let straight = top(&field, 6, 9);
-        let straight_fits = [
-            Rotation::Deg0,
-            Rotation::Deg90,
-            Rotation::Deg180,
-            Rotation::Deg270,
-        ]
-        .into_iter()
-        .any(|r| field.fit_corner(straight, r, false).is_some());
         assert!(
-            !straight_fits,
-            "a straight plateau edge must be a plain ramp, not a corner"
+            !rotations()
+                .into_iter()
+                .any(|r| field.fit_corner(straight, r, false).is_some()),
+            "a straight edge must be a usual ramp and not a corner"
         );
     }
 
-    /// Claiming a slope's cells must remove them from the fill pass, or every
-    /// ramp would be buried inside the blocks meant to sit under it.
+    /// A slope must remove its cells from the fill pass. If it did not, each
+    /// ramp would be inside the blocks that must go below it.
     #[test]
     fn claimed_cells_do_not_come_back_as_fill_blocks() {
         let mut field = field(8, 3, |x, _| 1 + x);
@@ -937,29 +954,29 @@ mod tests {
             rise,
         );
 
-        let index = (1 * field.width + anchor.0) as usize;
         assert!(field.is_ramp(anchor));
-        let spans = unclaimed_spans(&field, index);
+        let spans = unclaimed_spans(&field, (field.width + anchor.0) as usize);
         assert!(
             spans
                 .iter()
                 .all(|(low, high)| anchor.2 < *low || anchor.2 > *high),
-            "the anchor cell is still offered to the fill pass: {spans:?}"
+            "the fill pass can still use the cell of the ramp: {spans:?}"
         );
     }
 
+    /// A column that is higher than one brick must become more than one brick.
+    /// Those bricks must fill the column, with no gap and no overlap.
     #[test]
     fn a_tall_column_is_split_into_legal_bricks() {
         let field = field(1, 1, |_, _| 1000);
         let spans = unclaimed_spans(&field, 0);
-        assert!(spans.len() > 1, "a 1000-plate column must be split");
+        assert!(spans.len() > 1, "a column of 1000 plates must be divided");
         for (low, high) in &spans {
             assert!(
                 (high - low + 1) * 2 <= MAX_HALF_EXTENT,
-                "span {low}..={high} exceeds the largest legal brick"
+                "the range {low}..={high} is larger than the largest legal brick"
             );
         }
-        // No gaps and no overlap: the splits must still tile the column.
         assert_eq!(spans[0].0, 0);
         assert_eq!(spans.last().unwrap().1, 999);
         for pair in spans.windows(2) {
@@ -967,7 +984,8 @@ mod tests {
         }
     }
 
-    /// A flat plain must merge into a few big blocks rather than one per pixel.
+    /// A flat plain must become a small number of large blocks and not one
+    /// block for each pixel.
     #[test]
     fn the_fill_pass_merges_equal_columns_into_boxes() {
         let field = field(16, 16, |_, _| 2);
@@ -976,70 +994,47 @@ mod tests {
         assert_eq!(filled, bricks.len());
         assert!(
             bricks.len() < 32,
-            "256 identical columns collapsed to only {} brick(s)",
+            "256 equal columns gave {} brick(s)",
             bricks.len()
         );
     }
 
-    /// One-cell runs have no ramp asset; the wedge is the one-cell ramp.
+    /// The geometry of an emitted ramp: the correct asset for its length, and
+    /// a center over the cells that it covers.
+    ///
+    /// Two of the four rotations go at a NEGATIVE axis, which is where an
+    /// error in the center is easy to make.
     #[test]
-    fn a_single_cell_run_uses_the_wedge_asset() {
-        let wedge = ramp_brick(
-            &layout(),
-            Cell(0, 0, 0),
-            1,
-            2,
-            Rotation::Deg0,
-            Color::new(1, 2, 3),
-        );
-        let ramp = ramp_brick(
-            &layout(),
-            Cell(0, 0, 0),
-            3,
-            2,
-            Rotation::Deg0,
-            Color::new(1, 2, 3),
-        );
-        let BrickType::Procedural {
-            asset: wedge_asset, ..
-        } = &wedge.asset
-        else {
-            panic!("rampify emits procedural bricks");
-        };
-        let BrickType::Procedural {
-            asset: ramp_asset, ..
-        } = &ramp.asset
-        else {
-            panic!("rampify emits procedural bricks");
-        };
-        assert_eq!(wedge_asset.as_ref(), "PB_DefaultWedge");
-        assert_eq!(ramp_asset.as_ref(), "PB_DefaultRamp");
-    }
-
-    /// A ramp's footprint must land exactly on the cells it consumed, whichever
-    /// way it runs. Two of the four rotations run toward negative axes, which
-    /// is exactly where a centring mistake hides.
-    #[test]
-    fn a_ramp_is_centred_over_the_cells_it_covers() {
+    fn a_ramp_uses_the_right_asset_and_covers_its_own_cells() {
         let layout = layout();
         let full = layout.half * 2;
+        let color = Color::new(1, 2, 3);
+
+        assert_eq!(
+            asset(&ramp_brick(&layout, Cell(0, 0, 0), 1, 2, Rotation::Deg0, color)),
+            "PB_DefaultWedge"
+        );
+        assert_eq!(
+            asset(&ramp_brick(&layout, Cell(0, 0, 0), 3, 2, Rotation::Deg0, color)),
+            "PB_DefaultRamp"
+        );
+
         for (rotation, forward) in [
             (Rotation::Deg0, Cell(-1, 0, 0)),
             (Rotation::Deg90, Cell(0, -1, 0)),
             (Rotation::Deg180, Cell(1, 0, 0)),
             (Rotation::Deg270, Cell(0, 1, 0)),
         ] {
-            let anchor = Cell(4, 4, 0);
-            let run = 3;
-            let brick = ramp_brick(&layout, anchor, run, 2, rotation, Color::new(0, 0, 0));
+            let (anchor, run) = (Cell(4, 4, 0), 3);
+            let brick = ramp_brick(&layout, anchor, run, 2, rotation, color);
             let far = anchor + forward * (run - 1);
-            // Centre of the covered span, in units, cell centres included.
+            // The center of the cells that the ramp covers, in units.
             let expect_x = (anchor.0.min(far.0) * full + anchor.0.max(far.0) * full + full) / 2;
             let expect_y = (anchor.1.min(far.1) * full + anchor.1.max(far.1) * full + full) / 2;
             assert_eq!(
                 (brick.position.x, brick.position.y),
                 (expect_x, expect_y),
-                "{rotation:?} ramp is off its footprint"
+                "the ramp at {rotation:?} is not over its own cells"
             );
         }
     }

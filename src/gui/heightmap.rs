@@ -69,9 +69,10 @@ enum PickTarget {
     Colormap,
 }
 
-/// What the Brick Type row picks. The first five choose which asset the blocky
-/// renderer stacks; the last two replace the renderer, because a sloped surface
-/// is not built out of one repeated brick.
+/// What the Brick Type row selects. The first five values select the asset
+/// that the usual renderer puts above itself. The last two values replace the
+/// renderer, because one brick used again and again cannot make a sloped
+/// surface.
 #[derive(PartialEq, Clone)]
 enum BrickMode {
     Default,
@@ -79,9 +80,9 @@ enum BrickMode {
     SmoothTile,
     Stud,
     Micro,
-    /// Smooth micro-wedge terrain (`opt::terrain`).
+    /// Smooth micro wedge terrain (`opt::terrain`).
     Terrain,
-    /// Wrapperup's rampifier over the height columns (`opt::rampify`).
+    /// The Wrapperup rampifier over the height columns (`opt::rampify`).
     Rampify,
 }
 
@@ -185,17 +186,17 @@ impl HeightmapApp {
 
     fn options(&self, img_only: bool) -> GenOptions {
         let img = img_only || (self.heightmaps.is_empty() && self.colormap.is_some());
-        // The sloped renderers only exist for a heightmap; a flat image has no
-        // terrain to slope, so the Image2Brick pane falls back to blocks rather
-        // than paving an unchanging plane in wedges.
+        // The sloped renderers are for a heightmap only. A flat image has no
+        // ground to slope, so the Image2Brick page uses blocks. If it did not,
+        // it would fill a level plane with wedges.
         let surface = if img {
             SurfaceMode::Blocks
         } else {
             self.mode.surface()
         };
         GenOptions {
-            // `--size` counts STUDS everywhere except the blocky micro mode,
-            // which reinterprets it as micro units.
+            // `--size` counts STUDS in each mode, but the micro mode counts
+            // micro units.
             size: if self.mode == BrickMode::Micro {
                 self.horizontal_size
             } else {
@@ -209,8 +210,8 @@ impl HeightmapApp {
                 BrickMode::SmoothTile => PB_DEFAULT_SMOOTH_TILE,
                 BrickMode::Stud => PB_DEFAULT_STUDDED,
                 BrickMode::Micro => PB_DEFAULT_MICRO_BRICK,
-                // Both sloped renderers choose their own assets per cell and
-                // never read this one.
+                // The two sloped renderers select their own asset for each
+                // cell. They never read this value.
                 BrickMode::Terrain | BrickMode::Rampify => PB_DEFAULT_MICRO_BRICK,
             },
             micro: self.mode == BrickMode::Micro,
