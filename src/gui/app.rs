@@ -23,6 +23,9 @@ const CARD_ICON: f32 = 56.0;
 const PAGE_PAD: i8 = 12;
 
 pub struct BrzApp {
+    /// Native only: a browser tab has no window level, so this field (and the
+    /// toggle that drives it) is absent on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
     always_on_top: bool,
     /// The open tool, or `None` for the homepage grid.
     pane: Option<Menu>,
@@ -120,6 +123,7 @@ impl Default for BrzApp {
     fn default() -> Self {
         Self {
             pane: None,
+            #[cfg(not(target_arch = "wasm32"))]
             always_on_top: false,
             shared: SharedOptions::default(),
             heightmap: HeightmapApp::default(),
@@ -193,6 +197,9 @@ impl BrzApp {
         ui.horizontal(|ui| {
             ui.heading("brz tools");
             ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+            // Native only: a browser tab has no window level, so the toggle is
+            // hidden on wasm (and the field it drives does not exist there).
+            #[cfg(not(target_arch = "wasm32"))]
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::toggle(ui, &mut self.always_on_top, "Always on top").changed() {
                     ui.ctx()
