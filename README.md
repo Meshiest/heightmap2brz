@@ -74,6 +74,7 @@ Heightmap surface:
       --greedy                         greedy meshing
       --terrain                        smooth micro-wedge surface
       --rampify                        Wrapperup ramps over the columns
+      --wedge                          terraced wedge terrain (BRWorldSculptor style)
       --prefab                         write a prefab bundle, not a world
 
 Modes:
@@ -103,10 +104,11 @@ To make HD heightmaps for `--hdmap`, use
 ### Smooth surfaces
 
 By default every pixel becomes a flat-topped prism, so a slope renders as a
-staircase. Two flags replace that with a sloped surface. They are alternatives
-to each other and to `--tile`/`--smooth`/`--micro`/`--stud`, and they choose
-their own bricks per cell, so the optimizer flags (`--greedy`, `--snap`) do not
-apply to them.
+staircase. Three flags replace that surface. They are alternatives to each
+other and to `--tile`/`--smooth`/`--micro`/`--stud`, and they choose their own
+bricks per cell, so the optimizer flags (`--greedy`, `--snap`) do not apply to
+them. `--terrain` and `--rampify` approximate the slopes; `--wedge` instead
+embraces the terraces and shapes their outlines.
 
 `--terrain` builds the surface out of **micro wedges**. Heights are sampled on a
 shared `(w+1) x (h+1)` vertex grid - each vertex is the mean of the pixels
@@ -138,12 +140,33 @@ pieces, and flat ground merges into large blocks. Under `--rampify`,
 heightmap heightmap.png -c colormap.png --rampify -v 8 -o rampified.brz
 ```
 
-Add `--prefab` to either (or to any heightmap/`--img` render) to write a prefab
-bundle instead of a world, so the save can be dropped into Brickadia's `Prefabs`
-folder and spawned from the prefab browser.
+`--wedge` builds **terraced wedge terrain** in the style of the
+[BRWorldSculptor](https://github.com/f1shar/br-terrain-gen) sculpting tool,
+whose terrain rules it ports: tops stay flat everywhere, every height is a
+whole terrace step, and the *outlines* of the terraces are cut at 45° by
+vertical side wedges (`PB_DefaultSideWedge`). Convex plateau corners are
+chamfered, concave corners get a matching filler, collinear staircase steps
+merge into single large wedges, lone corners take seeded shallow stretched
+cuts so long walls don't repeat one stamp, and the flat tops greedy-merge
+into boxes whose bottoms follow the surface as a closed shell. Configurations
+that cannot be built cleanly with wedges (diagonal crossings, one-cell
+spikes) are eroded away first, exactly as the sculpt tool does. Merges never
+cross a colormap edge — a brick is one colour, so a piece that would span
+two colours falls through to a smaller piece instead. Under `--wedge`,
+`--vertical` is the height of one terrace step (one shade of grey) in units,
+rounded to a whole number of plates. Costs roughly 0.6 to 1.0 bricks per
+pixel on real maps.
 
-In the GUI both appear in the **Brick Type** row as *Smooth Terrain* and
-*Rampify*.
+```
+heightmap heightmap.png -c colormap.png --wedge -v 4 -o wedged.brz
+```
+
+Add `--prefab` to any of them (or to any heightmap/`--img` render) to write a
+prefab bundle instead of a world, so the save can be dropped into Brickadia's
+`Prefabs` folder and spawned from the prefab browser.
+
+In the GUI they appear in the **Brick Type** row as *Smooth Terrain*,
+*Rampify* and *Wedge Terrain*.
 
 ### Text rendering
 

@@ -1,5 +1,6 @@
 use super::{
-    BitMask, QuadTree, gen_rampify_heightmap, gen_terrain_heightmap, greedy_mesh_binary_plane,
+    BitMask, QuadTree, gen_rampify_heightmap, gen_terrain_heightmap, gen_wedge_heightmap,
+    greedy_mesh_binary_plane,
 };
 use crate::map::*;
 use crate::util::*;
@@ -47,6 +48,9 @@ pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
         }
         SurfaceMode::Rampify => {
             return gen_rampify_heightmap(heightmap, colormap, options, progress_f);
+        }
+        SurfaceMode::Wedge => {
+            return gen_wedge_heightmap(heightmap, colormap, options, progress_f);
         }
         SurfaceMode::Blocks => {}
     }
