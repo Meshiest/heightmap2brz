@@ -77,15 +77,17 @@ const MERGE_RUN: i32 = 64;
 const SKIRT: i32 = 1;
 
 /// The chance a lone corner takes a shallow stretched cut instead of a 1x1.
-/// The sculpt tool exposes this as a slider; its default is what ships here.
-/// Randomising WHICH corners stretch (seeded, per absolute cell, so the same
-/// map always builds the same) is what keeps long walls from looking punched
-/// out by one repeated stamp.
-const VARIETY: f32 = 0.5;
+/// The sculpt tool exposes this as a slider; maxed here, so every corner
+/// that CAN take a shallow cut does. Which wall a corner cuts into is still
+/// seeded per absolute cell, so long walls don't repeat one stamp and the
+/// same map always builds the same.
+const VARIETY: f32 = 1.0;
 /// How far outlines are smoothed, 0..=1. Raises the minimum staircase run a
 /// 45-degree face needs before it beats a shallow bevel, and lengthens the
-/// shallow stretches. The sculpt tool's default.
-const SMOOTHNESS: f32 = 0.3;
+/// shallow stretches. Maxed: a run must be five long before a straight 45
+/// degree chord wins, and corners sweep up to eight cells where the terrain
+/// holds -- the smoothest outlines the planner can produce.
+const SMOOTHNESS: f32 = 1.0;
 /// Seed for the variety hash. Fixed: the same input must give the same save.
 const SEED: u32 = 0;
 
