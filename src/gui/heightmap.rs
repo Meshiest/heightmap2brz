@@ -439,11 +439,11 @@ impl HeightmapApp {
                             );
                         widgets::radio(ui, &mut self.mode, BrickMode::Wedge, "Wedge Terrain")
                             .on_hover_text(
-                                "Build TERRACED terrain in the style of the BRWorldSculptor sculpting \n\
-                                 tool: tops stay flat, and terrace outlines are cut at 45 degrees by \n\
-                                 vertical side wedges -- corners chamfered, staircases merged into \n\
-                                 large wedges, flat tops merged into boxes. Slopes are not \n\
-                                 approximated; this is the look of hand-built brick terrain",
+                                "Build TERRACED terrain: tops stay flat, and terrace outlines are cut \n\
+                                 at 45 degrees by vertical side wedges -- corners chamfered, \n\
+                                 staircases merged into large wedges, flat tops merged into boxes. \n\
+                                 Slopes are not approximated; this is the look of hand-built brick \n\
+                                 terrain",
                             );
                     });
                     if self.mode.surface() != SurfaceMode::Blocks {

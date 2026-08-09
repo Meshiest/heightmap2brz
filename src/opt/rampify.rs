@@ -498,10 +498,13 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
     }
 
     // The rise of a ramp is a whole number of plates, so the vertical scale
-    // must also be a whole number of plates.
-    let plates_per_shade = ((options.scale as i32 + CELL_UNITS / 2) / CELL_UNITS).max(1);
-    let effective = plates_per_shade * CELL_UNITS;
-    if effective != options.scale as i32 {
+    // must also be a whole number of plates. Round in i64 so an absurdly large
+    // `--vertical` can't overflow i32; the result fits i32 (at most u32::MAX/4)
+    // and the per-shade height product below is a saturating_mul.
+    let plates_per_shade =
+        (((options.scale as i64) + (CELL_UNITS / 2) as i64) / CELL_UNITS as i64).max(1) as i32;
+    let effective = plates_per_shade as i64 * CELL_UNITS as i64;
+    if effective != options.scale as i64 {
         info!(
             "Rampified terrain rises {effective} unit(s) per shade (--vertical {}, rounded to \
              {plates_per_shade} plate(s): a ramp's rise is quantized to plates)",

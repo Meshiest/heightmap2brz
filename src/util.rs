@@ -26,7 +26,7 @@ pub enum SurfaceMode {
     Rampify,
     /// Terraced Brickadia wedge terrain: flat tops everywhere, with convex
     /// and concave outline corners cut at 45 degrees by vertical side
-    /// wedges. A port of the BRWorldSculptor rules. Refer to `opt::wedge`.
+    /// wedges. Refer to `opt::wedge`.
     Wedge,
 }
 

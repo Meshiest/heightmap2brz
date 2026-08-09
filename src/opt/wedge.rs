@@ -12,9 +12,7 @@
 //! result is the "brick terrain" look of hand-built Brickadia maps rather
 //! than a smooth surface.
 //!
-//! The rules are a port of the BRWorldSculptor sculpting tool
-//! (`f1shar/br-terrain-gen`), with the sculpting left behind and the
-//! heightmap pipeline kept. Stage for stage:
+//! The heightmap pipeline drives a set of terracing rules. Stage for stage:
 //!
 //! 1. **Bake** -- one shade of grey is one terrace step of `--vertical`
 //!    units, rounded to whole plates (a side wedge's height is in plates).
@@ -31,24 +29,22 @@
 //!    cells behind them into one NxN wedge; lone corners get a seeded chance
 //!    to stretch into a shallow 1xN wedge cutting into a wall; leftover 1x1
 //!    chamfers and fillers; then a greedy box merge over the flat tops.
-//!    (The sculpt tool has one more pass for maps whose minimum brick spans
-//!    several cells; here one pixel is one cell, so it has nothing to do.)
+//!    (One more pass would matter for maps whose minimum brick spans several
+//!    cells; here one pixel is one cell, so it has nothing to do.)
 //! 5. **Output** -- boxes become `PB_DefaultBrick`, cuts and fillers become
 //!    `PB_DefaultSideWedge`. Box bottoms follow the surface as a shell one
 //!    plate past the lowest ground they abut, except at the map border and
 //!    against culled cells, where they drop to the floor so the outside of
 //!    the build stays closed.
 //!
-//! Where the sculpt tool gates every merge on its rock/dirt material, this
-//! port gates on the COLORMAP: a brick is one colour, so a piece that would
-//! span two colours is declined, not recoloured, and falls through to a
-//! finer pass. That is the same rule the flat-top optimizers already follow.
+//! Every merge is gated on the COLORMAP: a brick is one colour, so a piece
+//! that would span two colours is declined, not recoloured, and falls through
+//! to a finer pass. That is the same rule the flat-top optimizers already
+//! follow.
 //!
 //! The wedge rotation convention (`ROT_HYP`: rotation `r` points the
 //! vertical hypotenuse at diagonal corner `r`, counterclockwise from +X/+Y)
-//! was calibrated in-game by the sculpt tool over several rounds of feedback.
-//! Grid axes and world axes map here exactly as they do there, so the
-//! numbers carry over unchanged.
+//! was calibrated in-game over several rounds of feedback.
 
 use crate::map::*;
 use crate::util::*;
@@ -77,8 +73,8 @@ const MERGE_RUN: i32 = 64;
 const SKIRT: i32 = 1;
 
 /// The chance a lone corner takes a shallow stretched cut instead of a 1x1.
-/// The sculpt tool exposes this as a slider; maxed here, so every corner
-/// that CAN take a shallow cut does. Which wall a corner cuts into is still
+/// A variety slider; maxed here, so every corner that CAN take a shallow cut
+/// does. Which wall a corner cuts into is still
 /// seeded per absolute cell, so long walls don't repeat one stamp and the
 /// same map always builds the same.
 const VARIETY: f32 = 1.0;
@@ -101,8 +97,8 @@ const CHAMFER: u8 = 1;
 const FILLER: u8 = 2;
 
 /// Deterministic per-cell hash in `[0, 1)`, keyed on absolute cell
-/// coordinates. The same xxHash-style mix the sculpt tool uses, so a given
-/// seed picks the same corners there and here.
+/// coordinates, an xxHash-style mix: a given seed always picks the same
+/// corners, so the same map always builds the same.
 fn cell_hash(seed: u32, x: i32, y: i32) -> f32 {
     let mut h = seed ^ (x as u32).wrapping_mul(374761393) ^ (y as u32).wrapping_mul(668265263);
     h = (h ^ (h >> 13)).wrapping_mul(1274126177);
@@ -134,7 +130,7 @@ fn cliff_for_wall(d: usize, w: usize) -> usize {
 
 /// The height field, in plates. Reads off the edge clamp per axis, so the
 /// map behaves as if its border row continued outward forever -- the same
-/// convention every stage of the sculpt tool uses.
+/// convention every stage here uses.
 struct Field {
     cols: i32,
     rows: i32,
@@ -341,8 +337,8 @@ fn classify(f: &Field) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<i32>) {
     (kind, diag, rot, val)
 }
 
-/// One planned piece, in cells and plates. This is the sculpt tool's piece
-/// contract with its writer, minus the sculpt-only fields.
+/// One planned piece, in cells and plates: the contract between the planning
+/// passes and the brick writer.
 #[derive(Clone, Debug)]
 struct Piece {
     wedge: bool,
@@ -524,8 +520,14 @@ impl Plan<'_> {
     /// Stretch lone corners into shallow 1xN wedges cutting into a wall, as
     /// far as the terrain stays flat and the cliff holds below. Seeded per
     /// absolute cell, so the same map always stretches the same corners.
-    fn stretch_corners(&mut self) {
-        let lengths = stretch_lengths(SMOOTHNESS);
+    fn stretch_corners(&mut self, max_span: i32) {
+        // Cap the sweep to the brick-size limit, exactly as the merge passes do:
+        // the emitted wedge's half extent is `length * half`, and nothing splits
+        // an over-wide footprint afterwards.
+        let lengths: Vec<i32> = stretch_lengths(SMOOTHNESS)
+            .into_iter()
+            .filter(|&l| l <= max_span)
+            .collect();
         for y in 0..self.f.rows {
             for x in 0..self.f.cols {
                 let i = self.idx(x, y);
@@ -696,8 +698,8 @@ impl Plan<'_> {
     }
 
     /// Greedy-merge the flat boxes into big rectangles. Deliberately the
-    /// simple greedy: the sculpt tool measured row-run stacking at 1-3%
-    /// WORSE at every span tried; the span is the lever, not the algorithm.
+    /// simple greedy: row-run stacking measured 1-3% WORSE at every span
+    /// tried; the span is the lever, not the algorithm.
     fn merge_boxes(&mut self, max_span: i32, floor: i32) {
         let mut used = self.culled.to_vec();
         for y in 0..self.f.rows {
@@ -814,12 +816,16 @@ pub fn gen_wedge_heightmap<F: Fn(f32) -> bool>(
         return Err("Brick size must be at least 1".to_string());
     }
 
-    let terrace = ((options.scale as i32 + CELL_UNITS / 2) / CELL_UNITS).max(1);
-    if terrace * CELL_UNITS != options.scale as i32 {
+    // `--vertical` is a u32; round it to whole plates in i64 so an absurdly
+    // large value can't overflow i32 here. The result fits i32 (at most
+    // u32::MAX/4), and the per-cell height product is separately capped by the
+    // saturating_mul below.
+    let terrace = (((options.scale as i64) + (CELL_UNITS / 2) as i64) / CELL_UNITS as i64).max(1) as i32;
+    if terrace as i64 * CELL_UNITS as i64 != options.scale as i64 {
         info!(
             "Wedge terraces rise {} unit(s) per shade (--vertical {}, rounded to {terrace} \
              plate(s): a side wedge spans whole plates)",
-            terrace * CELL_UNITS,
+            terrace as i64 * CELL_UNITS as i64,
             options.scale
         );
     }
@@ -827,7 +833,9 @@ pub fn gen_wedge_heightmap<F: Fn(f32) -> bool>(
     info!("Baking terraces");
     let cols = width as i32;
     let rows = height as i32;
-    let count = (cols * rows) as usize;
+    // Cast before multiplying: an i32 product would overflow on a map wider
+    // than ~46k px per side, the way terrain.rs already guards this.
+    let count = width as usize * height as usize;
     let mut field = Field {
         cols,
         rows,
@@ -889,7 +897,7 @@ pub fn gen_wedge_heightmap<F: Fn(f32) -> bool>(
     };
     plan.merge_staircases(max_run);
     progress!(0.5);
-    plan.stretch_corners();
+    plan.stretch_corners(max_span);
     progress!(0.6);
     plan.leftovers_and_fillers();
     progress!(0.7);
@@ -1154,6 +1162,35 @@ mod tests {
             side_wedges(&bricks).all(|(_, s)| s.z == 4),
             "a cut must span the whole two-plate terrace step"
         );
+    }
+
+    /// A long uniform wall at a large `--size` must not emit a side wedge wider
+    /// than the brick limit. `stretch_corners` caps its sweep to `max_span` the
+    /// way the merge passes do; without it a length-8 stretch at size 40 is a
+    /// 320-unit half extent, an illegal brick the game drops or renders
+    /// overlapping -- the "wedges not placing / overlapping" report at high
+    /// `--size`.
+    #[test]
+    fn stretched_cuts_stay_within_the_brick_size_limit() {
+        // size 40 (8 studs): max_span = 250/40 = 6, but stretch_lengths offers
+        // up to 8. A 20x20 plateau's long uniform edges force the long sweep.
+        let hm = Fn2D(24, 24, |x, y| ((2..22).contains(&x) && (2..22).contains(&y)) as u32);
+        let mut opts = options(4);
+        opts.size = 40;
+        let bricks = build(&hm, &Grey(24, 24), opts);
+        let wedges = side_wedges(&bricks).count();
+        assert!(wedges > 0, "the plateau corners must still be cut");
+        for b in &bricks {
+            let BrickType::Procedural { size, .. } = &b.asset else {
+                unreachable!()
+            };
+            assert!(
+                size.x <= MAX_HALF_EXTENT as u16
+                    && size.y <= MAX_HALF_EXTENT as u16
+                    && size.z <= MAX_HALF_EXTENT as u16,
+                "brick half extent {size:?} exceeds the {MAX_HALF_EXTENT} limit"
+            );
+        }
     }
 
     /// With --cull, transparent cells are holes: nothing may be built over
