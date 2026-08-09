@@ -84,6 +84,9 @@ enum BrickMode {
     Terrain,
     /// The Wrapperup rampifier over the height columns (`opt::rampify`).
     Rampify,
+    /// Terraced wedge terrain with 45-degree chamfered outlines
+    /// (`opt::wedge`).
+    Wedge,
 }
 
 impl BrickMode {
@@ -91,6 +94,7 @@ impl BrickMode {
         match self {
             BrickMode::Terrain => SurfaceMode::Terrain,
             BrickMode::Rampify => SurfaceMode::Rampify,
+            BrickMode::Wedge => SurfaceMode::Wedge,
             _ => SurfaceMode::Blocks,
         }
     }
@@ -210,9 +214,11 @@ impl HeightmapApp {
                 BrickMode::SmoothTile => PB_DEFAULT_SMOOTH_TILE,
                 BrickMode::Stud => PB_DEFAULT_STUDDED,
                 BrickMode::Micro => PB_DEFAULT_MICRO_BRICK,
-                // The two sloped renderers select their own asset for each
-                // cell. They never read this value.
-                BrickMode::Terrain | BrickMode::Rampify => PB_DEFAULT_MICRO_BRICK,
+                // The sloped and terraced renderers select their own asset
+                // for each cell. They never read this value.
+                BrickMode::Terrain | BrickMode::Rampify | BrickMode::Wedge => {
+                    PB_DEFAULT_MICRO_BRICK
+                }
             },
             micro: self.mode == BrickMode::Micro,
             stud: self.mode == BrickMode::Stud,
@@ -430,6 +436,14 @@ impl HeightmapApp {
                                  wedges and ramp corners onto the height columns and fill the rest with \n\
                                  plain bricks. Coarser than Smooth Terrain (one plate of vertical \n\
                                  resolution) but builds from ordinary bricks",
+                            );
+                        widgets::radio(ui, &mut self.mode, BrickMode::Wedge, "Wedge Terrain")
+                            .on_hover_text(
+                                "Build TERRACED terrain: tops stay flat, and terrace outlines are cut \n\
+                                 at 45 degrees by vertical side wedges -- corners chamfered, \n\
+                                 staircases merged into large wedges, flat tops merged into boxes. \n\
+                                 Slopes are not approximated; this is the look of hand-built brick \n\
+                                 terrain",
                             );
                     });
                     if self.mode.surface() != SurfaceMode::Blocks {
@@ -751,7 +765,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("the pane painted no text {want:?}"))
         };
         let note = rect(NOTE);
-        let rampify = rect("Rampify");
+        // The LAST button on the row, so the note must paint below it.
+        let rampify = rect("Wedge Terrain");
 
         assert!(
             note.top() >= rampify.bottom(),

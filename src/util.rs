@@ -24,6 +24,10 @@ pub enum SurfaceMode {
     /// The Wrapperup rampifier over the height columns: usual ramps, wedges
     /// and corner ramps on the surface. Refer to `opt::rampify`.
     Rampify,
+    /// Terraced Brickadia wedge terrain: flat tops everywhere, with convex
+    /// and concave outline corners cut at 45 degrees by vertical side
+    /// wedges. Refer to `opt::wedge`.
+    Wedge,
 }
 
 pub struct GenOptions {

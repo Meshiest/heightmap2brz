@@ -94,6 +94,7 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg stud: --stud "Render bricks as stud cubes")
         (@arg terrain: --terrain "Render the terrain as SMOOTH micro bricks instead of flat-topped tiles: every pixel gets a sloped top chosen from Brickadia's micro wedge family (ramp, wedge corner, inner corner, and the stacked diagonal corner+triangle), fitted to the four shared vertex heights around it. Heights are sampled on a shared (w+1)x(h+1) vertex grid so neighbouring cells MEET rather than step. Replaces --tile/--smooth/--micro/--stud and the optimizers, which have no meaning once the top face is not flat")
         (@arg rampify: --rampify "Rampify the terrain with Wrapperup's rampifier: fit full-size ramps, wedges and ramp corners onto the height column surface and fill the rest with plain bricks. Coarser than --terrain (one plate of vertical resolution, runs of at most 4 studs) but uses ordinary bricks rather than micro pieces. Replaces --tile/--smooth/--micro/--stud and the optimizers")
+        (@arg wedge: --wedge "Build TERRACED wedge terrain: tops stay flat, every height is a whole terrace step, and the outlines of the terraces are cut at 45 degrees by vertical side wedges (PB_DefaultSideWedge) -- convex corners chamfered, concave corners filled, collinear staircases merged into single large wedges, flat tops greedy-merged into boxes. Unbuildable configurations (diagonal crossings, spikes) are eroded first. Unlike --terrain and --rampify, slopes are not approximated: this is the terraced 'brick terrain' look of hand-built Brickadia maps. Replaces --tile/--smooth/--micro/--stud and the optimizers")
         (@arg prefab: --prefab "Heightmap/image renders: write a PREFAB bundle instead of a world, so the save can be dropped in Brickadia's Prefabs folder and spawned from the prefab browser rather than loaded as a level")
         (@arg snap: --snap "Snap bricks to the brick grid")
         (@arg lrgb: --lrgb "Use linear rgb input color instead of sRGB")
@@ -324,7 +325,7 @@ fn main() {
         .iter()
         .any(|m| matches.is_present(m))
     {
-        for flag in ["terrain", "rampify", "prefab"] {
+        for flag in ["terrain", "rampify", "wedge", "prefab"] {
             if matches.is_present(flag) {
                 warn!(
                     "--{flag} applies to heightmap and --img renders only; this render is \
@@ -1433,18 +1434,24 @@ fn run_heightmap(
         Err(e) => fail(e),
     };
 
-    // The two sloped renderers. The code refuses both together and does not
-    // select one of them. They are different methods with different bricks.
-    // A user who gives both must select one of them.
-    let surface = match (matches.is_present("terrain"), matches.is_present("rampify")) {
-        (true, true) => fail!(
-            "--terrain and --rampify are two different smoothing techniques and cannot be \
-             combined: --terrain fits micro wedges to a shared vertex grid, --rampify fits \
-             full-size ramps to the height columns. Pass exactly one"
+    // The three surface renderers. The code refuses a combination and does
+    // not select one of them. They are different methods with different
+    // bricks. A user who gives several must select one of them.
+    let surface = match (
+        matches.is_present("terrain"),
+        matches.is_present("rampify"),
+        matches.is_present("wedge"),
+    ) {
+        (true, false, false) => SurfaceMode::Terrain,
+        (false, true, false) => SurfaceMode::Rampify,
+        (false, false, true) => SurfaceMode::Wedge,
+        (false, false, false) => SurfaceMode::Blocks,
+        _ => fail!(
+            "--terrain, --rampify and --wedge are three different surface techniques and \
+             cannot be combined: --terrain fits micro wedges to a shared vertex grid, \
+             --rampify fits full-size ramps to the height columns, --wedge builds terraces \
+             with 45-degree chamfered outlines. Pass exactly one"
         ),
-        (true, false) => SurfaceMode::Terrain,
-        (false, true) => SurfaceMode::Rampify,
-        (false, false) => SurfaceMode::Blocks,
     };
     // Each option below controls a box with a FLAT TOP, which is the one
     // thing that a sloped renderer does not make. The code names each option,
@@ -1452,7 +1459,11 @@ fn run_heightmap(
     // A render that ignored `--greedy` without a message would appear
     // correct.
     if surface != SurfaceMode::Blocks {
-        let mode = if surface == SurfaceMode::Terrain { "--terrain" } else { "--rampify" };
+        let mode = match surface {
+            SurfaceMode::Terrain => "--terrain",
+            SurfaceMode::Rampify => "--rampify",
+            _ => "--wedge",
+        };
         for (flag, name) in [
             ("--tile", "tile"),
             ("--smooth", "smooth"),
@@ -1472,7 +1483,8 @@ fn run_heightmap(
         if matches.is_present("micro") {
             warn!(
                 "{mode} ignores --micro; --size stays a count of STUDS per pixel. --terrain \
-                 already builds from micro bricks, and --rampify needs full-size ramp assets"
+                 already builds from micro bricks, and --rampify and --wedge need full-size \
+                 assets"
             );
         }
         if matches.is_present("img") {
