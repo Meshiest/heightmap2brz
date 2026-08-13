@@ -1,4 +1,5 @@
-use brdb::{BString, Brick, Collision, World};
+use brdb::{BString, Brick, CHUNK_SIZE, ChunkIndex, Collision, World};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
@@ -41,7 +42,6 @@ pub struct GenOptions {
     pub img: bool,
     pub glow: bool,
     pub hdmap: bool,
-    pub lrgb: bool,
     pub nocollide: bool,
     pub quadtree: bool,
     pub greedy: bool,
@@ -76,6 +76,246 @@ impl GenOptions {
     }
 }
 
+/// The units per stud on the brick grid. A 1x1 brick is 10 units on a side.
+pub const UNITS_PER_STUD: f64 = 10.0;
+
+/// The real-world inches per brick unit. One unit is one inch, thus one stud
+/// is ten inches. The area readout uses this rule.
+pub const INCHES_PER_UNIT: f64 = 1.0;
+
+const INCHES_PER_MILE: f64 = 63360.0;
+const INCHES_PER_FOOT: f64 = 12.0;
+
+/// The largest half extent of a procedural brick, in units.
+///
+/// One pixel becomes one brick or more, and [`GenOptions::size`] is the half
+/// extent of that brick. This value thus bounds the horizontal scale. The
+/// quadtree optimizer stops merging at the same value.
+pub const MAX_BRICK_HALF_EXTENT: u16 = 500;
+
+/// The number of chunks the game loads from one save.
+///
+/// A chunk is a cube of [`CHUNK_SIZE`] units. A save with more chunks than
+/// this does not complete its load. [`check_chunk_limit`] refuses to write
+/// such a save.
+pub const MAX_SAVE_CHUNKS: usize = 100_000;
+
+/// The size of a render, in bricks and in real-world units.
+///
+/// All values come from the pixel count of the image and from
+/// [`GenOptions::size`]. Thus the code can show the size before the render.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Footprint {
+    /// The size of the source image, in pixels.
+    pub pixels: (u32, u32),
+    /// The half extent of one pixel's brick, in units ([`GenOptions::size`]).
+    pub half_extent: u16,
+    /// The horizontal size of the build, in units.
+    pub units: (u64, u64),
+    /// The same size in studs. The value is fractional in micro mode, where
+    /// one pixel can be one fifth of a stud.
+    pub studs: (f64, f64),
+    /// The real-world area, at one inch per unit.
+    pub sq_miles: f64,
+    /// The height of the build at the brightest shade of the heightmap.
+    pub max_height_units: u64,
+}
+
+const SQ_FEET_PER_SQ_MILE: f64 = 27_878_400.0;
+
+/// Write `n` with a comma between each group of three digits.
+///
+/// The size readout shows values of six digits or more. Grouped digits are
+/// easier to read.
+pub fn commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.char_indices() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Write a stud count. Show one decimal only below 10 studs.
+///
+/// Micro mode can put one fifth of a stud in a pixel. Larger counts do not
+/// need tenths.
+fn studs_text(v: f64) -> String {
+    if v >= 10.0 {
+        commas(v.round() as u64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+/// Write a real-world length. Use miles, or feet below one tenth of a mile.
+fn length_text(units: u64) -> String {
+    let inches = units as f64 * INCHES_PER_UNIT;
+    let miles = inches / INCHES_PER_MILE;
+    if miles >= 0.1 {
+        format!("{miles:.2} mi")
+    } else {
+        format!("{} ft", commas((inches / INCHES_PER_FOOT).round() as u64))
+    }
+}
+
+impl Footprint {
+    /// `1,024 x 1,024 px -> 5,120 x 5,120 studs`
+    ///
+    /// The line shows studs only. The unit count is ten times the stud count.
+    /// The log shows it instead.
+    pub fn size_text(&self) -> String {
+        format!(
+            "{} x {} px  ->  {} x {} studs",
+            commas(self.pixels.0 as u64),
+            commas(self.pixels.1 as u64),
+            studs_text(self.studs.0),
+            studs_text(self.studs.1),
+        )
+    }
+
+    /// `0.81 mi x 0.81 mi, 0.66 sq mi`
+    ///
+    /// The values use one inch per unit. The row tooltip gives that rule. The
+    /// line does not repeat it.
+    pub fn real_text(&self) -> String {
+        format!(
+            "{} x {}, {}",
+            length_text(self.units.0),
+            length_text(self.units.1),
+            self.area_text(),
+        )
+    }
+
+    /// Write the real-world area. Use square miles, or square feet below one
+    /// tenth of a square mile.
+    ///
+    /// Most heightmaps cover less than one mile. "0.03 sq mi" gives less
+    /// information than the equivalent 728,000 sq ft.
+    pub fn area_text(&self) -> String {
+        if self.sq_miles >= 0.1 {
+            format!("{:.2} sq mi", self.sq_miles)
+        } else {
+            format!(
+                "{} sq ft",
+                commas((self.sq_miles * SQ_FEET_PER_SQ_MILE).round() as u64)
+            )
+        }
+    }
+
+    /// `up to 2,550 studs tall (2,125 ft)`
+    ///
+    /// The line uses the same two units as the horizontal lines.
+    pub fn height_text(&self) -> String {
+        format!(
+            "up to {} studs tall ({})",
+            studs_text(self.max_height_units as f64 / UNITS_PER_STUD),
+            length_text(self.max_height_units),
+        )
+    }
+
+    /// The real-world width and length in miles, at one inch per unit.
+    pub fn miles(&self) -> (f64, f64) {
+        (
+            self.units.0 as f64 * INCHES_PER_UNIT / INCHES_PER_MILE,
+            self.units.1 as f64 * INCHES_PER_UNIT / INCHES_PER_MILE,
+        )
+    }
+
+    /// The height of the highest point in feet, at one inch per unit.
+    pub fn max_height_feet(&self) -> f64 {
+        self.max_height_units as f64 * INCHES_PER_UNIT / INCHES_PER_FOOT
+    }
+
+    /// Show if one pixel is larger than one brick can be.
+    ///
+    /// The CLI and the GUI do not clamp the horizontal scale to the limit.
+    /// Both report this condition instead.
+    pub fn over_brick_limit(&self) -> bool {
+        self.half_extent > MAX_BRICK_HALF_EXTENT
+    }
+
+    /// `each pixel is 1,200 units across, more than the 1,000 ...`
+    pub fn brick_limit_text(&self) -> String {
+        format!(
+            "each pixel is {} units across, more than the {} of one brick. The game can \
+             refuse bricks of this size",
+            commas(self.half_extent as u64 * 2),
+            commas(MAX_BRICK_HALF_EXTENT as u64 * 2),
+        )
+    }
+}
+
+/// Calculate the size that an image of `pixels` builds at this scale.
+///
+/// `size` is [`GenOptions::size`], the half extent of one pixel in units. One
+/// pixel thus covers `2 * size` units in each brick mode. `scale` is
+/// [`GenOptions::scale`], the height in units of one shade of grey.
+/// `max_level` is the brightest shade of the heightmap, 255 for an 8-bit map.
+pub fn footprint(pixels: (u32, u32), size: u16, scale: u32, max_level: u32) -> Footprint {
+    let units = (
+        pixels.0 as u64 * 2 * size as u64,
+        pixels.1 as u64 * 2 * size as u64,
+    );
+    let max_height_units = scale as u64 * max_level as u64;
+
+    Footprint {
+        pixels,
+        half_extent: size,
+        units,
+        studs: (
+            units.0 as f64 / UNITS_PER_STUD,
+            units.1 as f64 / UNITS_PER_STUD,
+        ),
+        sq_miles: (units.0 as f64 * INCHES_PER_UNIT / INCHES_PER_MILE)
+            * (units.1 as f64 * INCHES_PER_UNIT / INCHES_PER_MILE),
+        max_height_units,
+    }
+}
+
+/// Count the save chunks that a set of bricks occupies.
+///
+/// The count uses `Position::to_relative`, the same function that `brdb` uses
+/// to put a brick into a chunk. The two counts thus agree.
+pub fn count_chunks(bricks: &[Brick]) -> usize {
+    bricks
+        .iter()
+        .map(|b| b.position.to_relative().0)
+        .collect::<HashSet<ChunkIndex>>()
+        .len()
+}
+
+/// Refuse a save that the game cannot load. Return the chunk count.
+///
+/// The function returns the count because the caller must not read all the
+/// bricks a second time.
+///
+/// **Only the completed bricks give this count.** The optimizer decides how
+/// many bricks a render makes and where their centers are. A map can cover
+/// 100 chunks with 12 merged bricks. Thus the code does not estimate the
+/// count before the render. It does the check at save time.
+///
+/// The count increases with the AREA of the build, not with its detail. Thus
+/// the message tells the user to decrease the horizontal scale or to use a
+/// smaller image.
+pub fn check_chunk_limit(bricks: &[Brick]) -> Result<usize, String> {
+    let chunks = count_chunks(bricks);
+    if chunks > MAX_SAVE_CHUNKS {
+        return Err(format!(
+            "this save has {} chunks, more than the {} that the game loads from one save. It \
+             would not complete its load. Each chunk is a cube of {CHUNK_SIZE} units. Decrease \
+             the horizontal scale (--size / Horizontal Scale) or the vertical scale \
+             (--vertical / Vertical Size), or use a smaller heightmap",
+            commas(chunks as u64),
+            commas(MAX_SAVE_CHUNKS as u64),
+        ));
+    }
+    Ok(chunks)
+}
+
 // convert gamma to linear gamma
 pub fn to_linear_gamma(c: u8) -> u8 {
     let cf = (c as f64) / 255.0;
@@ -86,7 +326,13 @@ pub fn to_linear_gamma(c: u8) -> u8 {
     }) as u8
 }
 
-// convert sRGB to linear rgb
+/// [`to_linear_gamma`] over an RGBA pixel, alpha untouched.
+///
+/// The colormap path does NOT use this: brick colours in a save file are
+/// stored in the same encoding an image is, so converting only darkened every
+/// render away from the colormap it was given. It stays for the animation
+/// encoders' `--srgb-to-linear`, which converts frame pixels for a different
+/// reason (a hex-encoded gate reads its colour as linear).
 pub fn to_linear_rgb(rgb: [u8; 4]) -> [u8; 4] {
     [
         to_linear_gamma(rgb[0]),
@@ -207,11 +453,74 @@ pub fn to_linear_rgb_f32(rgba: [u8; 4]) -> [f32; 4] {
     ]
 }
 
-// given an array of bricks, create a save
+/// The longest edge of the `Meta/Screenshot.jpg` of a save.
+///
+/// The game writes screenshots of 1280x720 pixels. That size is its render
+/// resolution, not a limit. This constant bounds the long edge only and keeps
+/// the shape of the map.
+const SCREENSHOT_EDGE: u32 = 1280;
+
+/// The JPEG quality of the preview. The game shows the preview at a few
+/// hundred pixels. A higher quality gives no visible improvement.
+const SCREENSHOT_QUALITY: u8 = 85;
+
+/// Encode the `Meta/Screenshot.jpg` of a generated save.
+///
+/// The game shows a grid of previews. A generated save has no render of
+/// itself, but the source map is a view of the build from above. Use the
+/// colormap, because it shows the colors of the build. Use the heightmap when
+/// there is no colormap. The render makes the same selection.
+///
+/// The caller writes this preview for each heightmap save, world or prefab.
+/// The preview was applied only with `--prefab` before. Thus a GUI save, which
+/// is always a world bundle, had no preview.
+///
+/// The function keeps the shape of the map. It does not pad the map into the
+/// 16:9 shape of a game screenshot, because a heightmap is usually square.
+pub fn save_screenshot(source: &image::RgbaImage) -> Result<Vec<u8>, String> {
+    use image::{DynamicImage, codecs::jpeg::JpegEncoder, imageops};
+
+    let (w, h) = (source.width().max(1), source.height().max(1));
+    let scale = (SCREENSHOT_EDGE as f32 / w as f32).min(SCREENSHOT_EDGE as f32 / h as f32);
+    let fitted = if scale >= 1.0 {
+        // Use Nearest to enlarge. A heightmap is pixel art, and a smooth
+        // filter removes the pixel grid.
+        DynamicImage::ImageRgba8(source.clone()).resize_exact(
+            (w as f32 * scale).round().max(1.0) as u32,
+            (h as f32 * scale).round().max(1.0) as u32,
+            imageops::FilterType::Nearest,
+        )
+    } else {
+        DynamicImage::ImageRgba8(source.clone()).resize(
+            SCREENSHOT_EDGE,
+            SCREENSHOT_EDGE,
+            imageops::FilterType::Lanczos3,
+        )
+    };
+
+    // JPEG has no alpha channel. An RGBA image causes an encode error, thus
+    // remove the alpha channel here.
+    let rgb = fitted.to_rgb8();
+    let mut out = std::io::Cursor::new(Vec::new());
+    JpegEncoder::new_with_quality(&mut out, SCREENSHOT_QUALITY)
+        .encode_image(&rgb)
+        .map_err(|e| format!("failed to encode the save preview: {e}"))?;
+    Ok(out.into_inner())
+}
+
+/// Create a save from an array of bricks.
+///
+/// The description holds the brick count. The game shows the description next
+/// to the preview. The count tells the user if the build is loadable, and only
+/// the render knows it.
 pub fn bricks_to_save(bricks: Vec<Brick>) -> World {
     let mut world = World::new();
+    let count = bricks.len();
     world.add_bricks(bricks);
-    world.meta.bundle.description = "Save generated from heightmap file".to_string();
+    world.meta.bundle.description = format!(
+        "Save generated from heightmap file\n{} bricks",
+        commas(count as u64)
+    );
     world
 }
 
@@ -241,6 +550,208 @@ pub fn write_world(world: &World, out_file: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brdb::{BrickSize, BrickType, Position, assets::bricks::PB_DEFAULT_BRICK};
+
+    /// A 1024x1024 map at the default scale, in each unit of the readout.
+    ///
+    /// One pixel is `2 * size` units wide, because `size` is a HALF extent.
+    /// The full readout depends on this rule. At `--size 1`, one stud,
+    /// `GenOptions::size` is 5. One pixel is thus 10 units, or one stud.
+    #[test]
+    fn a_stud_per_pixel_builds_one_stud_per_pixel() {
+        let plan = footprint((1024, 1024), 5, 1, 255);
+        assert_eq!(plan.units, (10_240, 10_240));
+        assert_eq!(plan.studs, (1024.0, 1024.0));
+        // 10,240 inches is 853.3 ft. The area is that value squared.
+        let (mi_x, _) = plan.miles();
+        assert!((mi_x - 0.16162).abs() < 1e-4, "{mi_x} miles across");
+        assert!((plan.sq_miles - 0.026121).abs() < 1e-5, "{} sq mi", plan.sq_miles);
+    }
+
+    /// Micro mode counts MICRO units, not studs. The same slider value thus
+    /// builds one fifth of the map. For this reason the readout uses
+    /// `GenOptions::size` and not the slider.
+    #[test]
+    fn micro_units_build_a_fifth_of_what_the_same_number_of_studs_does() {
+        let micro = footprint((1024, 1024), 1, 1, 255);
+        let studs = footprint((1024, 1024), 5, 1, 255);
+        assert_eq!(micro.units, (2048, 2048));
+        assert_eq!(micro.studs, (204.8, 204.8));
+        assert_eq!(studs.units.0, micro.units.0 * 5);
+    }
+
+    /// The height is the vertical scale multiplied by the brightest shade.
+    /// The readout gives it in feet, at one inch per unit.
+    #[test]
+    fn the_tallest_column_is_the_vertical_scale_times_the_brightest_shade() {
+        let plan = footprint((16, 16), 5, 100, 255);
+        assert_eq!(plan.max_height_units, 25_500);
+        assert!((plan.max_height_feet() - 2125.0).abs() < 1e-6);
+    }
+
+    fn brick_at(x: i32, y: i32, z: i32) -> Brick {
+        Brick {
+            asset: BrickType::Procedural {
+                asset: PB_DEFAULT_BRICK,
+                size: BrickSize::new(5, 5, 6),
+            },
+            position: Position::new(x, y, z),
+            ..Default::default()
+        }
+    }
+
+    /// The count uses the same rule as the writer. A brick belongs to the
+    /// CHUNK_SIZE cube that contains its position. The brick count is not
+    /// related.
+    #[test]
+    fn bricks_sharing_a_chunk_are_counted_once() {
+        let same = vec![
+            brick_at(0, 0, 0),
+            brick_at(10, 20, 30),
+            brick_at(CHUNK_SIZE - 1, 0, 0),
+        ];
+        assert_eq!(count_chunks(&same), 1);
+
+        let spread = vec![
+            brick_at(0, 0, 0),
+            brick_at(CHUNK_SIZE, 0, 0),
+            brick_at(0, CHUNK_SIZE, 0),
+            brick_at(0, 0, CHUNK_SIZE),
+            // Negative coordinates give different chunks. The grid is
+            // signed and has its center at the origin.
+            brick_at(-1, 0, 0),
+        ];
+        assert_eq!(count_chunks(&spread), 5);
+    }
+
+    /// The function must refuse above the limit and accept at the limit.
+    #[test]
+    fn a_save_over_the_chunk_limit_is_refused_before_it_is_written() {
+        // Use a 400x250 grid of chunks, not one row. `ChunkIndex` holds
+        // each axis in an i16. 100,000 chunks on one axis thus overflow and
+        // collide.
+        let at_limit: Vec<Brick> = (0..MAX_SAVE_CHUNKS)
+            .map(|i| brick_at((i % 400) as i32 * CHUNK_SIZE, (i / 400) as i32 * CHUNK_SIZE, 0))
+            .collect();
+        assert_eq!(count_chunks(&at_limit), MAX_SAVE_CHUNKS);
+        assert_eq!(check_chunk_limit(&at_limit), Ok(MAX_SAVE_CHUNKS));
+
+        let mut over = at_limit;
+        over.push(brick_at(0, 0, CHUNK_SIZE));
+        let err = check_chunk_limit(&over).expect_err("one chunk above the limit is refused");
+        assert!(
+            err.contains("100001") || err.contains("100,001"),
+            "the message must give the count: {err}"
+        );
+        assert!(
+            err.contains("--size"),
+            "the message must name the option that corrects it: {err}"
+        );
+    }
+
+    /// The CLI and the GUI permit a pixel that is wider than one brick. The
+    /// code must report this condition.
+    #[test]
+    fn a_pixel_too_wide_to_be_one_brick_is_reported() {
+        let ok = footprint((16, 16), MAX_BRICK_HALF_EXTENT, 1, 255);
+        assert!(!ok.over_brick_limit());
+
+        let over = footprint((16, 16), MAX_BRICK_HALF_EXTENT + 1, 1, 255);
+        assert!(over.over_brick_limit());
+        // Give the full width, which the user sees in the game. Do not give
+        // the half extent, which is how the option is stored.
+        assert!(
+            over.brick_limit_text().contains("1,002 units"),
+            "{}",
+            over.brick_limit_text()
+        );
+    }
+
+    /// The readout has three short lines. The log gives the unit count. The
+    /// tooltip gives the one inch per unit rule. Repetition of these on each
+    /// line hides the values.
+    #[test]
+    fn the_readout_lines_carry_studs_and_real_world_size_and_nothing_else() {
+        let plan = footprint((1024, 1024), 5, 150, 255);
+
+        assert_eq!(plan.size_text(), "1,024 x 1,024 px  ->  1,024 x 1,024 studs");
+        assert_eq!(plan.real_text(), "0.16 mi x 0.16 mi, 728,178 sq ft");
+        // Studs and a real-world length, as in the two lines above. Not the
+        // 38,250 units of the stored height. This build is more than half a
+        // mile high, thus the line changes to miles at the same limit as the
+        // horizontal lines.
+        assert_eq!(plan.height_text(), "up to 3,825 studs tall (0.60 mi)");
+        // A lower build stays in feet.
+        assert_eq!(
+            footprint((16, 16), 5, 10, 255).height_text(),
+            "up to 255 studs tall (213 ft)"
+        );
+
+        for line in [plan.size_text(), plan.real_text(), plan.height_text()] {
+            assert!(!line.contains("units"), "{line}");
+            assert!(!line.contains("inch"), "{line}");
+        }
+    }
+
+    /// `Meta/Screenshot.jpg` must be a JPEG and must keep the shape of the
+    /// map.
+    #[test]
+    fn a_save_preview_is_a_jpeg_that_keeps_the_maps_shape() {
+        // The source is two times as wide as it is high. A change to 16:9,
+        // or to a square, thus changes the size in the result.
+        let source = image::RgbaImage::from_pixel(2048, 1024, image::Rgba([10, 20, 30, 255]));
+        let jpg = save_screenshot(&source).expect("encodes");
+        assert_eq!(&jpg[..2], &[0xFF, 0xD8], "Screenshot.jpg must be a JPEG");
+
+        let shot = image::load_from_memory(&jpg).expect("the game must decode it");
+        assert_eq!((shot.width(), shot.height()), (1280, 640), "2:1 stays 2:1");
+
+        // A map that is smaller than the box is enlarged to fill it.
+        let small = image::RgbaImage::from_pixel(64, 64, image::Rgba([9, 9, 9, 255]));
+        let shot = image::load_from_memory(&save_screenshot(&small).expect("encodes")).unwrap();
+        assert_eq!((shot.width(), shot.height()), (1280, 1280));
+    }
+
+    /// The game shows the bundle description next to the preview. The
+    /// description must give the brick count with grouped digits, because the
+    /// count can be more than one million.
+    #[test]
+    fn the_save_description_states_the_brick_count() {
+        let world = bricks_to_save(vec![brick_at(0, 0, 0); 1_234_567]);
+        assert!(
+            world.meta.bundle.description.contains("1,234,567 bricks"),
+            "{}",
+            world.meta.bundle.description
+        );
+        assert_eq!(bricks_to_save(vec![]).meta.bundle.description.lines().count(), 2);
+    }
+
+    #[test]
+    fn big_numbers_are_grouped_so_they_can_be_read() {
+        assert_eq!(commas(0), "0");
+        assert_eq!(commas(999), "999");
+        assert_eq!(commas(1_000), "1,000");
+        assert_eq!(commas(51_200), "51,200");
+        assert_eq!(commas(1_234_567), "1,234,567");
+    }
+
+    /// Most heightmaps cover less than one mile. An area readout in square
+    /// miles only would show "0.00 sq mi" for almost every render.
+    #[test]
+    fn a_small_build_reports_feet_rather_than_a_rounded_off_zero() {
+        let small = footprint((64, 64), 5, 1, 255);
+        assert!(small.sq_miles < 0.1);
+        assert!(
+            small.area_text().ends_with("sq ft"),
+            "{}",
+            small.area_text()
+        );
+        assert!(small.real_text().contains(" ft"), "{}", small.real_text());
+
+        let big = footprint((8192, 8192), 5, 1, 255);
+        assert_eq!(big.area_text(), "1.67 sq mi");
+        assert!(big.real_text().contains("1.29 mi"), "{}", big.real_text());
+    }
 
     /// The 0.04045 knee, in 8-bit terms: `0.04045 * 255 = 10.31`, so 10 is the
     /// last sample on the linear segment and 11 the first on the power
