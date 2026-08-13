@@ -1081,7 +1081,6 @@ mod tests {
             img: false,
             glow: false,
             hdmap: false,
-            lrgb: false,
             nocollide: false,
             quadtree: true,
             greedy: false,

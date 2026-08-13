@@ -67,7 +67,7 @@ Common:
       --glow              Emit at 0 glow intensity
       --nocollide         Disable brick collision
       --hdmap             RGB-encoded high-detail heightmap
-      --lrgb              Treat input colour as linear rather than sRGB
+      --lrgb              deprecated, ignored (colours are never converted now)
 
 Heightmap surface:
       --tile/--smooth/--micro/--stud   flat-topped brick style

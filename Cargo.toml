@@ -11,6 +11,9 @@ image = { version = "0.25.10", default-features = false, features = [
   "png",
   "gif",
   "webp",
+  # The CLI and the GUI accept .jpg heightmaps and colormaps. Without this
+  # feature the decode of such a file fails.
+  "jpeg",
 ] }
 log = "0.4.28"
 # Standard MIDI File parser (midi::parse). Pure Rust, no_std-capable, wasm-safe,

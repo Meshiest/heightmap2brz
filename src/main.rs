@@ -97,7 +97,7 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg wedge: --wedge "Build TERRACED wedge terrain: tops stay flat, every height is a whole terrace step, and the outlines of the terraces are cut at 45 degrees by vertical side wedges (PB_DefaultSideWedge) -- convex corners chamfered, concave corners filled, collinear staircases merged into single large wedges, flat tops greedy-merged into boxes. Unbuildable configurations (diagonal crossings, spikes) are eroded first. Unlike --terrain and --rampify, slopes are not approximated: this is the terraced 'brick terrain' look of hand-built Brickadia maps. Replaces --tile/--smooth/--micro/--stud and the optimizers")
         (@arg prefab: --prefab "Heightmap/image renders: write a PREFAB bundle instead of a world, so the save can be dropped in Brickadia's Prefabs folder and spawned from the prefab browser rather than loaded as a level")
         (@arg snap: --snap "Snap bricks to the brick grid")
-        (@arg lrgb: --lrgb "Use linear rgb input color instead of sRGB")
+        (@arg lrgb: --lrgb "DEPRECATED and ignored. Colormap pixels always go into the bricks without conversion, because a save file stores brick colours in the same encoding as an image")
         (@arg img: -i --img "Make the heightmap flat and render an image")
         (@arg glow: --glow "Make the heightmap (or animation display) glow at 0 intensity")
         (@arg srgb2lin: --("srgb-to-linear") "Animation: convert sRGB frame colors to linear before encoding (use if the render looks too bright)")
@@ -290,8 +290,19 @@ fn main() {
     if matches.is_present("srgb2lin") && !matches.is_present("animmode") {
         warn!(
             "--srgb-to-linear applies to --anim-mode renders only (it converts a FRAME's \
-             colours before they are encoded). The heightmap and --img paths have --lrgb for \
-             the same job; --text has no colour encoding to convert"
+             colours before they are encoded). The heightmap and --img paths convert nothing \
+             at all; --text has no colour encoding to convert"
+        );
+    }
+
+    // `--lrgb` disabled a default sRGB to linear conversion of the colormap.
+    // That conversion is removed. A save file stores brick colours in the same
+    // encoding as an image, thus the conversion only made each render darker
+    // than its colormap. The flag stays as a no-op for existing scripts.
+    if matches.is_present("lrgb") {
+        warn!(
+            "--lrgb is deprecated and has no effect. Colormap pixels always go into the \
+             bricks without conversion, which is what --lrgb selected"
         );
     }
 
@@ -1493,9 +1504,24 @@ fn run_heightmap(
     }
     let blocks = surface == SurfaceMode::Blocks;
 
+    // `--size` counts STUDS, which are 5 units of half extent each. With
+    // `--micro` it counts micro units. Use `checked_mul`: the half extent is a
+    // u16, thus `--size 20000` overflowed and rendered a map at an incorrect
+    // size.
+    let micro_size = matches.is_present("micro") && blocks;
+    let units_per_stud = if micro_size { 1 } else { 5 };
+    let Some(half_extent) = size.checked_mul(units_per_stud) else {
+        fail!(
+            "--size {size} is too large. One pixel would be more than {} units across, which \
+             is more than one brick can be. The maximum brick size is {} units",
+            u16::MAX,
+            MAX_BRICK_HALF_EXTENT * 2
+        );
+    };
+
     // output options
     let options = GenOptions {
-        size: size * if matches.is_present("micro") && blocks { 1 } else { 5 },
+        size: half_extent,
         scale,
         cull: matches.is_present("cull"),
         asset: if matches.is_present("micro") {
@@ -1509,13 +1535,12 @@ fn run_heightmap(
         } else {
             PB_DEFAULT_BRICK
         },
-        micro: matches.is_present("micro") && blocks,
+        micro: micro_size,
         stud: matches.is_present("stud") && blocks,
         snap: matches.is_present("snap"),
         img: matches.is_present("img") && blocks,
         glow: matches.is_present("glow"),
         hdmap: matches.is_present("hdmap"),
-        lrgb: matches.is_present("lrgb"),
         nocollide: matches.is_present("nocollide"),
         quadtree: true,
         greedy: matches.is_present("greedy"),
@@ -1529,14 +1554,12 @@ fn run_heightmap(
         .map(|s| s.to_lowercase())
         .as_deref()
     {
-        Some("png") | Some("jpg") | Some("jpeg") => {
-            match ColormapPNG::new(&colormap_file, options.lrgb) {
-                Ok(map) => map,
-                Err(err) => {
-                    fail!("Error reading colormap: {:?}", err);
-                }
+        Some("png") | Some("jpg") | Some("jpeg") => match ColormapPNG::new(&colormap_file) {
+            Ok(map) => map,
+            Err(err) => {
+                fail!("Error reading colormap: {:?}", err);
             }
-        }
+        },
         Some(ext) => {
             fail!("Unsupported colormap format '{}'", ext);
         }
@@ -1566,6 +1589,28 @@ fn run_heightmap(
         fail!("Unsupported heightmap format");
     };
 
+    // The size of the render, before it runs. The GUI shows the same values
+    // below its scale sliders.
+    let plan = footprint(
+        heightmap.size(),
+        options.size,
+        if options.img { 0 } else { options.scale },
+        255,
+    );
+    info!("Build size: {}", plan.size_text());
+    info!(
+        "  {} x {} units, {} at 1 unit = 1 inch",
+        commas(plan.units.0),
+        commas(plan.units.1),
+        plan.real_text()
+    );
+    if !options.img {
+        info!("  {}", plan.height_text());
+    }
+    if plan.over_brick_limit() {
+        warn!("--size {size}: {}", plan.brick_limit_text());
+    }
+
     // Not `.expect(...)`: `gen_opt_heightmap` returns a `String` describing a
     // real user-facing condition (an image it cannot use), and a panic trace
     // reads as a crash rather than as the refusal it is.
@@ -1574,8 +1619,42 @@ fn run_heightmap(
         Err(e) => fail!("{e}"),
     };
 
+    // Do the check BEFORE the write. The game cannot load a save above the
+    // chunk limit, and a failure in the game wastes the full render.
+    match check_chunk_limit(&bricks) {
+        Ok(chunks) => info!(
+            "Save spans {} of the {} chunks the game will load",
+            commas(chunks as u64),
+            commas(MAX_SAVE_CHUNKS as u64)
+        ),
+        Err(e) => fail!("{e}"),
+    }
+
     info!("Writing Save to {}", out_file);
     let mut data = bricks_to_save(bricks);
+
+    // Each save gets a preview, world or prefab. The game shows a grid of
+    // pictures, and a generated save has no screenshot of itself. The source
+    // map gives a view from above. Use the COLORMAP, which shows the colours
+    // of the build. Without `-c`, `colormap_file` is already the heightmap.
+    //
+    // An encode failure only writes a warning, because it must not stop the
+    // render.
+    match save_screenshot(colormap.image()) {
+        Ok(screenshot) => {
+            data.meta.screenshot = Some(screenshot);
+            info!("Save preview: {}", colormap_file.display());
+        }
+        Err(e) => warn!("no save preview embedded: {e}"),
+    }
+    // The game names its own bundles, and the browser tile shows this name.
+    // Use the output file name: `-o "Big Island.brz"` gives "Big Island".
+    if data.meta.bundle.name.is_empty() {
+        if let Some(stem) = std::path::Path::new(&out_file).file_stem() {
+            data.meta.bundle.name = stem.to_string_lossy().to_string();
+        }
+    }
+
     // A prefab bundle and a world bundle differ in their metadata only. The
     // difference is `level_type` and the block of pivots and bounds that
     // `make_prefab` calculates from the brick positions. The code thus changes

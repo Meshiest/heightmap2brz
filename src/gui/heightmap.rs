@@ -117,7 +117,6 @@ pub struct HeightmapApp {
     optimization: OptimizationMode,
     opt_cull: bool,
     opt_nocollide: bool,
-    opt_lrgb: bool,
     opt_hdmap: bool,
     opt_snap: bool,
     opt_glow: bool,
@@ -140,7 +139,6 @@ impl Default for HeightmapApp {
             optimization: OptimizationMode::Quad,
             opt_cull: false,
             opt_nocollide: false,
-            opt_lrgb: false,
             opt_snap: false,
             opt_glow: false,
             opt_hdmap: false,
@@ -160,6 +158,38 @@ impl HeightmapApp {
             |img: &PickedImage| -> bool { img.image.width() > 1024 || img.image.height() > 1024 };
 
         self.heightmaps.iter().any(check_image) || self.colormap.as_ref().map_or(false, check_image)
+    }
+
+    /// The pixel size of the source image, or `None` if no image is picked.
+    ///
+    /// The build uses the size of the HEIGHTMAP. It uses the size of the
+    /// colormap only if there is no heightmap. `maps_from_images` makes the
+    /// same selection, thus the readout agrees with the render.
+    fn source_size(&self, img_only: bool) -> Option<(u32, u32)> {
+        let img = if img_only {
+            self.colormap.as_ref()
+        } else {
+            self.heightmaps.first().or(self.colormap.as_ref())
+        };
+        img.map(|i| (i.image.width(), i.image.height()))
+    }
+
+    /// The size that the current selection builds at the current settings.
+    ///
+    /// The value comes from `options()` and not from the sliders. A mode can
+    /// change what a slider COUNTS. Micro mode counts micro units, not studs.
+    fn footprint(&self, img_only: bool) -> Option<Footprint> {
+        let options = self.options(img_only);
+        self.source_size(img_only).map(|px| {
+            footprint(
+                px,
+                options.size,
+                // An image render is one layer of bricks. A shade of grey
+                // thus adds no height.
+                if options.img { 0 } else { options.scale },
+                255,
+            )
+        })
     }
 
     /// Poll an in-flight file pick and apply the result.
@@ -199,12 +229,14 @@ impl HeightmapApp {
             self.mode.surface()
         };
         GenOptions {
-            // `--size` counts STUDS in each mode, but the micro mode counts
-            // micro units.
+            // `--size` counts STUDS in each mode, but micro mode counts
+            // micro units. Use a saturating multiply: the slider does not
+            // clamp a typed value, and the CLI has no limit. A typed value
+            // multiplied by five overflows first.
             size: if self.mode == BrickMode::Micro {
                 self.horizontal_size
             } else {
-                self.horizontal_size * 5
+                self.horizontal_size.saturating_mul(5)
             },
             scale: self.vertical_scale,
             cull: self.opt_cull,
@@ -226,7 +258,6 @@ impl HeightmapApp {
             img,
             glow: self.opt_glow,
             hdmap: self.opt_hdmap,
-            lrgb: self.opt_lrgb,
             nocollide: self.opt_nocollide,
             quadtree: self.optimization == OptimizationMode::Quad,
             greedy: self.optimization == OptimizationMode::Greedy,
@@ -246,6 +277,18 @@ impl HeightmapApp {
             self.heightmaps.clone()
         };
         let colormap = self.colormap.clone();
+        // The picture for the in-game preview: the colormap, or the
+        // heightmap if there is no colormap. The render makes the same
+        // selection. Get the image here, where both selections are available.
+        // The worker receives only the boxed `Colormap` trait.
+        let preview_source = colormap
+            .as_ref()
+            .or(heightmaps.first())
+            .map(|p| p.image.clone());
+        let save_name = std::path::Path::new(&out_file)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
 
         let progress_tx = self.progress_channel.0.clone();
         // Send failures are IGNORED, as in the Video and Audio panes: a closed
@@ -286,9 +329,35 @@ impl HeightmapApp {
                 })?;
                 stopped()?;
 
+                // Do the check BEFORE the write. The game cannot load a save
+                // above the chunk limit, and a failure in the game wastes the
+                // full render. Only the completed bricks give the count. Refer
+                // to `check_chunk_limit`.
+                let chunks = check_chunk_limit(&bricks)?;
+                info!(
+                    "Save spans {} of the {} chunks the game will load",
+                    commas(chunks as u64),
+                    commas(MAX_SAVE_CHUNKS as u64)
+                );
+
                 info!("Writing Save to {}", out_file);
                 progress("Writing", 0.95);
-                let data = bricks_to_save(bricks);
+                let mut data = bricks_to_save(bricks);
+
+                // The in-game preview. A generated save has no screenshot of
+                // itself, thus the source map gives a view from above. A save
+                // with no preview shows an empty tile in the browser. An
+                // encode failure only writes a log message, because it must
+                // not stop the render.
+                if let Some(source) = &preview_source {
+                    match save_screenshot(source) {
+                        Ok(screenshot) => data.meta.screenshot = Some(screenshot),
+                        Err(e) => error!("no save preview embedded: {e}"),
+                    }
+                }
+                if !save_name.is_empty() {
+                    data.meta.bundle.name = save_name.clone();
+                }
 
                 // This pane's own extension branch, now shared with the other
                 // four -- see `gui::util::deliver_world`. It was the only one
@@ -346,14 +415,75 @@ impl HeightmapApp {
             save_destination_row(t, ui, shared);
             out_file_warning_row(t, ui, &shared.out_file);
 
+            // The slider tracks stop at the limit of the GAME, not at a
+            // round number. `MAX_BRICK_HALF_EXTENT` is the largest half
+            // extent of a procedural brick, and one pixel is one brick. Micro
+            // mode counts micro units, thus the same physical limit is five
+            // times the value. Both tracks stopped at 100 before, which gave
+            // micro mode one fifth of the range of the CLI. A typed value can
+            // be more than the track (`SliderClamping::Never`), because the
+            // CLI has no limit.
+            let (unit, max_horizontal) = if self.mode == BrickMode::Micro {
+                ("micro units", MAX_BRICK_HALF_EXTENT)
+            } else {
+                ("studs", MAX_BRICK_HALF_EXTENT / 5)
+            };
             t.row_hover(ui, "Horizontal Scale", Some("The size of each pixel in studs (or microbricks)"), |ui| {
-                widgets::slider(ui, egui::Slider::new(&mut self.horizontal_size, 1..=100).text("studs"));
+                widgets::slider(
+                    ui,
+                    egui::Slider::new(&mut self.horizontal_size, 1..=max_horizontal)
+                        .clamping(egui::SliderClamping::Never)
+                        .text(unit),
+                )
+                .on_hover_text(format!(
+                    "The track stops at {max_horizontal} {unit}. One pixel then fills the \
+                     largest brick the game allows ({} units across). Type a larger value to \
+                     go above the track, as --size does",
+                    MAX_BRICK_HALF_EXTENT * 2
+                ));
             });
             if !img_only {
                 t.row_hover(ui, "Vertical Size", Some("The height of each shade of grey from the heightmap"), |ui| {
-                    widgets::slider(ui, egui::Slider::new(&mut self.vertical_scale, 1..=100).text("units"));
+                    // No brick limit applies here. The code divides a high
+                    // column into pieces of 250 units or less. Thus
+                    // `--vertical` accepts any value, and this track does not
+                    // stop at 100.
+                    widgets::slider(
+                        ui,
+                        egui::Slider::new(&mut self.vertical_scale, 1..=1000)
+                            .clamping(egui::SliderClamping::Never)
+                            .logarithmic(true)
+                            .text("units"),
+                    )
+                    .on_hover_text(
+                        "The height of one shade of grey, in units. Type a larger value to go \
+                         above the track, as --vertical does",
+                    );
                 });
             }
+
+            t.row_hover(ui, "Estimated Size", Some("The size of the finished build, from the image size and the scales above. Real-world values use one brick unit per inch, thus ten inches per stud"), |ui| {
+                ui.vertical(|ui| match self.footprint(img_only) {
+                    None => {
+                        ui.label("Select an image to see the size of the build");
+                    }
+                    Some(plan) => {
+                        ui.label(plan.size_text());
+                        ui.label(plan.real_text());
+                        // A flat image render has no shade of grey to give
+                        // height, so there is no height to report.
+                        if plan.max_height_units > 0 {
+                            ui.label(plan.height_text());
+                        }
+                        if plan.over_brick_limit() {
+                            ui.colored_label(
+                                Color32::from_rgb(255, 200, 100),
+                                format!("Note: {}", plan.brick_limit_text()),
+                            );
+                        }
+                    }
+                });
+            });
 
             t.row_hover(ui, "Optimization", Some("Algorithm used to reduce brick count"), |ui| {
                 // Vertical for the same reason as the Brick Type row below: the
@@ -393,8 +523,6 @@ impl HeightmapApp {
                     );
                     widgets::toggle(ui, &mut self.opt_nocollide, "No Collide")
                         .on_hover_text("Disable brick collision");
-                    widgets::toggle(ui, &mut self.opt_lrgb, "LRGB")
-                        .on_hover_text("Use linear rgb input color instead of sRGB");
                     widgets::toggle(ui, &mut self.opt_glow, "Glow")
                         .on_hover_text("Glow bricks at lowest intensity");
                     if !img_only {
@@ -703,6 +831,93 @@ mod tests {
             Err("failed to write file".to_string()),
             "a converted error must still be reported to the user"
         );
+    }
+
+    fn picked(w: u32, h: u32) -> PickedImage {
+        PickedImage {
+            name: "test.png".to_string(),
+            image: std::sync::Arc::new(image::RgbaImage::new(w, h)),
+        }
+    }
+
+    /// The readout must follow what the slider COUNTS in the selected mode.
+    ///
+    /// Micro mode counts micro units, and each other mode counts studs. The
+    /// same slider value thus builds one fifth of the map. A readout that
+    /// used the slider value would show five times the correct size.
+    #[test]
+    fn the_size_readout_follows_the_brick_mode_the_slider_is_counted_in() {
+        let mut app = HeightmapApp::default();
+        app.heightmaps = vec![picked(1024, 1024)];
+        app.horizontal_size = 1;
+
+        app.mode = BrickMode::Default;
+        let studs = app.footprint(false).expect("an image is selected");
+        assert_eq!(studs.studs, (1024.0, 1024.0));
+
+        app.mode = BrickMode::Micro;
+        let micro = app.footprint(false).expect("an image is selected");
+        assert_eq!(micro.studs, (204.8, 204.8));
+    }
+
+    /// The build uses the size of the HEIGHTMAP if there is one, because
+    /// `maps_from_images` builds from that image. A colormap of a different
+    /// size does not change the build, thus it must not change the readout.
+    #[test]
+    fn the_readout_measures_the_image_the_render_is_built_from() {
+        let mut app = HeightmapApp::default();
+        app.heightmaps = vec![picked(512, 256)];
+        app.colormap = Some(picked(64, 64));
+        assert_eq!(app.footprint(false).unwrap().pixels, (512, 256));
+
+        // The Image2Brick page renders the colormap and ignores heightmaps.
+        assert_eq!(app.footprint(true).unwrap().pixels, (64, 64));
+
+        // With no image there is no size, and the code must not panic.
+        assert!(HeightmapApp::default().footprint(false).is_none());
+    }
+
+    /// The size readout must REACH the pane. This row exists only to be read.
+    /// A row that stops painting looks the same as a pane with no data.
+    #[test]
+    fn the_pane_paints_the_size_readout_for_a_selected_image() {
+        let ctx = Context::default();
+        crate::gui::theme::install(&ctx);
+        let mut app = HeightmapApp::default();
+        app.heightmaps = vec![picked(1024, 1024)];
+        let mut shared = SharedOptions::default();
+
+        let mut texts: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 2400.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_settings(ui, &mut shared, false);
+                });
+            });
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+        }
+
+        let plan = app.footprint(false).unwrap();
+        for want in [plan.size_text(), plan.real_text(), plan.height_text()] {
+            assert!(
+                texts.iter().any(|t| *t == want),
+                "the pane never painted {want:?}; it painted {texts:?}"
+            );
+        }
     }
 
     /// The Brick Type and Optimization notes must sit BELOW their buttons, at

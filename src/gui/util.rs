@@ -457,7 +457,7 @@ pub fn maps_from_images(
     let colormap_img = colormap
         .or(heightmaps.first())
         .ok_or_else(|| "no images selected".to_string())?;
-    let colormap = ColormapPNG::from_image((*colormap_img.image).clone(), options.lrgb);
+    let colormap = ColormapPNG::from_image((*colormap_img.image).clone());
 
     let heightmap: Box<dyn Heightmap> = if options.img {
         Box::new(HeightmapFlat::new(colormap.size()).unwrap())
