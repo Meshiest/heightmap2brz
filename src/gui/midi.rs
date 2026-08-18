@@ -15,7 +15,11 @@
 //! [`crate::gui::midi_preview::Preview`] backend, by contrast, is real on both
 //! targets (rodio on desktop, Web Audio in the browser).
 use crate::{
-    audio::{speakers::build_midi_event_world, track::SynthWave},
+    audio::{
+        percussion::{OneShotSound, PALETTE_ROLES},
+        speakers::build_midi_event_world,
+        track::SynthWave,
+    },
     gui::{
         SharedOptions,
         midi_preview::{self, Preview},
@@ -23,7 +27,10 @@ use crate::{
     },
     gui::util::pick_midi_bytes,
     gui::theme::{icons, widgets},
-    midi::{Instrument, MidiOptions, MidiSummary, ToneAssignment, analyze_midi, discover, preview::synthesize},
+    midi::{
+        Instrument, MidiOptions, MidiSummary, ToneAssignment, analyze_midi, discover,
+        preview::synthesize, timbre::synth_for_program,
+    },
 };
 use egui::Ui;
 use log::{error, info};
@@ -46,8 +53,9 @@ pub struct MidiApp {
     input: Option<PickedMidi>,
     /// The in-flight file picker (native dialog or browser upload), if any.
     pending_pick: Option<Promise<Option<(String, Vec<u8>)>>>,
-    /// One tone per discovered instrument, resized (to all-Sine) each time a new
-    /// file is parsed. Kept beside `opts` rather than inside its
+    /// One tone per discovered instrument, refilled each time a new file is
+    /// parsed with the waveform auto-picked from each instrument's GM program
+    /// (the user can still change any row). Kept beside `opts` rather than inside its
     /// [`ToneAssignment`] so the per-row combos can bind a plain slice; the
     /// assignment is assembled from it in [`Self::midi_opts`].
     tones: Vec<SynthWave>,
@@ -60,6 +68,10 @@ pub struct MidiApp {
     selected: Vec<bool>,
     /// The tone the bulk control assigns to all / selected rows.
     bulk_tone: SynthWave,
+    /// The sound each drum role plays, one per [`PALETTE_ROLES`] entry (not
+    /// per file -- the kit is global). Editable via the drum-kit dropdowns and
+    /// fed to [`MidiOptions::drum_kit`]. Starts at each role's tuned default.
+    drum_kit: Vec<OneShotSound>,
     /// Every numeric/toggle setting, in the pipeline's own struct. Its own
     /// `tones` field is unused -- [`Self::midi_opts`] overrides it from `tones`.
     opts: MidiOptions,
@@ -102,6 +114,7 @@ impl Default for MidiApp {
             volumes: Vec::new(),
             selected: Vec::new(),
             bulk_tone: SynthWave::Sine,
+            drum_kit: PALETTE_ROLES.iter().map(|r| r.sound).collect(),
             opts: MidiOptions::default(),
             pending_generate: None,
             pending_preview: None,
@@ -126,6 +139,7 @@ impl MidiApp {
         MidiOptions {
             tones: ToneAssignment::PerInstrument(self.tones.clone()),
             instrument_volumes: self.volumes.clone(),
+            drum_kit: self.drum_kit.clone(),
             ..self.opts.clone()
         }
     }
@@ -161,9 +175,13 @@ impl MidiApp {
                     summary.total_notes,
                     summary.duration_s,
                 );
-                // One tone slot per instrument, all Sine (the default); full
+                // One tone slot per instrument, pre-filled with the waveform
+                // auto-picked from its GM program (overridable per row); full
                 // volume; none selected.
-                self.tones = vec![SynthWave::Sine; instruments.len()];
+                self.tones = instruments
+                    .iter()
+                    .map(|i| synth_for_program(i.program.unwrap_or(0)))
+                    .collect();
                 self.volumes = vec![1.0; instruments.len()];
                 self.selected = vec![false; instruments.len()];
                 self.reset_preview();
@@ -277,6 +295,87 @@ impl MidiApp {
                 );
             },
         );
+        t.row_hover(
+            ui,
+            "Percussion",
+            Some("Build the drum channel (10) as oneshot samples: each drum note maps through the fold table (see the accordion) to one of the tuned sounds. Off skips percussion and builds only the pitched instruments."),
+            |ui| {
+                widgets::toggle(ui, &mut self.opts.build_percussion, "Percussion");
+            },
+        );
+        self.draw_percussion_accordion(ui);
+    }
+
+    /// A collapsible, editable, full-width drum-kit table: one row per General
+    /// MIDI percussion role, with a dropdown to pick which tuned sound it plays.
+    /// Feeds [`MidiOptions::drum_kit`]; greyed while percussion is off.
+    fn draw_percussion_accordion(&mut self, ui: &mut Ui) {
+        use egui_extras::{Column, TableBuilder};
+        let enabled = self.opts.build_percussion;
+        ui.add_enabled_ui(enabled, |ui| {
+            egui::CollapsingHeader::new(format!("Drum kit -- {} sounds", PALETTE_ROLES.len()))
+                .id_salt("percussion_kit")
+                .default_open(false)
+                .show(ui, |ui| {
+                    // Full-bleed to the card edges; the Sound column takes the
+                    // slack so the row of dropdowns fills the width.
+                    widgets::full_bleed(ui, |ui| {
+                        TableBuilder::new(ui)
+                            .striped(true)
+                            .auto_shrink([false, true])
+                            .vscroll(false)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::auto().at_least(90.0)) // role
+                            .column(Column::auto().at_least(40.0)) // note
+                            .column(Column::remainder().at_least(150.0)) // sound (flex)
+                            .column(Column::auto().at_least(56.0)) // pitch
+                            .column(Column::auto().at_least(44.0)) // vol
+                            .header(20.0, |mut header| {
+                                for s in ["Role", "Note", "Sound", "Pitch", "Vol"] {
+                                    header.col(|ui| {
+                                        ui.strong(s);
+                                    });
+                                }
+                            })
+                            .body(|mut body| {
+                                for (r, role) in PALETTE_ROLES.iter().enumerate() {
+                                    body.row(30.0, |mut tr| {
+                                        tr.col(|ui| {
+                                            ui.label(role.label);
+                                        });
+                                        tr.col(|ui| {
+                                            ui.label(role.gm_note.to_string());
+                                        });
+                                        tr.col(|ui| {
+                                            // Selected label: the role whose sound this row plays.
+                                            let cur = self.drum_kit[r];
+                                            let cur_label = PALETTE_ROLES
+                                                .iter()
+                                                .find(|o| o.sound == cur)
+                                                .map_or(cur.asset, |o| o.label);
+                                            widgets::combo(ui, ("drum_kit", r), cur_label, 150.0, |ui| {
+                                                for opt in PALETTE_ROLES {
+                                                    widgets::combo_item(
+                                                        ui,
+                                                        &mut self.drum_kit[r],
+                                                        opt.sound,
+                                                        opt.label,
+                                                    );
+                                                }
+                                            });
+                                        });
+                                        tr.col(|ui| {
+                                            ui.label(format!("{:.2}", self.drum_kit[r].pitch));
+                                        });
+                                        tr.col(|ui| {
+                                            ui.label(format!("{:.1}", self.drum_kit[r].volume));
+                                        });
+                                    });
+                                }
+                            });
+                    });
+                });
+        });
     }
 
     fn draw_input(&mut self, ui: &mut Ui) {
@@ -338,7 +437,7 @@ impl MidiApp {
             s.initial_bpm,
             s.total_notes,
             if s.has_percussion {
-                " -- has percussion (the percussion channel is not built)"
+                " -- has percussion (built as oneshot drums)"
             } else {
                 ""
             },
@@ -786,5 +885,59 @@ impl MidiApp {
     pub fn draw_footer(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
         bound_pane_width(ui);
         self.draw_submit(ui, shared);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::Context;
+
+    /// Every text glyph the settings pane paints, after a few frames so the
+    /// layout settles (as the heightmap pane's render tests do).
+    fn painted_texts(app: &mut MidiApp) -> Vec<String> {
+        let ctx = Context::default();
+        crate::gui::theme::install(&ctx);
+        let mut shared = SharedOptions::default();
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 2400.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_settings(ui, &mut shared);
+                });
+            });
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+        }
+        texts
+    }
+
+    /// The percussion toggle and the drum-kit accordion header must reach the
+    /// pane -- the whole point of the row is to be seen and toggled.
+    #[test]
+    fn the_settings_paint_a_percussion_toggle_and_drum_kit_accordion() {
+        let mut app = MidiApp::default();
+        let texts = painted_texts(&mut app);
+        assert!(
+            texts.iter().any(|t| t == "Percussion"),
+            "no Percussion toggle painted; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Drum kit")),
+            "no drum-kit accordion header painted; got {texts:?}"
+        );
     }
 }

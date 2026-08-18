@@ -6,7 +6,7 @@
 //! channel on one track, so this splits them by channel. Percussion (channel
 //! 10, index 9) is recorded in the summary but excluded from the instrument
 //! list: v1 does not build it (pitched noise is inaudible, see the design doc).
-use super::{MidiSummary, NoteEvent};
+use super::{MidiSummary, NoteEvent, PercussionHit};
 use midly::{Format, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 use std::collections::HashMap;
 
@@ -16,6 +16,9 @@ pub struct InstrumentNotes {
     pub label: String,
     pub track: usize,
     pub channel: u8,
+    /// The channel's last General MIDI program, if it sent a Program Change.
+    /// Drives automatic waveform selection ([`crate::midi::timbre`]).
+    pub program: Option<u8>,
     /// Sorted by start time.
     pub notes: Vec<NoteEvent>,
 }
@@ -26,6 +29,9 @@ pub struct ParsedMidi {
     /// in a stable order (track then channel). The index into this vector is
     /// the instrument index the tone assignment uses.
     pub instruments: Vec<InstrumentNotes>,
+    /// Every strike on the percussion channel, sorted by time. Empty for a
+    /// file with no drums. Resolved to sounds later through the drum fold table.
+    pub percussion: Vec<PercussionHit>,
     pub summary: MidiSummary,
 }
 
@@ -59,6 +65,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedMidi, String> {
 
     let mut total_notes = 0usize;
     let mut has_percussion = false;
+    let mut percussion: Vec<PercussionHit> = Vec::new();
     let mut last_tick: u64 = 0;
 
     for (ti, track) in smf.tracks.iter().enumerate() {
@@ -87,6 +94,11 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedMidi, String> {
                             total_notes += 1;
                             if ch == PERCUSSION_CHANNEL {
                                 has_percussion = true;
+                                percussion.push(PercussionHit {
+                                    start_s: to_seconds(tick),
+                                    note: key.as_int(),
+                                    velocity: vel.as_int(),
+                                });
                                 continue;
                             }
                             active
@@ -142,13 +154,20 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedMidi, String> {
             .cloned()
             .or_else(|| program.get(&key).map(|&p| gm_program_name(p).to_string()))
             .unwrap_or_else(|| format!("Channel {}", ch + 1));
-        instruments.push(InstrumentNotes { label, track: ti, channel: ch, notes });
+        instruments.push(InstrumentNotes {
+            label,
+            track: ti,
+            channel: ch,
+            program: program.get(&key).copied(),
+            notes,
+        });
     }
 
     let duration_s = instruments
         .iter()
         .flat_map(|i| i.notes.iter())
         .map(|n| n.end_s)
+        .chain(percussion.iter().map(|h| h.start_s))
         .fold(0.0f64, f64::max);
 
     let summary = MidiSummary {
@@ -160,16 +179,12 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedMidi, String> {
         has_percussion,
     };
 
-    if instruments.is_empty() {
-        return Err(if has_percussion {
-            "this MIDI has only percussion (channel 10), which is not built in this version"
-                .to_string()
-        } else {
-            "this MIDI file has no notes to play".to_string()
-        });
+    if instruments.is_empty() && percussion.is_empty() {
+        return Err("this MIDI file has no notes to play".to_string());
     }
 
-    Ok(ParsedMidi { instruments, summary })
+    percussion.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+    Ok(ParsedMidi { instruments, percussion, summary })
 }
 
 /// Pop the most recent unmatched press of `(ch, key)` and record the completed
@@ -440,6 +455,43 @@ mod tests {
         assert_eq!(p.instruments.len(), 2, "two channels are two instruments");
         let channels: Vec<u8> = p.instruments.iter().map(|i| i.channel).collect();
         assert!(channels.contains(&0) && channels.contains(&1));
+    }
+
+    #[test]
+    fn percussion_hits_are_collected_with_time_note_and_velocity() {
+        // Two drums on channel 10: a kick at tick 0, a snare at tick 480.
+        // No tempo meta, so the 120 BPM default holds and 480 ticks = 0.5 s.
+        let track = vec![
+            ev(0, note_on(9, 36, 100)),
+            ev(240, note_off(9, 36)),
+            ev(240, note_on(9, 38, 80)),
+            ev(240, note_off(9, 38)),
+            ev(0, TrackEventKind::Meta(MetaMessage::EndOfTrack)),
+        ];
+        let bytes = write_smf(Format::SingleTrack, 480, vec![track]);
+        let p = parse(&bytes).expect("parse");
+
+        assert_eq!(p.percussion.len(), 2, "both drum strikes are collected");
+        assert_eq!((p.percussion[0].note, p.percussion[0].velocity), (36, 100));
+        assert!(p.percussion[0].start_s.abs() < 1e-6, "kick at t=0");
+        assert_eq!((p.percussion[1].note, p.percussion[1].velocity), (38, 80));
+        assert!((p.percussion[1].start_s - 0.5).abs() < 1e-6, "snare at t=0.5s");
+    }
+
+    /// A file with ONLY percussion used to be refused; now it parses, with the
+    /// hits collected and no melodic instruments.
+    #[test]
+    fn a_percussion_only_file_parses_instead_of_erroring() {
+        let track = vec![
+            ev(0, note_on(9, 42, 100)),
+            ev(240, note_off(9, 42)),
+            ev(0, TrackEventKind::Meta(MetaMessage::EndOfTrack)),
+        ];
+        let bytes = write_smf(Format::SingleTrack, 480, vec![track]);
+        let p = parse(&bytes).expect("a drum-only file must parse");
+        assert!(p.instruments.is_empty(), "no melodic instruments");
+        assert_eq!(p.percussion.len(), 1);
+        assert_eq!(p.percussion[0].note, 42);
     }
 
     #[test]

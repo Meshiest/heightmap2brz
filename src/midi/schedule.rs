@@ -7,7 +7,10 @@
 //! volume)` spans -- no fps sampling, no envelope: the playback circuit reads
 //! the spans directly against the clock's runtime.
 use super::parse::InstrumentNotes;
-use super::{Instrument, MidiOptions, MidiScore, NoteEvent, NoteSpan, SpeakerVoice};
+use super::{
+    Instrument, MidiOptions, MidiScore, NoteEvent, NoteSpan, PercussionHit, PercussionLane,
+    SpeakerVoice, drums,
+};
 use crate::audio::bands::{PITCH_MAX, PITCH_MIN};
 
 /// The `PitchMultiplier` a MIDI note maps to: `2^((note - 69) / 12)`, so note
@@ -50,6 +53,7 @@ pub fn instrument_of(n: &InstrumentNotes) -> Instrument {
         label: n.label.clone(),
         track: n.track,
         channel: n.channel,
+        program: n.program,
         note_count: in_range.len(),
         max_polyphony: max_simultaneous(&in_range),
         dropped_notes: n.notes.len() - in_range.len(),
@@ -76,7 +80,11 @@ fn validate(opts: &MidiOptions) -> Result<(), String> {
 }
 
 /// Schedule every instrument into per-speaker note lists.
-pub fn schedule(instruments: &[InstrumentNotes], opts: &MidiOptions) -> Result<MidiScore, String> {
+pub fn schedule(
+    instruments: &[InstrumentNotes],
+    percussion: &[PercussionHit],
+    opts: &MidiOptions,
+) -> Result<MidiScore, String> {
     validate(opts)?;
 
     let mut voices: Vec<SpeakerVoice> = Vec::new();
@@ -135,7 +143,23 @@ pub fn schedule(instruments: &[InstrumentNotes], opts: &MidiOptions) -> Result<M
         }
     }
 
-    if voices.is_empty() {
+    // Percussion: one lane per distinct sound the fold table resolves to, each
+    // carrying that sound's strike times.
+    let mut percussion_lanes: Vec<PercussionLane> = Vec::new();
+    if opts.build_percussion {
+        for hit in percussion {
+            let sound = drums::drum_sound_with_kit(hit.note, &opts.drum_kit);
+            match percussion_lanes.iter_mut().find(|l| l.sound == sound) {
+                Some(lane) => lane.hits.push(hit.start_s),
+                None => percussion_lanes.push(PercussionLane { sound, hits: vec![hit.start_s] }),
+            }
+        }
+        for lane in &mut percussion_lanes {
+            lane.hits.sort_by(f64::total_cmp);
+        }
+    }
+
+    if voices.is_empty() && percussion_lanes.is_empty() {
         return Err("this MIDI has no in-range notes to play (every note is outside the emitter's pitch range)".to_string());
     }
 
@@ -143,9 +167,10 @@ pub fn schedule(instruments: &[InstrumentNotes], opts: &MidiOptions) -> Result<M
         .iter()
         .flat_map(|v| v.notes.iter())
         .map(|n| n.end_s)
+        .chain(percussion_lanes.iter().flat_map(|l| l.hits.iter().copied()))
         .fold(0.0f64, f64::max);
 
-    Ok(MidiScore { voices, duration_s })
+    Ok(MidiScore { voices, percussion_lanes, duration_s })
 }
 
 #[cfg(test)]
@@ -158,7 +183,7 @@ mod tests {
         NoteEvent { start_s, end_s, note, velocity }
     }
     fn inst(label: &str, channel: u8, notes: Vec<NoteEvent>) -> InstrumentNotes {
-        InstrumentNotes { label: label.to_string(), track: 0, channel, notes }
+        InstrumentNotes { label: label.to_string(), track: 0, channel, program: None, notes }
     }
     fn opts(cap: usize) -> MidiOptions {
         MidiOptions { polyphony_cap: cap, ..MidiOptions::default() }
@@ -182,14 +207,14 @@ mod tests {
     #[test]
     fn a_three_note_chord_gets_three_speakers() {
         let i = inst("chord", 0, vec![note(0.0, 1.0, 60, 100), note(0.0, 1.0, 64, 100), note(0.0, 1.0, 67, 100)]);
-        let s = schedule(&[i], &opts(8)).expect("schedule");
+        let s = schedule(&[i], &[], &opts(8)).expect("schedule");
         assert_eq!(s.voices.len(), 3, "one speaker per simultaneous note");
     }
 
     #[test]
     fn a_monophonic_line_gets_one_speaker_with_all_its_notes() {
         let i = inst("mono", 0, vec![note(0.0, 0.5, 60, 100), note(0.5, 1.0, 62, 100), note(1.0, 1.5, 64, 100)]);
-        let s = schedule(&[i], &opts(8)).expect("schedule");
+        let s = schedule(&[i], &[], &opts(8)).expect("schedule");
         assert_eq!(s.voices.len(), 1, "sequential notes share one speaker");
         assert_eq!(s.voices[0].notes.len(), 3, "and it holds all three");
         assert!((s.duration_s - 1.5).abs() < 1e-9);
@@ -198,19 +223,19 @@ mod tests {
     #[test]
     fn a_chord_past_the_cap_steals_and_stays_within_the_cap() {
         let i = inst("big", 0, (0..6).map(|k| note(0.0, 1.0, 60 + k, 100)).collect());
-        let s = schedule(&[i], &opts(3)).expect("schedule");
+        let s = schedule(&[i], &[], &opts(3)).expect("schedule");
         assert_eq!(s.voices.len(), 3, "capped at 3 speakers");
     }
 
     #[test]
     fn velocity_and_gain_set_the_note_volume() {
         let i = inst("v", 0, vec![note(0.0, 1.0, 69, 127)]);
-        let s = schedule(&[i], &MidiOptions { gain: 1.0, ..opts(8) }).expect("schedule");
+        let s = schedule(&[i], &[], &MidiOptions { gain: 1.0, ..opts(8) }).expect("schedule");
         let span = s.voices[0].notes[0];
         assert!((span.volume - 1.0).abs() < 1e-9, "full velocity at gain 1 is 1.0");
         assert!((span.pitch - 1.0).abs() < 1e-9, "note 69 is pitch 1.0");
         // Gain above 1 clamps.
-        let s2 = schedule(&[inst("v", 0, vec![note(0.0, 1.0, 69, 127)])], &MidiOptions { gain: 4.0, ..opts(8) }).expect("schedule");
+        let s2 = schedule(&[inst("v", 0, vec![note(0.0, 1.0, 69, 127)])], &[], &MidiOptions { gain: 4.0, ..opts(8) }).expect("schedule");
         assert_eq!(s2.voices[0].notes[0].volume, 1.0, "volume never exceeds 1.0");
     }
 
@@ -223,7 +248,7 @@ mod tests {
             instrument_volumes: vec![0.5, 1.0],
             ..opts(8)
         };
-        let s = schedule(&[a, b], &o).expect("schedule");
+        let s = schedule(&[a, b], &[], &o).expect("schedule");
         assert!((s.voices[0].notes[0].volume - 0.5).abs() < 1e-9, "instrument 0 halved");
         assert!((s.voices[1].notes[0].volume - 1.0).abs() < 1e-9, "instrument 1 untouched");
     }
@@ -232,7 +257,7 @@ mod tests {
     fn a_missing_per_instrument_volume_defaults_to_full() {
         // Empty list (the CLI case): every instrument plays at 1.0.
         let i = inst("x", 0, vec![note(0.0, 1.0, 69, 127)]);
-        let s = schedule(&[i], &MidiOptions { gain: 1.0, ..opts(8) }).expect("schedule");
+        let s = schedule(&[i], &[], &MidiOptions { gain: 1.0, ..opts(8) }).expect("schedule");
         assert!((s.voices[0].notes[0].volume - 1.0).abs() < 1e-9);
     }
 
@@ -244,7 +269,7 @@ mod tests {
             tones: ToneAssignment::PerInstrument(vec![SynthWave::Square, SynthWave::Sawtooth]),
             ..opts(8)
         };
-        let s = schedule(&[a, b], &o).expect("schedule");
+        let s = schedule(&[a, b], &[], &o).expect("schedule");
         assert_eq!(s.voices[0].synth, SynthWave::Square);
         assert_eq!(s.voices[1].synth, SynthWave::Sawtooth);
     }
@@ -252,8 +277,8 @@ mod tests {
     #[test]
     fn scheduling_is_deterministic() {
         let mk = || inst("d", 0, vec![note(0.0, 1.0, 60, 100), note(0.2, 0.8, 64, 90)]);
-        let a = schedule(&[mk()], &opts(8)).expect("a");
-        let b = schedule(&[mk()], &opts(8)).expect("b");
+        let a = schedule(&[mk()], &[], &opts(8)).expect("a");
+        let b = schedule(&[mk()], &[], &opts(8)).expect("b");
         assert_eq!(a.voices.len(), b.voices.len());
         for (x, y) in a.voices.iter().zip(&b.voices) {
             assert_eq!(x.notes, y.notes);
@@ -263,7 +288,46 @@ mod tests {
     #[test]
     fn a_bad_gain_is_refused_by_name() {
         let i = inst("x", 0, vec![note(0.0, 1.0, 60, 100)]);
-        let err = schedule(&[i], &MidiOptions { gain: -1.0, ..opts(8) }).unwrap_err();
+        let err = schedule(&[i], &[], &MidiOptions { gain: -1.0, ..opts(8) }).unwrap_err();
         assert!(err.contains("gain"), "got: {err}");
+    }
+
+    #[test]
+    fn percussion_groups_into_one_lane_per_folded_sound() {
+        use crate::audio::percussion::KICK_1;
+        use crate::midi::PercussionHit;
+        let h = |start_s: f64, note: u8| PercussionHit { start_s, note, velocity: 100 };
+        // Two kicks (36), one snare (38), one closed hat (42) -> three sounds.
+        let perc = vec![h(0.0, 36), h(1.0, 38), h(0.5, 36), h(0.25, 42)];
+
+        let s = schedule(&[], &perc, &opts(8)).expect("drum-only schedules");
+        assert_eq!(s.percussion_lanes.len(), 3, "one lane per distinct sound");
+
+        let kick = s.percussion_lanes.iter().find(|l| l.sound == KICK_1).unwrap();
+        assert_eq!(kick.hits, vec![0.0, 0.5], "both kick strikes, sorted");
+        assert!((s.duration_s - 1.0).abs() < 1e-9, "duration spans the last strike");
+    }
+
+    #[test]
+    fn a_drum_only_score_has_no_voices_but_has_lanes() {
+        use crate::midi::PercussionHit;
+        let s = schedule(&[], &[PercussionHit { start_s: 0.0, note: 42, velocity: 100 }], &opts(8))
+            .expect("drum-only must schedule");
+        assert!(s.voices.is_empty());
+        assert_eq!(s.percussion_lanes.len(), 1);
+    }
+
+    #[test]
+    fn a_drum_kit_override_changes_the_built_lane_sound() {
+        use crate::audio::percussion::{KICK_1, PALETTE_ROLES};
+        use crate::midi::PercussionHit;
+        // Remap the closed-hat role (note 42) to the kick sound, as the GUI would.
+        let mut kit: Vec<_> = PALETTE_ROLES.iter().map(|r| r.sound).collect();
+        kit[drums::role_index(42)] = KICK_1;
+        let opts = MidiOptions { drum_kit: kit, ..opts(8) };
+
+        let s = schedule(&[], &[PercussionHit { start_s: 0.0, note: 42, velocity: 100 }], &opts)
+            .expect("schedule");
+        assert_eq!(s.percussion_lanes[0].sound, KICK_1, "override reaches the lane");
     }
 }

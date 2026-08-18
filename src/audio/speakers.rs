@@ -823,7 +823,7 @@ pub fn build_midi_event_world(
     const COMPARE_LESS: &str = "BrickComponentType_WireGraph_Expr_CompareLess";
     use crate::anim::clock::MODULO;
 
-    if score.voices.is_empty() {
+    if score.voices.is_empty() && score.percussion_lanes.is_empty() {
         return Err(
             "this MIDI produced no speakers -- every note was outside the playable range"
                 .to_string(),
@@ -1042,6 +1042,91 @@ pub fn build_midi_event_world(
         world.add_wire_connection(pitch, WirePort::new(speaker_ids[v], AUDIO_EMITTER, "PitchMultiplier"));
         let vol_target = volume_multiply(&mut world, &mut sc.chip, v, speaker_ids[v], &sc.master_volume, -4);
         world.add_wire_connection(WirePort::new(vol_gated, SELECT, "Output"), vol_target);
+    }
+
+    // --- 3b. Percussion lanes ------------------------------------------------
+    // Each lane is one oneshot emitter driven by its own playhead: a `Var`
+    // index steps through the strike times, and on each advance its incrementing
+    // value fires the emitter's `Play` exec (any increment triggers the sample).
+    // Same reset/advance shape as the melodic playhead, but the compare is
+    // "time reached the strike" and the trigger is the index itself, not a
+    // pitch/volume gate. Rows continue below the last voice's.
+    let perc_base_row = SHARED_ROW - 1 - n_speakers as i32;
+    // Emitters sit in a compact near-square block just past the speaker
+    // cluster's far +y edge, sharing its x range -- beside the array, not a row.
+    let (_, sp_ny, _) = cluster_dims(n_speakers.max(1));
+    let ph = speaker_half();
+    let perc_cols = ((score.percussion_lanes.len() as f64).sqrt().ceil() as i32).max(1);
+    let perc_y0 = sp_ny as i32 * ph.y * 2 + ph.y * 2;
+    for (l, lane) in score.percussion_lanes.iter().enumerate() {
+        let (ix, iy) = (l as i32 % perc_cols, l as i32 / perc_cols);
+        let emitter = crate::audio::percussion::add_oneshot_emitter(
+            &mut world,
+            &lane.sound,
+            Position { x: ph.x + ix * ph.x * 2, y: perc_y0 + ph.y + iy * ph.y * 2, z: 6 },
+        );
+
+        let row = perc_base_row - l as i32;
+        let mut col = 0i32;
+        let mut vpos = || {
+            let p = service(col, row);
+            col += 1;
+            p
+        };
+
+        // Strike times, and the playhead index into them (starts 0).
+        let hits_arr = gate(&mut sc.chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, vpos(), vec![(
+            "Value",
+            Box::new(WireArrayVariant::DoubleArray(lane.hits.clone())) as Box<dyn AsBrdbValue>,
+        )]);
+        let idx_var = gate(&mut sc.chip, "B_1x1_Gate_Variable", VAR, vpos(), vec![(
+            "Value",
+            Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
+        )]);
+        let detector = gate(&mut sc.chip, "B_1x1_Gate_Expr_ChangeDetectorExec", CHANGE_DETECTOR, vpos(), vec![]);
+        world.add_wire_connection(play_time.clone(), WirePort::new(detector, CHANGE_DETECTOR, "Input"));
+
+        // Read the current strike time (bOutOfBounds once the index passes the end).
+        let get = gate(&mut sc.chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, vpos(), vec![]);
+        world.add_wire_connection(WirePort::new(hits_arr, ARRAY_VAR, "ArrayVarRef"), WirePort::new(get, ARRAY_GET, "ArrayVarRef"));
+        world.add_wire_connection(WirePort::new(idx_var, VAR, "Value"), WirePort::new(get, ARRAY_GET, "Index"));
+        world.add_wire_connection(WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"), WirePort::new(get, ARRAY_GET, "Exec"));
+
+        // Reset first: if playback time jumped backward (a loop wrap), index = 0.
+        // Setting it to 0 does not fire Play (0 is not non-zero).
+        let br_reset = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
+        world.add_wire_connection(WirePort::new(decreased, COMPARE_LESS, "bOutput"), WirePort::new(br_reset, BRANCH, "bCond"));
+        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "ExecOut"), WirePort::new(br_reset, BRANCH, "Exec"));
+        let var_set = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, vpos(), vec![(
+            "Value",
+            Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
+        )]);
+        world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(var_set, VAR_SET, "VarRef"));
+        world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutA"), WirePort::new(var_set, VAR_SET, "Exec"));
+
+        // Advance: on the no-reset exec, if playback time has reached the strike
+        // and the index is in bounds, increment it -- which fires the oneshot.
+        let reached = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE, vpos(), vec![]);
+        world.add_wire_connection(play_time.clone(), WirePort::new(reached, COMPARE_GE, "InputA"));
+        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "Value"), WirePort::new(reached, COMPARE_GE, "InputB"));
+        let br_reached = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
+        world.add_wire_connection(WirePort::new(reached, COMPARE_GE, "bOutput"), WirePort::new(br_reached, BRANCH, "bCond"));
+        world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutB"), WirePort::new(br_reached, BRANCH, "Exec"));
+        let br_oob = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
+        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "bOutOfBounds"), WirePort::new(br_oob, BRANCH, "bCond"));
+        world.add_wire_connection(WirePort::new(br_reached, BRANCH, "ExecOutA"), WirePort::new(br_oob, BRANCH, "Exec"));
+        let inc = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, vpos(), vec![(
+            "Value",
+            Box::new(WireVariant::Int(1)) as Box<dyn AsBrdbValue>,
+        )]);
+        world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(inc, VAR_INCREMENT, "VarRef"));
+        world.add_wire_connection(WirePort::new(br_oob, BRANCH, "ExecOutB"), WirePort::new(inc, VAR_INCREMENT, "Exec"));
+
+        // The incrementing index fires the oneshot: one strike per advance.
+        world.add_wire_connection(
+            WirePort::new(idx_var, VAR, "Value"),
+            WirePort::new(emitter, crate::audio::percussion::ONESHOT_EMITTER, crate::audio::percussion::PLAY_PORT),
+        );
     }
 
     // --- 4. Control buttons --------------------------------------------------
@@ -1594,6 +1679,7 @@ mod tests {
             voices: (0..voices)
                 .map(|i| SpeakerVoice { notes: notes.clone(), synth: SynthWave::Sine, instrument_idx: i })
                 .collect(),
+            percussion_lanes: vec![],
             duration_s: 1.0,
         }
     }

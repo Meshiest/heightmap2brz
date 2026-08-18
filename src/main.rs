@@ -135,10 +135,11 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg audiomaxdist: --("max-distance") +takes_value "Audio: speaker audible range in units (default 400; 10 units = 1 brick). Raise it (e.g. 4000) to be heard across a big build")
         (@arg audiospeakersinchip: --("speakers-in-chip") "Audio: place the speaker cluster INSIDE the microchip's own inner grid instead of beside it on the main grid, so the whole audio device is one portable microchip. The speakers play from the chip's ORIGIN regardless of their inner-grid layout (an AudioEmitter on a microchip inner grid emits from the chip's world position), so the layout is physical placement only, not spatial audio. Default off (speakers beside the chip)")
         (@arg audiosynth: --synth +takes_value "Audio: the synth waveform every TONAL band plays through -- sine (default), square, triangle or sawtooth. Applies to tonal bands in BOTH modes; white/pink --noise-bands keep their own noise assets and are unaffected. Default sine renders exactly as before this flag existed")
-        (@arg midi: --midi "MIDI (midi2brick): read the input as a Standard MIDI File and build an EVENT-BASED speaker world -- each track's notes are stored as spans and played by a runtime playhead. The input is the .mid; -o is the .brz. Lite: one --synth tone for the whole file (per-track tones are a GUI feature). Reuses --inner-radius, --max-distance, --gain, --no-loop, --no-control-buttons, --speakers-in-chip and --polyphony-cap")
+        (@arg midi: --midi "MIDI (midi2brick): read the input as a Standard MIDI File and build an EVENT-BASED speaker world -- each track's notes are stored as spans and played by a runtime playhead. The input is the .mid; -o is the .brz. Tones: a waveform is picked per instrument from its General MIDI program (bass/electric guitar sawtooth, lead square, piano/vocals sine, ...); --synth forces one wave for the whole file. Per-track manual tones are a GUI feature. Reuses --inner-radius, --max-distance, --gain, --no-loop, --no-control-buttons, --speakers-in-chip and --polyphony-cap")
         (@arg midilist: --("midi-list") "MIDI: with --midi, print the discovered instruments (name, channel, note count, max polyphony) and the file's format/duration/tempo, then exit without building")
         (@arg midipolyphony: --("polyphony-cap") +takes_value "MIDI: maximum speakers per instrument, however many notes it plays at once (default 8). A busier instrument steals its oldest sounding note")
         (@arg midirate: --("playback-rate") +takes_value "MIDI: playback speed multiplier baked into the clock (default 1.0; 2.0 = double speed, 0.5 = half). The generated Rate pin still overrides it at runtime")
+        (@arg nopercussion: --("no-percussion") "MIDI: skip the percussion channel (10). By default each drum note plays a oneshot sample, mapped from its General MIDI drum note through a fold table; this builds only the pitched instruments")
         (@arg animmode: --("anim-mode") +takes_value "Animation output mode (brick, text). 'brick' builds one display brick per pixel, driven by the encoding --anim-encoding selects. 'text' builds one animated Component_TextDisplay per BAND of image rows instead -- roughly two orders of magnitude fewer gates (a 192x108 clip is 113 gates against 4613), at the cost of glyph-grid rendering rather than real bricks. Text mode reuses --font, --char-repeat, --fill-char, --empty-char, --alpha-threshold and --line-height-world, and adds --colors")
         (@arg animcolors: --("colors") +takes_value "Text mode: quantize to at most N colours with a median-cut palette (default 0 = full 24-bit colour). Fewer colours means longer same-colour runs and a smaller save; useful values are 16 to 64")
         (@arg animencoding: --("anim-encoding") +takes_value "Animation pixel encoding (hex, color-array; default hex). 'hex' packs each frame into a shared RRGGBB string per chunk; 'color-array' gives each pixel its own colour array -- fewer gate evaluations and no string work, at the cost of more host RAM to build")
@@ -732,16 +733,19 @@ fn run_midi(matches: &clap::ArgMatches, heightmap_files: &[PathBuf], out_file: &
     info!("Done!");
 }
 
-/// Build [`MidiOptions`] from the CLI flags. The tone is a single `--synth`
-/// applied to every instrument (a `ToneAssignment::Uniform`); per-track tones
-/// are a GUI feature. Spatialization/playback flags are shared with the audio
-/// path by name.
+/// Build [`MidiOptions`] from the CLI flags. The tone defaults to an automatic
+/// per-instrument pick from each track's GM program ([`ToneAssignment::Auto`]);
+/// `--synth` forces one wave for the whole file. Per-track manual tones are a
+/// GUI feature. Spatialization/playback flags are shared with the audio path by
+/// name.
 #[cfg(not(target_arch = "wasm32"))]
 fn midi_options(matches: &clap::ArgMatches) -> Result<MidiOptions, String> {
     let d = MidiOptions::default();
-    let tone = match matches.value_of("audiosynth") {
-        Some(s) => SynthWave::parse(s)?,
-        None => SynthWave::Sine,
+    // Default: pick a waveform per instrument from its GM program. `--synth`
+    // forces one wave for the whole file, as before.
+    let tones = match matches.value_of("audiosynth") {
+        Some(s) => ToneAssignment::Uniform(SynthWave::parse(s)?),
+        None => ToneAssignment::Auto,
     };
     Ok(MidiOptions {
         inner_radius: parse_arg(matches, "audioinner", "--inner-radius", "a number", d.inner_radius)?,
@@ -762,7 +766,9 @@ fn midi_options(matches: &clap::ArgMatches) -> Result<MidiOptions, String> {
         instrument_volumes: Vec::new(),
         playback_rate: parse_arg(matches, "midirate", "--playback-rate", "a number", d.playback_rate)?,
         preview_seconds: d.preview_seconds,
-        tones: ToneAssignment::Uniform(tone),
+        tones,
+        build_percussion: !matches.is_present("nopercussion"),
+        drum_kit: Vec::new(),
     })
 }
 
@@ -777,7 +783,7 @@ fn print_midi_info(instruments: &[heightmap::midi::Instrument], summary: &height
         summary.duration_s,
         summary.initial_bpm,
         summary.total_notes,
-        if summary.has_percussion { " (has percussion, not built)" } else { "" }
+        if summary.has_percussion { " (has percussion)" } else { "" }
     );
     info!("{} instrument(s):", instruments.len());
     for (i, inst) in instruments.iter().enumerate() {

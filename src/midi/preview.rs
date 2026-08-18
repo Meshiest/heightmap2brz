@@ -129,6 +129,7 @@ mod tests {
                 synth,
                 instrument_idx: 0,
             }],
+            percussion_lanes: vec![],
             duration_s: dur,
         }
     }
@@ -161,6 +162,7 @@ mod tests {
                 synth: SynthWave::Sine,
                 instrument_idx: 0,
             }],
+            percussion_lanes: vec![],
             duration_s: 1.0,
         };
         let sr = 10_000u32;

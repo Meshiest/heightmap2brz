@@ -25,9 +25,11 @@
 //! in game via the playhead probe.
 use crate::audio::track::SynthWave;
 
+pub mod drums;
 pub mod parse;
 pub mod preview;
 pub mod schedule;
+pub mod timbre;
 
 /// One note, with its start and end already resolved to absolute seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,6 +42,21 @@ pub struct NoteEvent {
     pub velocity: u8,
 }
 
+/// One percussion strike, from the percussion channel (10 / index 9).
+///
+/// A drum note has no pitch and no duration that matters: the note number
+/// selects a SOUND, and a oneshot sample plays to its own end. Only the strike
+/// time and velocity survive; the sound is resolved later through the drum
+/// fold table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PercussionHit {
+    pub start_s: f64,
+    /// General MIDI percussion note (35..=81 for the standard kit).
+    pub note: u8,
+    /// MIDI velocity, 1..=127.
+    pub velocity: u8,
+}
+
 /// A discovered instrument -- one `(track, channel)` pair that carries notes,
 /// as shown in the GUI table and the CLI `--list`.
 #[derive(Clone, Debug, PartialEq)]
@@ -49,6 +66,9 @@ pub struct Instrument {
     pub label: String,
     pub track: usize,
     pub channel: u8,
+    /// The channel's General MIDI program, if it set one -- the timbre the
+    /// automatic waveform pick reads.
+    pub program: Option<u8>,
     /// Notes whose pitch lands inside the emitter's playable range.
     pub note_count: usize,
     /// The most notes sounding at once (over the in-range notes) -- the number
@@ -71,7 +91,7 @@ pub struct MidiSummary {
     /// Total NoteOn events across every channel, percussion included.
     pub total_notes: usize,
     /// Whether the file has any note on the percussion channel (channel 10,
-    /// index 9), which v1 does not build. Recorded for a future one-shot mode.
+    /// index 9). Built as oneshot drum emitters unless `--no-percussion`.
     pub has_percussion: bool,
 }
 
@@ -82,6 +102,10 @@ pub struct MidiSummary {
 /// falls back to [`SynthWave::Sine`] so a lookup always has an answer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToneAssignment {
+    /// Pick a waveform per instrument from its GM program ([`timbre`]). Resolved
+    /// into [`PerInstrument`](Self::PerInstrument) by [`Self::resolved`] in
+    /// `analyze_midi`, where the programs are known. The CLI's default.
+    Auto,
     Uniform(SynthWave),
     PerInstrument(Vec<SynthWave>),
 }
@@ -96,8 +120,25 @@ impl ToneAssignment {
     /// The synth for instrument `idx`.
     pub fn synth_for(&self, idx: usize) -> SynthWave {
         match self {
+            // Resolved away before the build; the fallback keeps this total.
+            ToneAssignment::Auto => SynthWave::Sine,
             ToneAssignment::Uniform(w) => *w,
             ToneAssignment::PerInstrument(v) => v.get(idx).copied().unwrap_or(SynthWave::Sine),
+        }
+    }
+
+    /// Resolve [`Auto`](Self::Auto) into a concrete per-instrument list using
+    /// each instrument's GM program (a program of `None` defaults to 0, GM's
+    /// Acoustic Grand Piano). Every other variant passes through unchanged.
+    pub fn resolved(&self, programs: &[Option<u8>]) -> ToneAssignment {
+        match self {
+            ToneAssignment::Auto => ToneAssignment::PerInstrument(
+                programs
+                    .iter()
+                    .map(|p| timbre::synth_for_program(p.unwrap_or(0)))
+                    .collect(),
+            ),
+            other => other.clone(),
         }
     }
 }
@@ -138,6 +179,13 @@ pub struct MidiOptions {
     pub preview_seconds: f32,
     /// Which tone each instrument sounds through.
     pub tones: ToneAssignment,
+    /// Build the percussion channel (10) as oneshot drum emitters. Default
+    /// true; the CLI `--no-percussion` clears it.
+    pub build_percussion: bool,
+    /// Per-role drum-sound override, indexed like
+    /// [`crate::audio::percussion::PALETTE_ROLES`]. Empty (the default and the
+    /// CLI) uses the baked fold table; the GUI's drum-kit dropdowns fill it.
+    pub drum_kit: Vec<crate::audio::percussion::OneShotSound>,
 }
 
 impl Default for MidiOptions {
@@ -155,6 +203,8 @@ impl Default for MidiOptions {
             polyphony_cap: 8,
             preview_seconds: 0.0,
             tones: ToneAssignment::default(),
+            build_percussion: true,
+            drum_kit: Vec::new(),
         }
     }
 }
@@ -179,11 +229,23 @@ pub struct SpeakerVoice {
     pub instrument_idx: usize,
 }
 
-/// The scheduled result: one voice per built speaker, plus the piece's length
-/// (for the looping modulo and the preview).
+/// One percussion voice: a single oneshot sound and the times it is struck.
+///
+/// Every drum note that the fold table resolves to the same sound shares one
+/// lane -- one emitter, one playhead pulsing its `Play` per strike.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PercussionLane {
+    pub sound: crate::audio::percussion::OneShotSound,
+    /// Strike times in seconds, sorted ascending.
+    pub hits: Vec<f64>,
+}
+
+/// The scheduled result: one voice per built speaker, one lane per distinct
+/// drum sound, plus the piece's length (for the looping modulo and the preview).
 #[derive(Clone, Debug)]
 pub struct MidiScore {
     pub voices: Vec<SpeakerVoice>,
+    pub percussion_lanes: Vec<PercussionLane>,
     pub duration_s: f64,
 }
 
@@ -201,9 +263,15 @@ pub fn discover(bytes: &[u8]) -> Result<(Vec<Instrument>, MidiSummary), String> 
 }
 
 /// Parse and schedule `bytes` into per-speaker note lists ready for the builder.
+///
+/// [`ToneAssignment::Auto`] is resolved here, where each instrument's GM program
+/// is known, into a concrete per-instrument waveform list.
 pub fn analyze_midi(bytes: &[u8], opts: &MidiOptions) -> Result<MidiScore, String> {
     let parsed = parse::parse(bytes)?;
-    schedule::schedule(&parsed.instruments, opts)
+    let programs: Vec<Option<u8>> = parsed.instruments.iter().map(|i| i.program).collect();
+    let mut opts = opts.clone();
+    opts.tones = opts.tones.resolved(&programs);
+    schedule::schedule(&parsed.instruments, &parsed.percussion, &opts)
 }
 
 #[cfg(test)]
@@ -229,6 +297,28 @@ mod tests {
     #[test]
     fn the_default_tone_is_uniform_sine() {
         assert_eq!(ToneAssignment::default(), ToneAssignment::Uniform(SynthWave::Sine));
+    }
+
+    #[test]
+    fn auto_resolves_each_instrument_from_its_program() {
+        // Violin (strings), Flute (pipe), and a channel with no program change.
+        let programs = vec![Some(40u8), Some(73), None];
+        assert_eq!(
+            ToneAssignment::Auto.resolved(&programs),
+            ToneAssignment::PerInstrument(vec![
+                SynthWave::Sawtooth, // strings
+                SynthWave::Sine,     // flute
+                SynthWave::Sine,     // no program -> GM piano default -> sine
+            ])
+        );
+    }
+
+    #[test]
+    fn resolving_a_non_auto_tone_leaves_it_unchanged() {
+        let t = ToneAssignment::Uniform(SynthWave::Square);
+        assert_eq!(t.resolved(&[Some(40), None]), t);
+        let per = ToneAssignment::PerInstrument(vec![SynthWave::Triangle]);
+        assert_eq!(per.resolved(&[Some(99)]), per);
     }
 
     #[test]
