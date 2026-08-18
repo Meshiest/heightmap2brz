@@ -194,6 +194,26 @@ const GUESS_COLOR: Color = Color { r: 235, g: 170, b: 60 };
 /// down the row. Generous so no two bricks overlap whatever their footprints.
 const CELL_GAP: i32 = 30;
 
+/// Build the audition palette from a per-role sound kit (indexed like
+/// [`PALETTE_ROLES`]).
+///
+/// Each role keeps its label and note but plays the kit's sound, so the prefab
+/// auditions exactly the sounds currently selected (the GUI's edited drum kit).
+/// A short kit falls back to each role's default sound.
+pub fn palette_from_kit(kit: &[OneShotSound]) -> World {
+    let roles: Vec<PaletteRole> = PALETTE_ROLES
+        .iter()
+        .enumerate()
+        .map(|(i, r)| PaletteRole {
+            label: r.label,
+            gm_note: r.gm_note,
+            approved: true,
+            sound: kit.get(i).copied().unwrap_or(r.sound),
+        })
+        .collect();
+    build_drum_palette(&roles)
+}
+
 /// Build the audition palette: one row cell per role, each a labelled `B_Button`
 /// wired to its own oneshot emitter.
 ///

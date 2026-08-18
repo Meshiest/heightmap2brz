@@ -16,6 +16,7 @@
 //! targets (rodio on desktop, Web Audio in the browser).
 use crate::{
     audio::{
+        oneshot_sounds::ONESHOT_SOUNDS,
         percussion::{OneShotSound, PALETTE_ROLES},
         speakers::build_midi_event_world,
         track::SynthWave,
@@ -68,10 +69,13 @@ pub struct MidiApp {
     selected: Vec<bool>,
     /// The tone the bulk control assigns to all / selected rows.
     bulk_tone: SynthWave,
-    /// The sound each drum role plays, one per [`PALETTE_ROLES`] entry (not
-    /// per file -- the kit is global). Editable via the drum-kit dropdowns and
-    /// fed to [`MidiOptions::drum_kit`]. Starts at each role's tuned default.
+    /// The sound each drum role plays, one per [`PALETTE_ROLES`] entry (the kit
+    /// is global, not per file). Editable via the drum-kit dropdowns and fed to
+    /// [`MidiOptions::drum_kit`]. Starts at each role's tuned default.
     drum_kit: Vec<OneShotSound>,
+    /// Text filter for the drum-kit Sound dropdowns, shared across rows (only
+    /// one popup is open at a time). Narrows the 347-sound catalog.
+    drum_sound_filter: String,
     /// Every numeric/toggle setting, in the pipeline's own struct. Its own
     /// `tones` field is unused -- [`Self::midi_opts`] overrides it from `tones`.
     opts: MidiOptions,
@@ -115,6 +119,7 @@ impl Default for MidiApp {
             selected: Vec::new(),
             bulk_tone: SynthWave::Sine,
             drum_kit: PALETTE_ROLES.iter().map(|r| r.sound).collect(),
+            drum_sound_filter: String::new(),
             opts: MidiOptions::default(),
             pending_generate: None,
             pending_preview: None,
@@ -226,7 +231,7 @@ impl MidiApp {
         t.row_hover(
             ui,
             "Gain",
-            Some("Multiplier on each note's velocity-derived volume, applied and then CLAMPED at 1.0 -- a way to make a render quieter, never louder."),
+            Some("Multiplier on each note's velocity-derived volume, applied and then CLAMPED at 1.0. A way to make a render quieter, never louder."),
             |ui| {
                 widgets::slider(ui, egui::Slider::new(&mut self.opts.gain, 0.0..=1.0));
             },
@@ -312,8 +317,9 @@ impl MidiApp {
     fn draw_percussion_accordion(&mut self, ui: &mut Ui) {
         use egui_extras::{Column, TableBuilder};
         let enabled = self.opts.build_percussion;
+        let pad = widgets::CELL_PAD;
         ui.add_enabled_ui(enabled, |ui| {
-            egui::CollapsingHeader::new(format!("Drum kit -- {} sounds", PALETTE_ROLES.len()))
+            egui::CollapsingHeader::new(format!("Drum kit ({} sounds)", PALETTE_ROLES.len()))
                 .id_salt("percussion_kit")
                 .default_open(false)
                 .show(ui, |ui| {
@@ -331,7 +337,11 @@ impl MidiApp {
                             .column(Column::auto().at_least(56.0)) // pitch
                             .column(Column::auto().at_least(44.0)) // vol
                             .header(20.0, |mut header| {
-                                for s in ["Role", "Note", "Sound", "Pitch", "Vol"] {
+                                header.col(|ui| {
+                                    ui.add_space(pad);
+                                    ui.strong("Role");
+                                });
+                                for s in ["Note", "Sound", "Pitch", "Vol"] {
                                     header.col(|ui| {
                                         ui.strong(s);
                                     });
@@ -341,41 +351,116 @@ impl MidiApp {
                                 for (r, role) in PALETTE_ROLES.iter().enumerate() {
                                     body.row(30.0, |mut tr| {
                                         tr.col(|ui| {
+                                            ui.add_space(pad);
                                             ui.label(role.label);
                                         });
                                         tr.col(|ui| {
                                             ui.label(role.gm_note.to_string());
                                         });
                                         tr.col(|ui| {
-                                            // Selected label: the role whose sound this row plays.
-                                            let cur = self.drum_kit[r];
-                                            let cur_label = PALETTE_ROLES
-                                                .iter()
-                                                .find(|o| o.sound == cur)
-                                                .map_or(cur.asset, |o| o.label);
-                                            widgets::combo(ui, ("drum_kit", r), cur_label, 150.0, |ui| {
-                                                for opt in PALETTE_ROLES {
-                                                    widgets::combo_item(
-                                                        ui,
-                                                        &mut self.drum_kit[r],
-                                                        opt.sound,
-                                                        opt.label,
+                                            // Pick any oneshot audio sound. The
+                                            // catalog is long, so the popup opens
+                                            // with a text filter over the names.
+                                            let selected = self.drum_kit[r].asset;
+                                            egui::ComboBox::from_id_salt(("drum_sound", r))
+                                                .selected_text(selected)
+                                                .width(ui.available_width().max(150.0))
+                                                .show_ui(ui, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(
+                                                            &mut self.drum_sound_filter,
+                                                        )
+                                                        .hint_text("filter sounds")
+                                                        .desired_width(f32::INFINITY),
                                                     );
-                                                }
-                                            });
+                                                    let filter =
+                                                        self.drum_sound_filter.to_ascii_lowercase();
+                                                    egui::ScrollArea::vertical()
+                                                        .max_height(220.0)
+                                                        .show(ui, |ui| {
+                                                            for &name in ONESHOT_SOUNDS {
+                                                                if !filter.is_empty()
+                                                                    && !name
+                                                                        .to_ascii_lowercase()
+                                                                        .contains(&filter)
+                                                                {
+                                                                    continue;
+                                                                }
+                                                                if ui
+                                                                    .selectable_label(
+                                                                        self.drum_kit[r].asset == name,
+                                                                        name,
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    self.drum_kit[r].asset = name;
+                                                                }
+                                                            }
+                                                        });
+                                                });
                                         });
                                         tr.col(|ui| {
-                                            ui.label(format!("{:.2}", self.drum_kit[r].pitch));
+                                            ui.add(
+                                                egui::DragValue::new(&mut self.drum_kit[r].pitch)
+                                                    .speed(0.01)
+                                                    .range(0.05..=4.0)
+                                                    .max_decimals(2),
+                                            );
                                         });
                                         tr.col(|ui| {
-                                            ui.label(format!("{:.1}", self.drum_kit[r].volume));
+                                            ui.add(
+                                                egui::DragValue::new(&mut self.drum_kit[r].volume)
+                                                    .speed(0.05)
+                                                    .range(0.0..=4.0)
+                                                    .max_decimals(2),
+                                            );
                                         });
                                     });
                                 }
                             });
                     });
+                    ui.add_space(4.0);
+                    if widgets::neutral(ui, "Generate audition palette")
+                        .on_hover_text(
+                            "Write a .brz prefab of the current kit, one button per sound, to \
+                             audition and tune in game",
+                        )
+                        .clicked()
+                    {
+                        self.save_drum_palette();
+                    }
                 });
         });
+    }
+
+    /// Build the audition palette from the current drum kit and save it as a
+    /// `.brz` prefab. Native picks a path through a file dialog and writes it;
+    /// the web build downloads `drum_palette.brz`. Both go through
+    /// [`deliver_world`], the same path the MIDI output uses.
+    fn save_drum_palette(&self) {
+        let mut world = crate::audio::percussion::palette_from_kit(&self.drum_kit);
+        world.make_prefab();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let out_file = match rfd::FileDialog::new()
+            .add_filter("Brickadia prefab", &["brz"])
+            .set_file_name("drum_palette.brz")
+            .save_file()
+        {
+            Some(path) => path.to_string_lossy().into_owned(),
+            None => return, // dialog cancelled
+        };
+        // The browser has no path picker: the name is the download's file name.
+        #[cfg(target_arch = "wasm32")]
+        let out_file = "drum_palette.brz".to_string();
+
+        // Copy the saved file to the clipboard on desktop, so it can be pasted
+        // straight into a build. `deliver_world` ignores the flag on the web,
+        // where it downloads instead.
+        match deliver_world(&world, &out_file, true) {
+            Ok(()) => info!("Audition palette written to {out_file}"),
+            Err(e) => error!("audition palette save failed: {e}"),
+        }
     }
 
     fn draw_input(&mut self, ui: &mut Ui) {
@@ -430,14 +515,14 @@ impl MidiApp {
         let s = &input.summary;
         ui.add_space(4.0);
         ui.label(format!(
-            "Format {} -- {} track(s), {:.1}s, {:.0} bpm, {} note(s){}",
+            "Format {}, {} track(s), {:.1}s, {:.0} bpm, {} note(s){}",
             s.format,
             s.track_count,
             s.duration_s,
             s.initial_bpm,
             s.total_notes,
             if s.has_percussion {
-                " -- has percussion (built as oneshot drums)"
+                ", has percussion (built as oneshot drums)"
             } else {
                 ""
             },
@@ -615,7 +700,7 @@ impl MidiApp {
                     widgets::loading(ui, "Synthesizing preview...");
                 } else if widgets::info(ui, format!("{}  Preview", icons::PLAY))
                     .on_hover_text(
-                        "Synthesize the first Preview Length seconds and play them here -- a \
+                        "Synthesize the first Preview Length seconds and play them here: a \
                          rough approximation of the notes, timing and tones, not the game's \
                          exact synth or spatialization.",
                     )
@@ -782,7 +867,7 @@ impl MidiApp {
                 self.preview.play(&pcm, midi_preview::SAMPLE_RATE);
                 self.preview_pcm = Some(pcm); // retained for scrubbing
             }
-            Ok(Ok(_)) => info!("Nothing to preview -- the file scheduled no playable notes"),
+            Ok(Ok(_)) => info!("Nothing to preview: the file scheduled no playable notes"),
             Ok(Err(e)) => error!("{e}"),
             Err(promise) => self.pending_preview = Some(promise),
         }
