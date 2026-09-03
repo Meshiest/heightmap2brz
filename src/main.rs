@@ -107,7 +107,8 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg text: --text "Render the input image as TextDisplay component bricks")
         (@arg fillchar: --("fill-char") +takes_value "Text mode: glyph for opaque pixels (default █)")
         (@arg emptychar: --("empty-char") +takes_value "Text mode: glyph for transparent pixels (default space)")
-        (@arg charrepeat: --("char-repeat") +takes_value "Text mode: glyphs emitted per pixel (default 2)")
+        (@arg charrepeat: --("char-repeat") +takes_value "Text mode: glyph characters emitted per pixel (default 1). One character is a square pixel at --width-scale 2; raise this only to stretch a pixel wider still")
+        (@arg widthscale: --("width-scale") +takes_value "Text mode: component WidthScale -- horizontal glyph stretch, 1.0-2.0 in game (default 2 for the monospace presets, 1 for orbitron and the monochrome modes). It scales the glyph advance too, so one character at 2 covers what two at 1 do, for half the characters")
         (@arg alphathreshold: --("alpha-threshold") +takes_value "Text mode: alpha below this is transparent (default 128)")
         (@arg lineheight: --("line-height-world") +takes_value "Text mode: world units per pixel row / pixel size (default 1)")
         (@arg font: --font +takes_value "Text mode: font preset (monaspace, iosevka, orbitron; default monaspace)")
@@ -140,7 +141,7 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg midipolyphony: --("polyphony-cap") +takes_value "MIDI: maximum speakers per instrument, however many notes it plays at once (default 8). A busier instrument steals its oldest sounding note")
         (@arg midirate: --("playback-rate") +takes_value "MIDI: playback speed multiplier baked into the clock (default 1.0; 2.0 = double speed, 0.5 = half). The generated Rate pin still overrides it at runtime")
         (@arg nopercussion: --("no-percussion") "MIDI: skip the percussion channel (10). By default each drum note plays a oneshot sample, mapped from its General MIDI drum note through a fold table; this builds only the pitched instruments")
-        (@arg animmode: --("anim-mode") +takes_value "Animation output mode (brick, text). 'brick' builds one display brick per pixel, driven by the encoding --anim-encoding selects. 'text' builds one animated Component_TextDisplay per BAND of image rows instead -- roughly two orders of magnitude fewer gates (a 192x108 clip is 113 gates against 4613), at the cost of glyph-grid rendering rather than real bricks. Text mode reuses --font, --char-repeat, --fill-char, --empty-char, --alpha-threshold and --line-height-world, and adds --colors")
+        (@arg animmode: --("anim-mode") +takes_value "Animation output mode (brick, text). 'brick' builds one display brick per pixel, driven by the encoding --anim-encoding selects. 'text' builds one animated Component_TextDisplay per BAND of image rows instead -- roughly two orders of magnitude fewer gates (a 192x108 clip is 113 gates against 4613), at the cost of glyph-grid rendering rather than real bricks. Text mode reuses --font, --char-repeat, --width-scale, --fill-char, --empty-char, --alpha-threshold and --line-height-world, and adds --colors")
         (@arg animcolors: --("colors") +takes_value "Text mode: quantize to at most N colours with a median-cut palette (default 0 = full 24-bit colour). Fewer colours means longer same-colour runs and a smaller save; useful values are 16 to 64")
         (@arg animencoding: --("anim-encoding") +takes_value "Animation pixel encoding (hex, color-array; default hex). 'hex' packs each frame into a shared RRGGBB string per chunk; 'color-array' gives each pixel its own colour array -- fewer gate evaluations and no string work, at the cost of more host RAM to build")
         (@arg animfps: --fps +takes_value "Animation output frame rate (default 10)")
@@ -927,8 +928,8 @@ fn run_anim(
         Err(e) => fail(e),
     };
     // Named out loud for the same reason as `--colors` above: the band
-    // layout is a closed-form bound on the COLOUR encoder's row width (16
-    // characters of colour tag plus `char_repeat` glyph characters per
+    // layout is a closed-form bound on the COLOUR encoder's row width (up to
+    // 16 characters of colour tag plus `char_repeat` glyph characters per
     // pixel), and a monochrome glyph mode packs several pixels into one
     // character, so it does not obey that bound or that row geometry.
     // REFUSED, not warned about. This used to warn and then build the save
@@ -1714,9 +1715,9 @@ fn log_cost(mode: AnimMode, cost: &cost::Cost, width: u32, height: u32, char_rep
                         "  {} band(s) of {rows} row(s); UPPER BOUND {per_band} character(s) per \
                          band per frame ({row} per {width}-pixel row: 16 for a colour tag + \
                          {repeat} glyph char(s) per pixel, worst case every pixel starting its \
-                         own run). NOT an estimate -- real length is content-dependent, which \
-                         is why no character total is reported above; --colors is what shortens \
-                         it",
+                         own run; a tag whose channels all repeat a digit spends 13). NOT an \
+                         estimate -- real length is content-dependent, which is why no character \
+                         total is reported above; --colors is what shortens it",
                         plan.len(),
                     );
                 }
@@ -1914,7 +1915,7 @@ fn anim_options(
 }
 
 /// The `TextOptions` every text-rendering path shares: `--font`,
-/// `--fill-char`, `--empty-char`, `--char-repeat`, `--alpha-threshold`,
+/// `--fill-char`, `--empty-char`, `--char-repeat`, `--width-scale`, `--alpha-threshold`,
 /// `--line-height-world`, `--braille`/`--blocks`, `--luma-threshold`,
 /// `--invert`, `--material`. Numeric values go through [`parse_arg`], so a
 /// mistyped `--char-repeat two` is a CLI error naming the flag.
@@ -1963,6 +1964,13 @@ fn text_options(matches: &clap::ArgMatches) -> Result<TextOptions, String> {
             "an integer",
             d.char_repeat,
         )?,
+        width_scale: parse_arg(
+            matches,
+            "widthscale",
+            "--width-scale",
+            "a number",
+            d.width_scale,
+        )?,
         alpha_threshold: parse_arg(
             matches,
             "alphathreshold",
@@ -1992,19 +2000,27 @@ fn text_options(matches: &clap::ArgMatches) -> Result<TextOptions, String> {
         text_opts
     } else {
         // mono modes use their own measured component geometry
-        let (line_height, kerning, line_offset, pitch_x, pitch_y) =
-            mono_geometry(text_opts.mode, pixel_size);
+        let g = mono_geometry(text_opts.mode, pixel_size);
         TextOptions {
-            line_height,
-            kerning,
-            line_offset,
-            pitch_x: pitch_x.unwrap_or(text_opts.pitch_x),
-            pitch_y,
+            line_height: g.line_height,
+            kerning: g.kerning,
+            line_offset: g.line_offset,
+            pitch_x: g.pitch_x.unwrap_or(text_opts.pitch_x),
+            pitch_y: g.pitch_y,
+            width_scale: g.width_scale,
             ..text_opts
         }
     };
     if text_opts.char_repeat == 0 {
         return Err("--char-repeat must be at least 1".to_string());
+    }
+    // Not clamped to the game's 1.0-2.0 slider: the value is written straight
+    // into the component, a future build may widen the range, and a stretch
+    // the game refuses is visible the moment the save is opened. Zero or
+    // negative is different -- that is a glyph with no width, which reads as
+    // an empty render rather than as a bad number.
+    if !(text_opts.width_scale > 0.0) {
+        return Err("--width-scale must be greater than 0".to_string());
     }
     Ok(text_opts)
 }

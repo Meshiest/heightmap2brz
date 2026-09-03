@@ -413,6 +413,30 @@ pub fn hex_pair(b: u8) -> &'static str {
     &HEX_PAIRS[i..i + 2]
 }
 
+/// Whether `b`'s two hex digits are the same (`0x00`, `0x11`, ... `0xFF`), so
+/// [`hex_digit`] alone stands for the whole byte.
+///
+/// Sixteen of the 256 bytes qualify. A colour whose three channels all
+/// qualify writes as the short `<color="F00">` form -- see
+/// [`crate::text::encode_row`].
+#[inline]
+pub fn is_short_hex(b: u8) -> bool {
+    b >> 4 == b & 0xF
+}
+
+/// The high nibble of `b` as one uppercase hex digit.
+///
+/// Only stands for the whole byte when [`is_short_hex`] holds; callers check
+/// that first. This slices the same [`HEX_PAIRS`] table [`hex_pair`] does --
+/// the high digit is simply the pair's first character -- so the short and
+/// long forms of a byte cannot drift apart, and the short form costs the same
+/// nothing per pixel the long one does.
+#[inline]
+pub fn hex_digit(b: u8) -> &'static str {
+    let i = b as usize * 2;
+    &HEX_PAIRS[i..i + 1]
+}
+
 /// [`to_linear_gamma`] evaluated for every possible input, computed once.
 ///
 /// The transfer is an `f64` `powf(2.4)` per channel -- tens of nanoseconds --
@@ -893,6 +917,26 @@ mod tests {
             "anim::pack::slice_of byte-slices these offsets directly, which is only sound \
              because everything written into a frame string is ASCII"
         );
+    }
+
+    /// The short colour form is only correct if one digit really re-expands to
+    /// the byte it replaces: `<color="F00">` has to mean exactly what
+    /// `<color="FF0000">` meant, or shortening a tag would silently shift the
+    /// colour. Checked over the whole byte range in both directions -- every
+    /// qualifying byte doubles back to its pair, and no other byte qualifies.
+    #[test]
+    fn a_short_hex_digit_doubles_back_into_the_byte_it_stands_for() {
+        let mut short = 0;
+        for b in 0..=255u8 {
+            let d = hex_digit(b);
+            if is_short_hex(b) {
+                short += 1;
+                assert_eq!(format!("{d}{d}"), hex_pair(b), "byte {b:#04X}");
+            } else {
+                assert_ne!(format!("{d}{d}"), hex_pair(b), "byte {b:#04X}");
+            }
+        }
+        assert_eq!(short, 16, "exactly one byte per hex digit doubles");
     }
 
     /// The `u8` lookup table must BE the function, for all 256 inputs -- not

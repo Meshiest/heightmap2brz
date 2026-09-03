@@ -170,9 +170,13 @@ In the GUI they appear in the **Brick Type** row as *Smooth Terrain*,
 
 `--text` renders an image (or, with `--img`, a flat picture) as
 `Component_TextDisplay` glyph bricks. Pick a `--font` preset (`monaspace`,
-`iosevka`, `orbitron`), the `--fill-char`/`--empty-char` glyphs, `--char-repeat`,
-`--alpha-threshold` and `--material` (`unlit`, `graffiti`, `plastic`,
-`metallic`, `glow`, `translucent`, `glass`). `--braille` and `--blocks` pack 8 or
+`iosevka`, `orbitron`), the `--fill-char`/`--empty-char` glyphs,
+`--char-repeat`, `--width-scale`, `--alpha-threshold` and `--material`
+(`unlit`, `graffiti`, `plastic`, `metallic`, `glow`, `translucent`, `glass`).
+The monospace presets draw a square pixel with ONE character stretched to
+`--width-scale 2` rather than a doubled-up pair, so a render sends half the
+glyphs it used to; colours whose channels all repeat a digit also write the
+short `<color="F00">` tag. `--braille` and `--blocks` pack 8 or
 4 pixels per character for dense monochrome output (`--luma-threshold`,
 `--invert`).
 

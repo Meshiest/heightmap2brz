@@ -14,14 +14,16 @@ pub const MAX_COMPONENT_CHARS: usize = 10_000;
 /// Offset) tuned in-game for that font; values scale with pixel size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontPreset {
-    /// `██` / two spaces per pixel is square; monospace, so space-based
+    /// One `█` (or one space) per pixel, drawn at `WidthScale` 2 so the
+    /// half-width glyph cell renders square; monospace, so space-based
     /// transparency lines up.
     MonaspaceArgon,
-    /// `██` / two spaces per pixel is square; monospace. Calibrated from the
-    /// user's reference clipboards (2026-07-04).
+    /// Same glyph scheme as [`FontPreset::MonaspaceArgon`], with geometry
+    /// calibrated from the user's reference clipboards (2026-07-04).
     IosevkaTerm,
-    /// Single `█` per pixel is square, halving the char budget -- but the font
-    /// is proportional, so space-based transparency does NOT line up.
+    /// Single `█` per pixel at `WidthScale` 1 -- the glyph is already square
+    /// -- but the font is proportional, so space-based transparency does NOT
+    /// line up.
     Orbitron,
 }
 
@@ -58,7 +60,12 @@ impl FontPreset {
             font: self.font_asset(),
             fill_char: '█',
             empty_char: ' ',
-            char_repeat: 2,
+            // One glyph per pixel, stretched to a square pixel by the
+            // component itself. `char_repeat` 2 at `width_scale` 1 renders
+            // identically and costs twice the characters -- see
+            // `TextOptions::width_scale`.
+            char_repeat: 1,
+            width_scale: 2.0,
             alpha_threshold: 128,
             line_world_height: pixel_size,
             line_height: 0.61 * pixel_size,
@@ -101,7 +108,8 @@ impl FontPreset {
             // LineOffset -8.5) and F-shape clipboard (0.5 units/px: LineHeight
             // 0.4, LineOffset -8, Kerning -0.1, Offset.Y -0.05)
             FontPreset::Orbitron => TextOptions {
-                char_repeat: 1,
+                // proportional and already square: no stretch to apply
+                width_scale: 1.0,
                 line_height: 0.8 * pixel_size,
                 line_offset: -8.0,
                 kerning: -0.2 * pixel_size,
@@ -224,6 +232,14 @@ pub struct TextOptions {
     pub line_world_height: f32,
     /// Component LineHeight (font size).
     pub line_height: f32,
+    /// Component WidthScale: horizontal glyph stretch, the game's 1.0-2.0
+    /// slider. It scales the glyph advance as well as the glyph, so one
+    /// `█` at 2.0 covers exactly what two at 1.0 do -- which is why the
+    /// monospace presets draw a square pixel with a single character
+    /// instead of a doubled-up pair, halving the text every colour mode
+    /// render sends. Purely a ratio, so unlike the world-unit geometry it is
+    /// never rescaled with `line_world_height`.
+    pub width_scale: f32,
     /// Component LineOffset.
     pub line_offset: f32,
     /// Component Kerning.
@@ -279,16 +295,46 @@ impl TextOptions {
     }
 }
 
+/// The component geometry a monochrome mode overrides the colour presets
+/// with. Named fields rather than the tuple this used to be: all but
+/// `pitch_x` are plain `f32`, so a swapped pair would compile and render
+/// subtly wrong.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MonoGeometry {
+    /// Component LineHeight (font size).
+    pub line_height: f32,
+    /// Component Kerning.
+    pub kerning: f32,
+    /// Component LineOffset.
+    pub line_offset: f32,
+    /// `None` leaves the caller's current pitch_x alone.
+    pub pitch_x: Option<f32>,
+    /// Tile row spacing scale.
+    pub pitch_y: f32,
+    /// Always 1.0. A mono glyph cell is already 2 pixels wide, so the colour
+    /// presets' square-pixel stretch would double it; carrying it here is
+    /// what makes switching to a mono mode clear a stretch the user set, the
+    /// same way this struct clears their kerning.
+    pub width_scale: f32,
+}
+
 /// Component geometry for the monochrome modes, measured in-game
-/// (2026-07-04), returned as (font size, kerning, line offset, pitch_x,
-/// pitch_y): braille wants font size 2.7 with kerning -4 and a constant
+/// (2026-07-04): braille wants font size 2.7 with kerning -4 and a constant
 /// LineOffset of -8 (gap X from the font preset); blocks wants font size
 /// 1.08, gap X 0.41, and matches the normal mode's zeroes. Both use gap Y
-/// 0.8125.
-pub fn mono_geometry(mode: PixelMode, pixel_size: f32) -> (f32, f32, f32, Option<f32>, f32) {
-    match mode {
-        PixelMode::Braille => (2.7 * pixel_size, -4.0 * pixel_size, -8.0, None, 0.8125),
-        _ => (1.08 * pixel_size, 0.0, 0.0, Some(0.41), 0.8125),
+/// 0.8125 and no width stretch.
+pub fn mono_geometry(mode: PixelMode, pixel_size: f32) -> MonoGeometry {
+    let (line_height, kerning, line_offset, pitch_x) = match mode {
+        PixelMode::Braille => (2.7 * pixel_size, -4.0 * pixel_size, -8.0, None),
+        _ => (1.08 * pixel_size, 0.0, 0.0, Some(0.41)),
+    };
+    MonoGeometry {
+        line_height,
+        kerning,
+        line_offset,
+        pitch_x,
+        pitch_y: 0.8125,
+        width_scale: 1.0,
     }
 }
 
@@ -564,11 +610,23 @@ fn row_too_wide(y: u32, chars: usize) -> String {
 ///
 /// Spelled out as literals, with the cost derived from them, so the count
 /// and the text it counts cannot drift apart. All three parts are ASCII, so
-/// `len()` (bytes) equals the char count, which is what makes
-/// `COLOR_TAG_CHARS` a constant instead of a `chars().count()` per tag.
+/// `len()` (bytes) equals the char count, which is what makes these
+/// constants instead of a `chars().count()` per tag.
 const COLOR_TAG_OPEN: &str = "<color=\"";
 const COLOR_TAG_CLOSE: &str = "\">";
 const COLOR_TAG_CHARS: usize = COLOR_TAG_OPEN.len() + 6 + COLOR_TAG_CLOSE.len();
+
+/// The same tag in the three-digit form the game also parses: `<color="F00">`
+/// for `FF0000`. Available whenever all three channels have matching nibbles
+/// (16 values each: `00`, `11`, ... `FF`), which is exactly when the short
+/// form re-expands to the same colour -- so it is a pure size win, never a
+/// colour change. Three characters off every qualifying run adds up: a run is
+/// as short as one pixel, and text mode's whole cost is characters.
+///
+/// The band layout deliberately does NOT budget for this (see
+/// `crate::anim::text_layout::TAG_CHARS`): it must hold for any frame, and a
+/// short tag only ever comes in under the long-form bound.
+const COLOR_TAG_SHORT_CHARS: usize = COLOR_TAG_OPEN.len() + 3 + COLOR_TAG_CLOSE.len();
 
 /// Encode one image row. Updates `last_color` with the final emitted tag so
 /// color runs can continue into following rows.
@@ -611,12 +669,22 @@ fn encode_row(
             // Byte-for-byte the `format!("<color=\"{:02X}{:02X}{:02X}\">", ..)`
             // this replaced -- see `crate::util::hex_pair` for why the
             // formatting machinery is worth keeping out of a per-pixel path.
+            // The short form is the same tag with each channel's repeated
+            // nibble written once; the test below pins that the two spell the
+            // same colour.
             out.push_str(COLOR_TAG_OPEN);
-            out.push_str(crate::util::hex_pair(rgb[0]));
-            out.push_str(crate::util::hex_pair(rgb[1]));
-            out.push_str(crate::util::hex_pair(rgb[2]));
+            if rgb.iter().all(|c| crate::util::is_short_hex(*c)) {
+                out.push_str(crate::util::hex_digit(rgb[0]));
+                out.push_str(crate::util::hex_digit(rgb[1]));
+                out.push_str(crate::util::hex_digit(rgb[2]));
+                chars += COLOR_TAG_SHORT_CHARS;
+            } else {
+                out.push_str(crate::util::hex_pair(rgb[0]));
+                out.push_str(crate::util::hex_pair(rgb[1]));
+                out.push_str(crate::util::hex_pair(rgb[2]));
+                chars += COLOR_TAG_CHARS;
+            }
             out.push_str(COLOR_TAG_CLOSE);
-            chars += COLOR_TAG_CHARS;
             *last_color = Some(rgb);
         }
         out.push_str(&fill_run);
@@ -779,6 +847,10 @@ pub fn add_text_block_styled(
     let block_opts = TextOptions {
         line_height,
         kerning,
+        // A block is a readable line, not pixel art: the presets' square-pixel
+        // stretch would draw it at double width. Same reasoning as the
+        // `line_height` and `kerning` this already replaces.
+        width_scale: 1.0,
         ..opts.clone()
     };
     let (brick, id) = anchor_cube(position, visible_anchor)
@@ -830,6 +902,8 @@ pub fn text_label_component(
     let block_opts = TextOptions {
         line_height,
         kerning: 0.0,
+        // prose, not pixels -- see `add_text_block_styled`
+        width_scale: 1.0,
         ..opts.clone()
     };
     text_display_component(
@@ -887,13 +961,19 @@ const B_GATE_VARIABLE: BrickType = BrickType::str("B_1x1_Gate_Variable");
 
 /// The in-game tunable geometry fields: (label, TextDisplay wire port,
 /// current component value).
-fn calibration_variables(opts: &TextOptions) -> [(&'static str, &'static str, f32); 6] {
+fn calibration_variables(opts: &TextOptions) -> [(&'static str, &'static str, f32); 7] {
     [
         (
             "Font
 Size",
             "LineHeight",
             opts.line_height,
+        ),
+        (
+            "Width
+Scale",
+            "WidthScale",
+            opts.width_scale,
         ),
         ("Kerning", "Kerning", opts.kerning),
         (
@@ -999,6 +1079,8 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
         kerning: 0.0,
         // labels are plain text: never apply the mono modes' cell scaling
         mode: PixelMode::Color,
+        // nor the square-pixel stretch the grid below is calibrating
+        width_scale: 1.0,
         // nor the image's material -- a Graffiti/Glow label is unreadable
         material: TextMaterial::Unlit,
         ..cal.clone()
@@ -1324,6 +1406,7 @@ fn text_display_component(
         ("Skew", Box::new(0.0f32)),
         ("Kerning", Box::new(opts.kerning)),
         ("LineHeight", Box::new(opts.line_height)),
+        ("WidthScale", Box::new(opts.width_scale)),
         ("LineOffset", Box::new(opts.line_offset)),
         ("Color", Box::new(color)),
         ("MaterialSlider", Box::new(opts.material_intensity)),
@@ -1380,16 +1463,20 @@ mod tests {
         img
     }
 
-    /// Encode with defaults, asserting a single band results.
+    /// Encode with defaults -- one glyph per pixel, since the default preset
+    /// draws its square pixel with `width_scale` 2 rather than a doubled-up
+    /// character -- asserting a single band results.
     fn text(i: &RgbaImage) -> String {
         let bands = encode_bands(i, &TextOptions::default()).unwrap();
         assert_eq!(bands.len(), 1);
         bands.into_iter().next().unwrap().text
     }
 
+    /// One glyph, and the short tag: `FF0000` is three repeated-digit
+    /// channels, so it writes as `F00` for the same colour.
     #[test]
     fn single_opaque_pixel() {
-        assert_eq!(text(&img(&[&[RED]])), "<color=\"FF0000\">██");
+        assert_eq!(text(&img(&[&[RED]])), "<color=\"F00\">█");
     }
 
     /// The hand-assembled colour tag must be byte-identical to the `format!`
@@ -1412,9 +1499,40 @@ mod tests {
         }
     }
 
+    /// The short form is chosen per colour, not per render: a colour whose
+    /// three channels all repeat their digit writes `<color="F00">`, and one
+    /// that does not still writes all six digits. Both the text AND the
+    /// band's `chars` count are checked, because the encoder budgets bands
+    /// against that count -- a tag written short but counted long wastes
+    /// budget, and one counted short but written long overruns the component
+    /// limit and is silently truncated in game.
+    #[test]
+    fn a_colour_whose_channels_all_repeat_a_digit_writes_the_short_tag() {
+        // three repeated-digit channels, and three near-misses: one channel
+        // off is enough to need the long form
+        for (rgb, want) in [
+            ([0x00u8, 0x00, 0x00], "<color=\"000\">█"),
+            ([0xFF, 0x00, 0x00], "<color=\"F00\">█"),
+            ([0x11, 0x22, 0x33], "<color=\"123\">█"),
+            ([0x12, 0x22, 0x33], "<color=\"122233\">█"),
+            ([0x11, 0x23, 0x33], "<color=\"112333\">█"),
+            ([0x11, 0x22, 0x34], "<color=\"112234\">█"),
+        ] {
+            let i = img(&[&[Rgba([rgb[0], rgb[1], rgb[2], 255])]]);
+            let bands = encode_bands(&i, &TextOptions::default()).unwrap();
+            assert_eq!(bands[0].text, want, "{rgb:02X?}");
+            assert_eq!(
+                bands[0].chars,
+                bands[0].text.chars().count(),
+                "counted length must be the written length for {rgb:02X?}"
+            );
+        }
+        assert_eq!(COLOR_TAG_CHARS - COLOR_TAG_SHORT_CHARS, 3, "three digits saved");
+    }
+
     #[test]
     fn trailing_transparent_trimmed() {
-        assert_eq!(text(&img(&[&[RED, CLEAR]])), "<color=\"FF0000\">██");
+        assert_eq!(text(&img(&[&[RED, CLEAR]])), "<color=\"F00\">█");
     }
 
     #[test]
@@ -1424,27 +1542,24 @@ mod tests {
             ..Default::default()
         };
         let bands = encode_bands(&img(&[&[RED, CLEAR]]), &opts).unwrap();
-        assert_eq!(bands[0].text, "<color=\"FF0000\">██..");
+        assert_eq!(bands[0].text, "<color=\"F00\">█.");
     }
 
     #[test]
     fn color_run_spans_transparent_gap() {
-        assert_eq!(
-            text(&img(&[&[RED, CLEAR, RED]])),
-            "<color=\"FF0000\">██  ██"
-        );
+        assert_eq!(text(&img(&[&[RED, CLEAR, RED]])), "<color=\"F00\">█ █");
     }
 
     #[test]
     fn color_run_spans_rows() {
-        assert_eq!(text(&img(&[&[RED], &[RED]])), "<color=\"FF0000\">██\n██");
+        assert_eq!(text(&img(&[&[RED], &[RED]])), "<color=\"F00\">█\n█");
     }
 
     #[test]
     fn color_change_emits_new_tag() {
         assert_eq!(
             text(&img(&[&[RED, GREEN]])),
-            "<color=\"FF0000\">██<color=\"00FF00\">██"
+            "<color=\"F00\">█<color=\"0F0\">█"
         );
     }
 
@@ -1452,7 +1567,7 @@ mod tests {
     fn alpha_threshold_boundary() {
         let below = Rgba([255, 0, 0, 127]);
         let at = Rgba([255, 0, 0, 128]);
-        assert_eq!(text(&img(&[&[below, at]])), "  <color=\"FF0000\">██");
+        assert_eq!(text(&img(&[&[below, at]])), " <color=\"F00\">█");
     }
 
     #[test]
@@ -1462,16 +1577,18 @@ mod tests {
             ..Default::default()
         };
         let bands = encode_bands(&img(&[&[RED]]), &opts).unwrap();
-        assert_eq!(bands[0].text, "<color=\"FF0000\">███");
+        assert_eq!(bands[0].text, "<color=\"F00\">███");
     }
 
     #[test]
     fn fully_transparent_rows_keep_line_breaks() {
-        assert_eq!(text(&img(&[&[CLEAR], &[RED]])), "\n<color=\"FF0000\">██");
+        assert_eq!(text(&img(&[&[CLEAR], &[RED]])), "\n<color=\"F00\">█");
     }
 
-    /// 20-wide row of per-pixel alternating colors = 20 × (16 + 2) = 360 chars.
-    /// Band capacity: 360 + 361·(n−1) ≤ 10 000 ⇒ 27 rows. 60 rows ⇒ 27+27+6.
+    /// 20-wide row of per-pixel alternating colors. Both are repeated-digit
+    /// colours, so each pixel costs a 13-char short tag plus its one glyph:
+    /// 20 × 14 = 280 chars. Band capacity: 280 + 281·(n−1) ≤ 10 000 ⇒ 35
+    /// rows. 60 rows ⇒ 35+25.
     #[test]
     fn bands_split_at_char_limit() {
         let mut i = RgbaImage::new(20, 60);
@@ -1483,7 +1600,7 @@ mod tests {
         let bands = encode_bands(&i, &TextOptions::default()).unwrap();
         assert_eq!(
             bands.iter().map(|b| b.start_row).collect::<Vec<_>>(),
-            vec![0, 27, 54]
+            vec![0, 35]
         );
         assert_eq!(bands.iter().map(|b| b.rows).sum::<usize>(), 60);
         for b in &bands {
@@ -1499,6 +1616,28 @@ mod tests {
                 "band must reset color state"
             );
         }
+    }
+
+    /// The same 20x60 image in colours no channel can shorten costs 17 per
+    /// pixel instead of 14, and bands three ways instead of two -- the size
+    /// win from the short tag, measured rather than asserted in a comment.
+    /// (20 × 17 = 340; 340 + 341·(n−1) ≤ 10 000 ⇒ 29 rows ⇒ 29+29+2.)
+    #[test]
+    fn colours_that_cannot_shorten_band_sooner() {
+        let long_a = Rgba([0x12, 0x34, 0x56, 255]);
+        let long_b = Rgba([0x78, 0x9A, 0xBC, 255]);
+        let mut i = RgbaImage::new(20, 60);
+        for y in 0..60 {
+            for x in 0..20 {
+                i.put_pixel(x, y, if x % 2 == 0 { long_a } else { long_b });
+            }
+        }
+        let bands = encode_bands(&i, &TextOptions::default()).unwrap();
+        assert_eq!(
+            bands.iter().map(|b| b.start_row).collect::<Vec<_>>(),
+            vec![0, 29, 58]
+        );
+        assert_eq!(bands.iter().map(|b| b.rows).sum::<usize>(), 60);
     }
 
     #[test]
@@ -1740,8 +1879,10 @@ mod tests {
 
     #[test]
     fn row_too_wide_is_error() {
-        let mut i = RgbaImage::new(600, 1);
-        for x in 0..600 {
+        // 800 px x (13-char short tag + 1 glyph) = 11 200, past the 10 000
+        // limit no band layout can split a single row below
+        let mut i = RgbaImage::new(800, 1);
+        for x in 0..800 {
             i.put_pixel(x, 0, if x % 2 == 0 { RED } else { GREEN });
         }
         let err = encode_bands(&i, &TextOptions::default()).unwrap_err();
@@ -1759,8 +1900,8 @@ mod tests {
             .count();
         let vars = world.bricks.len() - text_cubes;
         assert_eq!(text_cubes, 16, "4x4 tile grid");
-        assert_eq!(vars, 6, "one variable gate per tunable");
-        assert_eq!(world.wires.len(), 6 * 16, "every var wired to every tile");
+        assert_eq!(vars, 7, "one variable gate per tunable");
+        assert_eq!(world.wires.len(), 7 * 16, "every var wired to every tile");
         assert!(world.bricks.iter().all(|b| b.position.z >= 0));
         world
             .to_brz_vec()
@@ -1773,7 +1914,7 @@ mod tests {
             ..Default::default()
         };
         let world = build_calibration_world(&opts, 120.0);
-        assert_eq!(world.wires.len(), 6 * 16);
+        assert_eq!(world.wires.len(), 7 * 16);
         world
             .to_brz_vec()
             .expect("braille calibration world must encode to brz");
@@ -1784,7 +1925,7 @@ mod tests {
         let staggered = world.bricks.iter().any(|b| b.position.x > 0);
         assert!(staggered, "tiny spacing must depth-stagger");
         assert_eq!(world.wires.len() % 16, 0);
-        assert_eq!(world.wires.len() / 16, 5, "Offset Z variable dropped");
+        assert_eq!(world.wires.len() / 16, 6, "Offset Z variable dropped");
     }
 
     #[test]
@@ -1801,13 +1942,12 @@ mod tests {
         let mut world = World::new();
         add_text_bricks(&mut world, bands, &opts);
 
-        assert_eq!(world.bricks.len(), 3);
+        assert_eq!(world.bricks.len(), 2);
         // a single tile anchors at z=1; band 0's cube sits on the front
         // plane (world +X faces the viewer) and extra bands step backward
         // toward x=0, their text returning via local Z
-        assert_eq!(world.bricks[0].position, Position::new(4, 0, 1));
-        assert_eq!(world.bricks[1].position, Position::new(2, 0, 1));
-        assert_eq!(world.bricks[2].position, Position::new(0, 0, 1));
+        assert_eq!(world.bricks[0].position, Position::new(2, 0, 1));
+        assert_eq!(world.bricks[1].position, Position::new(0, 0, 1));
         assert_eq!(world.bricks[0].components.len(), 1);
         for b in &world.bricks {
             assert!(!b.visible, "anchor bricks must be invisible");

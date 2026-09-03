@@ -1040,7 +1040,7 @@ mod tests {
     fn every_band_gets_one_array_and_one_get() {
         let opts = AnimOptions { colors: 0, ..AnimOptions::default() };
         let w = build_text_world(&clip(8, 8, 4), &opts, &mut NoProgress).unwrap();
-        let bands = plan_bands(8, 8, 2).unwrap().len();
+        let bands = plan_bands(8, 8, opts.text.char_repeat).unwrap().len();
         assert_eq!(count_components(&w, ARRAY_VAR), bands);
         assert_eq!(count_components(&w, ARRAY_GET), bands);
     }
@@ -1064,7 +1064,7 @@ mod tests {
         let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
         let w = build_text_world(&clip(192, 8, 2), &opts, &mut NoProgress).unwrap();
         let anchors = text_anchor_positions(&w);
-        assert_eq!(anchors.len(), plan_bands(192, 8, 2).unwrap().len());
+        assert_eq!(anchors.len(), plan_bands(192, 8, opts.text.char_repeat).unwrap().len());
         // `add_text_tiles` stacks a tile's extra bands along world X, so depth
         // is x -- one anchor per band means nothing may stack there.
         let mut depths: Vec<i32> = anchors.iter().map(|p| p.x).collect();
@@ -1128,7 +1128,7 @@ mod tests {
             ..AnimOptions::default()
         };
         let w = build_text_world(&clip(8, 8, 5), &opts, &mut NoProgress).unwrap();
-        let bands = plan_bands(8, 8, 2).unwrap().len();
+        let bands = plan_bands(8, 8, opts.text.char_repeat).unwrap().len();
         // 5 frames at bank size 2 -> 3 banks, 2 boundaries.
         assert_eq!(
             count_components(&w, ARRAY_VAR),
@@ -1270,9 +1270,9 @@ mod tests {
     /// `Text` port -- one band, one string, no crossing over.
     #[test]
     fn every_text_display_is_driven_exactly_once() {
-        let w = build_text_world(&clip(64, 16, 3), &AnimOptions::default(), &mut NoProgress)
-            .expect("build");
-        let bands = plan_bands(64, 16, 2).unwrap().len();
+        let opts = AnimOptions::default();
+        let w = build_text_world(&clip(64, 16, 3), &opts, &mut NoProgress).expect("build");
+        let bands = plan_bands(64, 16, opts.text.char_repeat).unwrap().len();
         let mut fed = std::collections::HashMap::new();
         for wire in &w.wires {
             if wire.target.component_type.to_string() == TEXT_DISPLAY {
@@ -1287,12 +1287,14 @@ mod tests {
         );
     }
 
-    /// The headline number: a 192x108 screen is 54 bands, so a
-    /// single-bank render must cost exactly `2 * 54 + 5` gates -- two per band
-    /// plus the shared clock chain and change detector -- against brick mode's
-    /// 2 per pixel. Gates are every inner-grid brick that is not one of the
-    /// chip's five I/O pins (Pause, Restart, Resume, Rate, Done), counted the
-    /// same way `tests/anim_color.rs` counts them.
+    /// The headline number: a 192x108 screen is 36 bands at the default one
+    /// glyph per pixel, so a single-bank render must cost exactly `2 * 36 + 7`
+    /// gates -- two per band plus the shared clock chain and change detector
+    /// -- against brick mode's 2 per pixel. (It was 54 bands while a square
+    /// pixel took two characters; the `width_scale` 2 presets buy a third of
+    /// the bands back.) Gates are every inner-grid brick that is not one of
+    /// the chip's five I/O pins (Pause, Restart, Resume, Rate, Done), counted
+    /// the same way `tests/anim_color.rs` counts them.
     #[test]
     fn a_192x108_render_costs_two_gates_per_band_plus_the_clock() {
         // Buttons off: `w.bricks.len()` below counts the band anchor cubes and
@@ -1300,8 +1302,8 @@ mod tests {
         // bricks). The inner-grid gate count is unaffected by them either way.
         let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
         let w = build_text_world(&clip(192, 108, 2), &opts, &mut NoProgress).expect("build");
-        let bands = plan_bands(192, 108, 2).unwrap().len();
-        assert_eq!(bands, 54, "192 wide at char_repeat 2 bands 2 rows at a time");
+        let bands = plan_bands(192, 108, opts.text.char_repeat).unwrap().len();
+        assert_eq!(bands, 36, "192 wide at char_repeat 1 bands 3 rows at a time");
         assert_eq!(
             w.grids[0].1.len() - 7,
             2 * bands + 7,

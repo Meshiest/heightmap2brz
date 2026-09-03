@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn one_entry_per_frame_per_band() {
-        let plan = plan_bands(8, 4, 2).unwrap();
+        let plan = plan_bands(8, 4, opts().char_repeat).unwrap();
         let bands = plan.len();
         let mut p = TextPacker::new(8, 4, plan, opts(), Palette::default());
         for _ in 0..5 {
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn a_wrongly_sized_frame_is_rejected_naming_both_sizes() {
-        let plan = plan_bands(8, 4, 2).unwrap();
+        let plan = plan_bands(8, 4, opts().char_repeat).unwrap();
         let mut p = TextPacker::new(8, 4, plan, opts(), Palette::default());
         // No priming push: the very first frame is checked, because the
         // expected size comes from the source's SourceInfo rather than from
@@ -339,7 +339,7 @@ mod tests {
                 );
             }
         }
-        let plan = plan_bands(w as usize, h as usize, 2).unwrap();
+        let plan = plan_bands(w as usize, h as usize, opts().char_repeat).unwrap();
         let mut p = TextPacker::new(w, h, plan, opts(), Palette::default());
         p.push_frame(&f).unwrap();
         for band in p.finish() {
@@ -361,7 +361,7 @@ mod tests {
         f.put_pixel(0, 0, Rgba([0xFF, 0, 0, 0xFF]));
         f.put_pixel(1, 0, Rgba([0, 0, 0xFF, 0xFF]));
         let pal = Palette::build(&[f.clone()], 1, 1);
-        let plan = plan_bands(2, 1, 2).unwrap();
+        let plan = plan_bands(2, 1, opts().char_repeat).unwrap();
         let mut p = TextPacker::new(2, 1, plan, opts(), pal);
         p.push_frame(&f).unwrap();
         let out = p.finish();
@@ -372,7 +372,7 @@ mod tests {
     fn an_empty_palette_leaves_colours_untouched() {
         let mut f = RgbaImage::new(1, 1);
         f.put_pixel(0, 0, Rgba([0x12, 0x34, 0x56, 0xFF]));
-        let plan = plan_bands(1, 1, 2).unwrap();
+        let plan = plan_bands(1, 1, opts().char_repeat).unwrap();
         let mut p = TextPacker::new(1, 1, plan, opts(), Palette::default());
         p.push_frame(&f).unwrap();
         assert!(p.finish()[0][0].contains("123456"), "exact source colour");
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn pushing_past_the_frame_limit_errors_rather_than_truncating() {
-        let plan = plan_bands(1, 1, 2).unwrap();
+        let plan = plan_bands(1, 1, opts().char_repeat).unwrap();
         let mut p = TextPacker::new(1, 1, plan, opts(), Palette::default());
         p.set_frame_limit_for_test(2);
         p.push_frame(&solid(1, 1, [0, 0, 0])).unwrap();

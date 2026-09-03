@@ -251,6 +251,18 @@ fn the_text_branch_exits_nonzero() {
         "--char-repeat",
         &[png, "--text", "--char-repeat", "0"],
     );
+    // A zero or negative stretch is a glyph with no width -- an empty render
+    // rather than a bad number, so it has to be refused before the save.
+    assert_fails(
+        "text_width_scale",
+        "--width-scale",
+        &[png, "--text", "--width-scale", "0"],
+    );
+    assert_fails(
+        "text_width_scale_nan",
+        "--width-scale",
+        &[png, "--text", "--width-scale", "wide"],
+    );
     assert_fails(
         "text_missing",
         "nonexistent_text.png",

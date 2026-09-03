@@ -239,8 +239,8 @@ pub fn estimate_color_array(width: u32, height: u32, frames: usize, opts: &AnimO
 /// # Why this returns a `Result` and its two siblings do not
 ///
 /// Text mode is the only encoding whose geometry can be impossible:
-/// [`super::text_layout::plan_bands`] caps the width it can band (555 px at
-/// `char_repeat` 2), and past that there is no layout at all. Swallowing
+/// [`super::text_layout::plan_bands`] caps the width it can band (588 px at
+/// `char_repeat` 1), and past that there is no layout at all. Swallowing
 /// that into a band count of 0 reads out as "5 gate(s), 1 brick(s)" -- a
 /// plausible, cheap-looking render for a configuration `build_text_world`
 /// then refuses outright. An impossible geometry has to surface as
@@ -251,11 +251,13 @@ pub fn estimate_text(
     frames: usize,
     opts: &AnimOptions,
 ) -> Result<Cost, String> {
-    // The band count depends on `char_repeat`: a single-glyph font (Orbitron,
-    // `char_repeat` 1) fits more rows per component than a double-glyph one,
-    // so 192x108 bands 36 ways rather than 54. Reading the option off the
-    // same struct the render is built from, rather than taking it as a
-    // separate parameter, is what keeps this in sync with `--font`.
+    // The band count depends on `char_repeat`: one glyph per pixel (the
+    // default -- the presets draw a square pixel by stretching a single
+    // character to `width_scale` 2) fits more rows per component than a
+    // doubled-up one, so 192x108 bands 36 ways rather than 54. Reading the
+    // option off the same struct the render is built from, rather than taking
+    // it as a separate parameter, is what keeps this in sync with `--font`
+    // and `--char-repeat`.
     //
     // Propagated, not swallowed: see this function's doc.
     let bands = super::text_layout::plan_bands(
@@ -536,11 +538,12 @@ mod tests {
 
     #[test]
     fn text_mode_costs_two_gates_per_band_plus_the_clock() {
-        // 192x108 at char_repeat 2 -> 54 bands.
+        // 192x108 at the default char_repeat 1 -> 36 bands (it was 54 when a
+        // square pixel cost two characters instead of one at width_scale 2).
         let c = estimate_text(192, 108, 300, &opts(BANK_FRAMES)).expect("a legal geometry must estimate");
         assert_eq!(c.banks, 1);
-        assert_eq!(c.gates, 2 * 54 + 7);
-        assert_eq!(c.bricks, 54 + 1);
+        assert_eq!(c.gates, 2 * 36 + 7);
+        assert_eq!(c.bricks, 36 + 1);
     }
 
     #[test]
@@ -555,7 +558,9 @@ mod tests {
         let one = estimate_text(64, 32, 5, &opts(65_535)).expect("a legal geometry must estimate");
         let three = estimate_text(64, 32, 5, &opts(2)).expect("a legal geometry must estimate");
         assert_eq!(three.banks, 3);
-        let bands = crate::anim::text_layout::plan_bands(64, 32, 2).unwrap().len();
+        let bands = crate::anim::text_layout::plan_bands(64, 32, opts(2).text.char_repeat)
+            .unwrap()
+            .len();
         let boundaries = 2;
         assert_eq!(
             three.gates - one.gates,
@@ -564,7 +569,7 @@ mod tests {
     }
 
     /// An impossible text geometry must read as impossible, not as a bargain:
-    /// `plan_bands` caps the width it can lay out (555 px at `char_repeat` 2),
+    /// `plan_bands` caps the width it can lay out (588 px at `char_repeat` 1),
     /// and past that a band count of 0 reads out as 5 gates and 1 brick -- a
     /// plausible, unusually cheap render for a config `build_text_world`
     /// refuses outright.

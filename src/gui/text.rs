@@ -24,6 +24,7 @@ pub struct TextApp {
     fill_char: String,
     empty_char: String,
     char_repeat: usize,
+    width_scale: f32,
     alpha_threshold: u8,
     pixel_size: f32,
     // manual calibration; reseeded when the preset or pixel size changes
@@ -63,6 +64,7 @@ impl Default for TextApp {
             fill_char: d.fill_char.to_string(),
             empty_char: d.empty_char.to_string(),
             char_repeat: d.char_repeat,
+            width_scale: d.width_scale,
             alpha_threshold: d.alpha_threshold,
             pixel_size: d.line_world_height,
             line_height: d.line_height,
@@ -97,6 +99,7 @@ impl TextApp {
             fill_char: self.fill_char.chars().next().unwrap_or(d.fill_char),
             empty_char: self.empty_char.chars().next().unwrap_or(d.empty_char),
             char_repeat: self.char_repeat,
+            width_scale: self.width_scale,
             alpha_threshold: self.alpha_threshold,
             line_height: self.line_height,
             line_offset: self.line_offset,
@@ -130,6 +133,7 @@ impl TextApp {
         self.fill_char = d.fill_char.to_string();
         self.empty_char = d.empty_char.to_string();
         self.char_repeat = d.char_repeat;
+        self.width_scale = d.width_scale;
         self.line_height = d.line_height;
         self.line_offset = d.line_offset;
         self.kerning = d.kerning;
@@ -146,15 +150,15 @@ impl TextApp {
     /// calibration fields whenever the mode (or preset/pixel size) changes.
     fn seed_mode_geometry(&mut self) {
         if self.mode != PixelMode::Color {
-            let (lh, kerning, line_offset, pitch_x, pitch_y) =
-                mono_geometry(self.mode, self.pixel_size);
-            self.line_height = lh;
-            self.kerning = kerning;
-            self.line_offset = line_offset;
-            if let Some(pitch_x) = pitch_x {
+            let g = mono_geometry(self.mode, self.pixel_size);
+            self.line_height = g.line_height;
+            self.kerning = g.kerning;
+            self.line_offset = g.line_offset;
+            if let Some(pitch_x) = g.pitch_x {
                 self.pitch_x = pitch_x;
             }
-            self.pitch_y = pitch_y;
+            self.pitch_y = g.pitch_y;
+            self.width_scale = g.width_scale;
         }
     }
 
@@ -265,9 +269,24 @@ impl TextApp {
                         ui.add(egui::TextEdit::singleline(&mut self.empty_char).desired_width(24.0))
                             .on_hover_text("Glyph for transparent pixels (first character is used)");
                         ui.label("Repeat");
-                        widgets::slider(ui, egui::Slider::new(&mut self.char_repeat, 1..=4)).on_hover_text(
-                            "Glyphs per pixel; 2 makes square pixels with the monospace font",
-                        );
+                        widgets::slider(ui, egui::Slider::new(&mut self.char_repeat, 1..=4))
+                            .on_hover_text(
+                                "Glyph characters per pixel. 1 is enough for a square pixel \
+                                 at Width 2; raise it only to stretch a pixel wider still",
+                            );
+                        ui.add_enabled_ui(self.mode == PixelMode::Color, |ui| {
+                            ui.label("Width");
+                            widgets::slider(
+                                ui,
+                                egui::Slider::new(&mut self.width_scale, 1.0..=2.0).step_by(0.05),
+                            )
+                            .on_hover_text(
+                                "Component WidthScale: stretches each glyph (and its advance) \
+                                 horizontally. 2 makes one monospace character a square pixel, \
+                                 halving the text a render sends. Mono modes draw 2 pixels per \
+                                 character already and always use 1",
+                            );
+                        });
                     });
                 },
             );

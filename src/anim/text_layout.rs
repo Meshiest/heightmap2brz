@@ -6,6 +6,9 @@
 //! before a single frame is looked at: a row of `width` pixels costs at most
 //! `width * (TAG_CHARS + char_repeat)` characters, because the worst case is
 //! every pixel changing colour and so emitting its own `<color="RRGGBB">` tag.
+//! It is an upper bound in the other direction too: `crate::text::encode_row`
+//! writes the three-digit `<color="F00">` form for colours that allow it, and
+//! a real frame is only ever shorter than what is budgeted here.
 //! The bound depends only on the width, so the layout never needs a scan pass
 //! over the clip -- which is what lets the render stream: frames can be
 //! encoded and discarded one at a time, because the band boundaries are
@@ -16,8 +19,10 @@
 //! where the `+ 1`s account for the newline that joins rows within a band (a
 //! band of `rows` rows costs `rows * bound + (rows - 1)` characters at worst,
 //! and `rows * (bound + 1) <= MAX + 1` is the same inequality rearranged so
-//! integer division rounds correctly). That constant is 2 rows at width 192,
-//! 5 at width 96, and 8 at width 64 -- the values this module's tests pin.
+//! integer division rounds correctly). At the default one glyph per pixel
+//! that constant is 3 rows at width 192, 6 at width 96 and 9 at width 64; at
+//! two glyphs per pixel it is 2, 5 and 8 -- the values this module's tests
+//! pin, in both cases.
 //!
 //! This module is pure arithmetic over `width` / `height` / `char_repeat`; it
 //! knows nothing about images, bricks, or `World`.
@@ -26,6 +31,12 @@ use crate::text::MAX_COMPONENT_CHARS;
 /// Characters one `<color="RRGGBB">` tag costs: `<color="` (8) + 6 hex + `">`
 /// (2). The worst-case row bound assumes every pixel emits one, which is what
 /// `heightmap::text::encode_row` does when no two neighbours share a colour.
+///
+/// Deliberately the LONG form, even though the encoder writes a 13-character
+/// short tag whenever all three channels repeat a digit: the layout is fixed
+/// once for the whole clip, before any frame is seen, so it has to hold for
+/// the frame whose colours cannot shorten. Budgeting 13 here would band a
+/// clip that a single long-form frame then overruns.
 const TAG_CHARS: usize = 16;
 
 /// One `TextDisplay`'s worth of image rows, fixed for the whole clip.
@@ -120,6 +131,12 @@ mod tests {
 
     #[test]
     fn rows_per_band_matches_the_documented_constants() {
+        // one glyph per pixel: the default, since the presets draw a square
+        // pixel by stretching a single character to `width_scale` 2
+        assert_eq!(plan_bands(192, 108, 1).unwrap()[0].rows, 3);
+        assert_eq!(plan_bands(96, 108, 1).unwrap()[0].rows, 6);
+        assert_eq!(plan_bands(64, 108, 1).unwrap()[0].rows, 9);
+        // and the doubled-up encoding, which costs a third of the rows
         assert_eq!(plan_bands(192, 108, 2).unwrap()[0].rows, 2);
         assert_eq!(plan_bands(96, 108, 2).unwrap()[0].rows, 5);
         assert_eq!(plan_bands(64, 108, 2).unwrap()[0].rows, 8);
@@ -134,7 +151,10 @@ mod tests {
 
     #[test]
     fn a_row_too_wide_for_one_component_is_an_error_naming_the_width() {
-        // 10000 / 18 = 555 px is the ceiling at char_repeat 2.
+        // 10000 / 17 = 588 px is the ceiling at the default char_repeat 1,
+        // and 10000 / 18 = 555 px at char_repeat 2.
+        assert!(plan_bands(588, 10, 1).is_ok(), "588 fits at one glyph per pixel");
+        assert!(plan_bands(589, 10, 1).is_err(), "589 does not");
         assert!(plan_bands(555, 10, 2).is_ok(), "555 fits");
         let err = plan_bands(556, 10, 2).expect_err("556 must not fit");
         assert!(err.contains("556"), "error must name the width: {err}");

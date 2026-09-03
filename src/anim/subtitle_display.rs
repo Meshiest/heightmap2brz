@@ -44,11 +44,12 @@ pub use super::text_bricks::{TEXT_DISPLAY, TEXT_PORT};
 /// How much bigger a subtitle line is than one row of the screen, by default.
 ///
 /// Unverified by eye in game; an arithmetic guess, and this constant is
-/// deliberately the single place to change it. At 192 px wide with
-/// `char_repeat` 2 the screen is 384 glyph cells across, while a subtitle
-/// line is 40-60 characters: at equal glyph size the text would occupy about
-/// a seventh of the width and be useless, while at 6x it covers roughly
-/// half, which is what a subtitle normally looks like. `--subtitle-scale`
+/// deliberately the single place to change it. At 192 px wide the screen is
+/// 192 glyph cells across at the default one glyph per pixel -- each drawn
+/// double-width, so 384 cells' worth of picture -- while a subtitle line is
+/// 40-60 characters: at equal glyph size the text would occupy about a
+/// seventh of that width and be useless, while at 6x it covers roughly half,
+/// which is what a subtitle normally looks like. `--subtitle-scale`
 /// exposes it, since the right value depends on the screen's width and the
 /// track's typical line length.
 pub const DEFAULT_SUBTITLE_SCALE: f32 = 6.0;
@@ -901,7 +902,10 @@ mod tests {
                 .filter(|w| w.target.component_type.to_string() == TEXT_DISPLAY)
                 .count();
             // One per band, plus the subtitle's.
-            let bands = crate::anim::text_layout::plan_bands(32, 8, 2).unwrap().len();
+            let bands =
+                crate::anim::text_layout::plan_bands(32, 8, AnimOptions::default().text.char_repeat)
+                    .unwrap()
+                    .len();
             assert_eq!(driven, bands + 1, "bank_size {bank_size}");
         }
     }
@@ -980,7 +984,9 @@ mod tests {
         let world = build_text_world(&clip(32, 8, 3), &opts, &mut NoProgress).expect("build");
         let styles = text_display_styles(&world);
 
-        let bands = crate::anim::text_layout::plan_bands(32, 8, 2).unwrap().len();
+        let bands = crate::anim::text_layout::plan_bands(32, 8, opts.text.char_repeat)
+            .unwrap()
+            .len();
         assert_eq!(styles.len(), bands + 1, "every band plus the subtitle");
 
         let (subtitle, rest): (Vec<_>, Vec<_>) =

@@ -320,6 +320,11 @@ pub struct VideoApp {
     /// TEXT MODE ONLY. Also drives the band layout
     /// ([`text_layout::plan_bands`]) -- see [`Self::anim_opts`].
     text_char_repeat: usize,
+    /// TEXT MODE ONLY. Component `WidthScale` -- the horizontal glyph
+    /// stretch that lets one character stand for a square pixel. Pure
+    /// geometry: unlike `text_char_repeat` it changes no character count, so
+    /// neither the band layout nor the cost readout consults it.
+    text_width_scale: f32,
     /// TEXT MODE ONLY. The component `LineHeight` (font size); the Image2Text
     /// pane calls this control "Font Size".
     text_line_height: f32,
@@ -405,6 +410,7 @@ impl Default for VideoApp {
             text_fill_char: text_default.fill_char.to_string(),
             text_empty_char: text_default.empty_char.to_string(),
             text_char_repeat: text_default.char_repeat,
+            text_width_scale: text_default.width_scale,
             text_line_height: text_default.line_height,
             colors: d.colors,
             subtitles: None,
@@ -502,6 +508,7 @@ impl VideoApp {
             fill_char: self.text_fill_char.chars().next().unwrap_or('█'),
             empty_char: self.text_empty_char.chars().next().unwrap_or(' '),
             char_repeat: self.text_char_repeat.max(1),
+            width_scale: self.text_width_scale,
             // Same slider that culls brick-mode pixels, not a second control
             // (see `anim_options` in main.rs for why both fields must match).
             alpha_threshold: self.alpha_threshold,
@@ -596,6 +603,7 @@ impl VideoApp {
         self.text_fill_char = d.fill_char.to_string();
         self.text_empty_char = d.empty_char.to_string();
         self.text_char_repeat = d.char_repeat;
+        self.text_width_scale = d.width_scale;
         self.text_line_height = d.line_height;
     }
 
@@ -993,6 +1001,7 @@ impl VideoApp {
         vec![
             self.text_preset.name().to_string(),
             format!("x{} repeat", self.text_char_repeat),
+            format!("width {:.2}", self.text_width_scale),
             format!("line height {:.2}", self.text_line_height),
             match self.colors {
                 0 => "full colour".to_string(),
@@ -1011,6 +1020,7 @@ impl VideoApp {
                 || self.text_fill_char != d.text.fill_char.to_string()
                 || self.text_empty_char != d.text.empty_char.to_string()
                 || self.text_char_repeat != d.text.char_repeat
+                || self.text_width_scale != d.text.width_scale
                 || self.text_line_height != d.text.line_height
                 || self.colors != d.colors)
     }
@@ -1139,7 +1149,21 @@ impl VideoApp {
                             .on_hover_text("Glyph for transparent pixels (first character is used)");
                         ui.label("Repeat");
                         widgets::slider(ui, egui::Slider::new(&mut self.text_char_repeat, 1..=4))
-                            .on_hover_text("Glyphs per pixel; also sets the band layout's row width bound");
+                            .on_hover_text(
+                                "Glyph characters per pixel; also sets the band layout's row \
+                                 width bound. One character is a square pixel at Width 2",
+                            );
+                        ui.label("Width");
+                        widgets::slider(
+                            ui,
+                            egui::Slider::new(&mut self.text_width_scale, 1.0..=2.0).step_by(0.05),
+                        )
+                        .on_hover_text(
+                            "Component WidthScale: stretches each glyph and its advance \
+                             horizontally, so one character covers a square pixel without \
+                             doubling it up. Pure geometry -- it sends no extra characters, \
+                             so the bound below does not move",
+                        );
                     });
                 },
             );
@@ -1630,9 +1654,9 @@ impl VideoApp {
         ui.label(format!(
             "{} band(s) of {rows} row(s); UPPER BOUND {per_band} character(s) per band per \
              frame ({row} per {w}-pixel row: 16 for a colour tag + {repeat} glyph char(s) per \
-             pixel, worst case every pixel starting its own run). NOT an estimate -- real length \
-             is content-dependent, which is why no character total is reported above; Colours is \
-             what shortens it",
+             pixel, worst case every pixel starting its own run; a tag whose channels all \
+             repeat a digit spends 13). NOT an estimate -- real length is content-dependent, \
+             which is why no character total is reported above; Colours is what shortens it",
             plan.len(),
         ));
     }

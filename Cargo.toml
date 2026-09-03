@@ -1,6 +1,6 @@
 [package]
 name = "heightmap"
-version = "0.16.2"
+version = "0.17.0"
 authors = ["Isaac <gpg@reheatedcake.io>"]
 edition = "2024"
 rust-version = "1.88"
@@ -74,9 +74,12 @@ ffmpeg-sidecar = "2.5"
 # default-features off: only raw-PCM playback is needed, not the decoders.
 rodio = { version = "0.20", optional = true, default-features = false }
 
-# web: brz-only brdb with the wasm clock, async dialogs, browser downloads
+# web: brz-only brdb with the wasm clock, async dialogs, browser downloads.
+# Kept on the same major version as the native build above: the schemas are
+# baked into the crate, so an older brdb here silently drops component fields
+# the native one writes (WidthScale, added in 0.10, is the one that caught it).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-brdb = { version = "0.9.1", default-features = false, features = [
+brdb = { version = "0.11.0", default-features = false, features = [
   "brz",
   "wasm",
 ] }

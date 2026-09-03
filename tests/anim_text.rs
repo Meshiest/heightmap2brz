@@ -243,9 +243,10 @@ fn a_subtitled_render_passes_wire_integrity_at_both_bank_counts() {
 fn band_row_ranges_are_identical_for_every_frame() {
     // The core invariant: text components are fixed bricks, so the rows a
     // given component draws must not move frame to frame.
-    let plan = plan_bands(192, 108, 2).unwrap();
+    let opts = AnimOptions::default();
+    let plan = plan_bands(192, 108, opts.text.char_repeat).unwrap();
     let world = AnimMode::Text
-        .build(&support::clip(192, 108, 12), &AnimOptions::default(), &mut NoProgress)
+        .build(&support::clip(192, 108, 12), &opts, &mut NoProgress)
         .unwrap();
     let bands = support::band_strings(&world);
     for band in &bands {

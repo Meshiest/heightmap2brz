@@ -634,27 +634,6 @@ dependencies = [
 
 [[package]]
 name = "brdb"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba1fb2b1b3c93780f00491fa89196f3be91ee60317f604d152e88eca570cc347"
-dependencies = [
- "blake3",
- "indexmap",
- "itertools 0.14.0",
- "lalrpop",
- "lalrpop-util 0.21.0",
- "rmp",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
- "uuid",
- "web-time",
- "zstd",
-]
-
-[[package]]
-name = "brdb"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6323a5fec9d63f58ad51399686dc55adbad3a98df12511c246710a53c25b22f6"
@@ -671,6 +650,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.17",
  "uuid",
+ "web-time",
  "zstd",
 ]
 
@@ -1906,10 +1886,9 @@ dependencies = [
 
 [[package]]
 name = "heightmap"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
- "brdb 0.11.0",
- "brdb 0.9.1",
+ "brdb",
  "clap",
  "clipboard-win",
  "dirs",

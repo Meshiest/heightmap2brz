@@ -43,16 +43,20 @@ fn text_component_roundtrips_through_brz() {
         let (_soa, comps) = db.component_chunk_soa(1, chunk.index).unwrap();
         for c in comps {
             let text = c.prop("Text").unwrap().as_brdb_str().unwrap();
-            assert_eq!(
-                text,
-                "<color=\"FF0000\">████\n<color=\"00FF00\">██  <color=\"FF0000\">██"
-            );
+            // One glyph per pixel (the preset draws a square pixel with
+            // WidthScale 2 instead of a doubled-up character), and the short
+            // three-digit colour tags FF0000/00FF00 are allowed to take.
+            assert_eq!(text, "<color=\"F00\">██\n<color=\"0F0\">█ <color=\"F00\">█");
             let anchor = c.prop("Anchor").unwrap();
             assert_eq!(anchor.prop("X").unwrap().as_brdb_f32().unwrap(), 0.0);
             assert_eq!(anchor.prop("Y").unwrap().as_brdb_f32().unwrap(), 0.0);
             // user-calibrated glyph fit: LineHeight 0.61 + (0, -0.2, 0) offset
             let line_height = c.prop("LineHeight").unwrap().as_brdb_f32().unwrap();
             assert_eq!(line_height, 0.61);
+            // the stretch that makes one monospace glyph a square pixel --
+            // read back out of the save, not just off the options struct
+            let width_scale = c.prop("WidthScale").unwrap().as_brdb_f32().unwrap();
+            assert_eq!(width_scale, 2.0);
             let offset = c.prop("Offset").unwrap();
             assert_eq!(offset.prop("X").unwrap().as_brdb_f32().unwrap(), 0.0);
             assert_eq!(offset.prop("Y").unwrap().as_brdb_f32().unwrap(), -0.2);
@@ -122,5 +126,60 @@ fn material_settings_roundtrip_through_brz() {
         }
     }
     assert_eq!(found, 1, "expected exactly one TextDisplay component");
+    std::fs::remove_file(&path).ok();
+}
+
+/// A readable line -- an annotation, a button label, a subtitle -- must NOT
+/// inherit the presets' square-pixel stretch. The picture and the label share
+/// one `TextOptions`, so the only thing keeping prose from rendering at double
+/// width is `add_text_block_styled` overriding `width_scale`, the same way it
+/// already overrides `line_height` and `kerning`. Read back out of a real save
+/// rather than off the options struct, because that override is the entire
+/// mechanism.
+#[test]
+fn a_label_stays_unstretched_while_the_picture_it_annotates_does_not() {
+    use brdb::Position;
+    use heightmap::text::add_annotation;
+
+    let mut img = RgbaImage::new(1, 1);
+    img.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+
+    let opts = TextOptions::default();
+    assert_eq!(opts.width_scale, 2.0, "the preset must be the stretched one");
+
+    let mut world = World::new();
+    add_text_bricks(&mut world, encode_bands(&img, &opts).unwrap(), &opts);
+    add_annotation(
+        &mut world,
+        "a label".to_string(),
+        Position::new(0, 40, 1),
+        2.5,
+        &opts,
+    );
+
+    let data = world.to_brz_vec().unwrap();
+    let path = std::env::temp_dir().join(format!("h2b_text_label_{}.brz", std::process::id()));
+    std::fs::write(&path, data).unwrap();
+
+    let db = Brz::open(&path).unwrap().into_reader();
+    let mut seen: Vec<(String, f32)> = Vec::new();
+    for chunk in db.brick_chunk_index(1).unwrap() {
+        let (_soa, comps) = db.component_chunk_soa(1, chunk.index).unwrap();
+        for c in comps {
+            seen.push((
+                c.prop("Text").unwrap().as_brdb_str().unwrap().to_string(),
+                c.prop("WidthScale").unwrap().as_brdb_f32().unwrap(),
+            ));
+        }
+    }
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        seen,
+        vec![
+            ("<color=\"F00\">█".to_string(), 2.0),
+            ("a label".to_string(), 1.0),
+        ],
+        "the picture stretches, the label does not"
+    );
     std::fs::remove_file(&path).ok();
 }
