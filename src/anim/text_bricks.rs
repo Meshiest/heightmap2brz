@@ -1291,7 +1291,7 @@ mod tests {
     /// glyph per pixel, so a single-bank render must cost exactly `2 * 36 + 7`
     /// gates -- two per band plus the shared clock chain and change detector
     /// -- against brick mode's 2 per pixel. (It was 54 bands while a square
-    /// pixel took two characters; the `width_scale` 2 presets buy a third of
+    /// pixel took two characters; the `width_scale` ~2 presets buy a third of
     /// the bands back.) Gates are every inner-grid brick that is not one of
     /// the chip's five I/O pins (Pause, Restart, Resume, Rate, Done), counted
     /// the same way `tests/anim_color.rs` counts them.

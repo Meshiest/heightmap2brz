@@ -1,0 +1,177 @@
+name: Release
+
+# Tags are the bare version with no `v` prefix (`0.18.0`), which is what every
+# tag since 0.0.1 has used. `just tag` creates them; see tools/tag.sh.
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build and release'
+        required: true
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  # id-token and attestations are what actions/attest-build-provenance needs.
+  id-token: write
+  attestations: write
+
+jobs:
+  # Fails the whole release BEFORE anything is built if the tag disagrees with
+  # Cargo.toml or CHANGELOG.md has nothing to say about this version. An empty
+  # release body is not worth twenty minutes of matrix build time.
+  prepare:
+    name: Check version and notes
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.notes.outputs.version }}
+      title: ${{ steps.notes.outputs.title }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # release-notes.sh and version.sh both `cd` to the toplevel
+          fetch-depth: 0
+
+      - name: Check tag matches Cargo.toml
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          crate="$(tools/version.sh)"
+          if [ "$tag" != "$crate" ]; then
+            echo "tag $tag does not match Cargo.toml $crate" >&2
+            exit 1
+          fi
+
+      - name: Extract release notes
+        id: notes
+        run: |
+          version="$(tools/version.sh)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "title=$(tools/release-notes.sh "$version" --title)" >> "$GITHUB_OUTPUT"
+          tools/release-notes.sh "$version" --body > release-notes.md
+          echo "--- release body ---"
+          cat release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows is the only platform that gets the GUI: it is what the
+          # releases have always shipped.
+          - name: windows-x86_64
+            os: windows-latest
+            gui: true
+          - name: linux-x86_64
+            os: ubuntu-latest
+            gui: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      # --no-default-features drops `gui`, so the CLI links none of
+      # eframe/rfd/rodio and needs no GTK, ALSA or X11 packages on the runner.
+      - name: Build CLI
+        run: cargo build --release --locked --no-default-features --bin heightmap
+
+      - name: Build GUI
+        if: matrix.gui
+        run: cargo build --release --locked --bin heightmap_gui --features gui
+
+      # One folder, so the upload/download round trip has a single predictable
+      # shape regardless of how many binaries a platform produces.
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Asset names are deliberately unsuffixed: `heightmap` for unix and
+          # `heightmap.exe` for windows is what every release since 0.0.1 has
+          # used, and people link them directly.
+          if [ "${{ matrix.gui }}" = "true" ]; then
+            cp target/release/heightmap.exe dist/heightmap.exe
+            cp target/release/heightmap_gui.exe dist/heightmap_gui.exe
+          else
+            cp target/release/heightmap dist/heightmap
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: staging
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      # One file covering every asset, so a download can be verified without
+      # the GitHub CLI.
+      - name: Checksums
+        working-directory: staging
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Ties these bytes to this workflow run and commit, the only signature
+      # these binaries carry.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'staging/heightmap*'
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.version }}
+          TITLE: ${{ needs.prepare.outputs.title }}
+        run: |
+          # Idempotent so a re-run (or a workflow_dispatch over an existing tag)
+          # refreshes the notes and re-uploads the assets instead of failing.
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --notes-file release-notes.md
+            gh release upload "$TAG" \
+              --repo "${{ github.repository }}" \
+              --clobber \
+              staging/*
+          else
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --notes-file release-notes.md \
+              staging/*
+          fi

@@ -325,6 +325,12 @@ pub struct VideoApp {
     /// geometry: unlike `text_char_repeat` it changes no character count, so
     /// neither the band layout nor the cost readout consults it.
     text_width_scale: f32,
+    /// TEXT MODE ONLY. Forces the three-digit `<color="FFF">` tag. Same
+    /// trade-off as the Image2Text pane's control; see
+    /// [`crate::text::TextOptions::short_hex`]. A user choice rather than
+    /// calibration, so [`Self::load_text_preset`] leaves it alone, the same
+    /// treatment [`crate::gui::text::TextApp`] gives `material`.
+    text_short_hex: bool,
     /// TEXT MODE ONLY. The component `LineHeight` (font size); the Image2Text
     /// pane calls this control "Font Size".
     text_line_height: f32,
@@ -411,6 +417,7 @@ impl Default for VideoApp {
             text_empty_char: text_default.empty_char.to_string(),
             text_char_repeat: text_default.char_repeat,
             text_width_scale: text_default.width_scale,
+            text_short_hex: text_default.short_hex,
             text_line_height: text_default.line_height,
             colors: d.colors,
             subtitles: None,
@@ -509,6 +516,7 @@ impl VideoApp {
             empty_char: self.text_empty_char.chars().next().unwrap_or(' '),
             char_repeat: self.text_char_repeat.max(1),
             width_scale: self.text_width_scale,
+            short_hex: self.text_short_hex,
             // Same slider that culls brick-mode pixels, not a second control
             // (see `anim_options` in main.rs for why both fields must match).
             alpha_threshold: self.alpha_threshold,
@@ -998,7 +1006,7 @@ impl VideoApp {
             // here is inert, and a row of values would imply otherwise.
             return vec!["Text mode only".to_string()];
         }
-        vec![
+        let mut chips = vec![
             self.text_preset.name().to_string(),
             format!("x{} repeat", self.text_char_repeat),
             format!("width {:.2}", self.text_width_scale),
@@ -1007,7 +1015,13 @@ impl VideoApp {
                 0 => "full colour".to_string(),
                 n => format!("{n} colours"),
             },
-        ]
+        ];
+        // Only the non-default state earns a chip, as in `picture_chips`, so
+        // the row carries no permanent "off" entry per toggle.
+        if self.text_short_hex {
+            chips.push("3-digit color".to_string());
+        }
+        chips
     }
 
     fn text_is_tuned(&self) -> bool {
@@ -1021,6 +1035,7 @@ impl VideoApp {
                 || self.text_empty_char != d.text.empty_char.to_string()
                 || self.text_char_repeat != d.text.char_repeat
                 || self.text_width_scale != d.text.width_scale
+                || self.text_short_hex != d.text.short_hex
                 || self.text_line_height != d.text.line_height
                 || self.colors != d.colors)
     }
@@ -1156,7 +1171,7 @@ impl VideoApp {
                         ui.label("Width");
                         widgets::slider(
                             ui,
-                            egui::Slider::new(&mut self.text_width_scale, 1.0..=2.0).step_by(0.05),
+                            egui::Slider::new(&mut self.text_width_scale, 1.0..=2.5).step_by(0.05),
                         )
                         .on_hover_text(
                             "Component WidthScale: stretches each glyph and its advance \
@@ -1164,6 +1179,13 @@ impl VideoApp {
                              doubling it up. Pure geometry -- it sends no extra characters, \
                              so the bound below does not move",
                         );
+                        widgets::toggle(ui,&mut self.text_short_hex, "3-digit color")
+                            .on_hover_text(
+                                "Force the three-digit colour tag (<color=\"FFF\">), saving \
+                                 3 characters a tag plus merging runs whose colours land on \
+                                 the same quantized level, at the cost of quantizing every \
+                                 colour to 4 bits per channel",
+                            );
                     });
                 },
             );
@@ -1654,9 +1676,10 @@ impl VideoApp {
         ui.label(format!(
             "{} band(s) of {rows} row(s); UPPER BOUND {per_band} character(s) per band per \
              frame ({row} per {w}-pixel row: 16 for a colour tag + {repeat} glyph char(s) per \
-             pixel, worst case every pixel starting its own run; a tag whose channels all \
-             repeat a digit spends 13). NOT an estimate -- real length is content-dependent, \
-             which is why no character total is reported above; Colours is what shortens it",
+             pixel, worst case every pixel starting its own run; a tag spends 13 when its \
+             channels repeat a digit, or always with 3-digit color on). NOT an estimate: \
+             real length is content-dependent, which is why no character total is reported \
+             above; Colours is what shortens it",
             plan.len(),
         ));
     }
@@ -2205,6 +2228,7 @@ mod tests {
         app.text_char_repeat = 3;
         app.text_fill_char = "#".to_string();
         app.text_empty_char = ".".to_string();
+        app.text_short_hex = true;
         app.alpha_threshold = 77;
 
         let opts = app.anim_opts();
@@ -2212,6 +2236,7 @@ mod tests {
         assert_eq!(opts.text.char_repeat, 3);
         assert_eq!(opts.text.fill_char, '#');
         assert_eq!(opts.text.empty_char, '.');
+        assert!(opts.text.short_hex);
         // Both fields, not just the top-level one -- see `anim_opts`'s doc
         // for why the palette needs the encoder's own visibility rule.
         assert_eq!(opts.alpha_threshold, 77);

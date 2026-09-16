@@ -253,7 +253,7 @@ pub fn estimate_text(
 ) -> Result<Cost, String> {
     // The band count depends on `char_repeat`: one glyph per pixel (the
     // default -- the presets draw a square pixel by stretching a single
-    // character to `width_scale` 2) fits more rows per component than a
+    // character to `width_scale` ~2) fits more rows per component than a
     // doubled-up one, so 192x108 bands 36 ways rather than 54. Reading the
     // option off the same struct the render is built from, rather than taking
     // it as a separate parameter, is what keeps this in sync with `--font`
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn text_mode_costs_two_gates_per_band_plus_the_clock() {
         // 192x108 at the default char_repeat 1 -> 36 bands (it was 54 when a
-        // square pixel cost two characters instead of one at width_scale 2).
+        // square pixel cost two characters instead of one at width_scale ~2).
         let c = estimate_text(192, 108, 300, &opts(BANK_FRAMES)).expect("a legal geometry must estimate");
         assert_eq!(c.banks, 1);
         assert_eq!(c.gates, 2 * 36 + 7);

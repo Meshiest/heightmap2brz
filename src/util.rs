@@ -437,6 +437,23 @@ pub fn hex_digit(b: u8) -> &'static str {
     &HEX_PAIRS[i..i + 1]
 }
 
+/// Round each channel of `rgb` to the nearest of the 16 values
+/// [`is_short_hex`] accepts (`0x00, 0x11, 0x22, ... 0xFF`), so the result
+/// always spells with [`hex_digit`] alone. `crate::text::encode_row`'s
+/// `short_hex` option runs every pixel through this before it ever reaches
+/// the short-form check, rather than only benefiting the colours that already
+/// happened to qualify.
+///
+/// Rounds to the NEAREST level, not `c >> 4` (truncation). Truncation keeps
+/// only the high nibble and so always darkens: `0xFE` would land on `0xEE`, a
+/// full step down, where rounding keeps it at `0xFF`. Endpoints survive
+/// exactly and every other value drifts by at most half a step. Adding half
+/// the divisor (127) before dividing is what turns the integer floor into a
+/// round; multiplying by 17 (`0xFF / 15`) re-expands the level to 8 bits.
+pub fn quantize_short_hex(rgb: [u8; 3]) -> [u8; 3] {
+    rgb.map(|c| (((c as u16 * 15 + 127) / 255) as u8) * 17)
+}
+
 /// [`to_linear_gamma`] evaluated for every possible input, computed once.
 ///
 /// The transfer is an `f64` `powf(2.4)` per channel -- tens of nanoseconds --
@@ -937,6 +954,56 @@ mod tests {
             }
         }
         assert_eq!(short, 16, "exactly one byte per hex digit doubles");
+    }
+
+    /// `short_hex`'s whole reason to exist is that the emit branch in
+    /// `encode_row` can always take the three-digit path once quantized. If
+    /// even one of the 256 inputs quantized to a value `is_short_hex`
+    /// rejects, that branch would silently fall through to the long form.
+    #[test]
+    fn every_byte_quantizes_to_a_value_is_short_hex_accepts() {
+        for c in 0..=255u8 {
+            let q = quantize_short_hex([c, 0, 0])[0];
+            assert!(is_short_hex(q), "byte {c:#04X} quantized to {q:#04X}, which is not short");
+        }
+    }
+
+    /// Turning `short_hex` on must never move a colour that did not need
+    /// moving: every byte already accepted by `is_short_hex` has to be a
+    /// fixed point of quantization, and quantizing an already-quantized byte
+    /// a second time must agree with the first (idempotent), or repeated
+    /// passes over the same colour could keep drifting it.
+    #[test]
+    fn already_short_bytes_are_fixed_points_and_quantization_is_idempotent() {
+        for c in 0..=255u8 {
+            let q = quantize_short_hex([c, 0, 0])[0];
+            let qq = quantize_short_hex([q, 0, 0])[0];
+            assert_eq!(qq, q, "byte {c:#04X}: quantizing its result again must not move it");
+            if is_short_hex(c) {
+                assert_eq!(q, c, "already-short byte {c:#04X} must quantize to itself");
+            }
+        }
+    }
+
+    /// The endpoints must not drift: a fully black or fully white pixel has
+    /// to stay exactly black or white.
+    #[test]
+    fn black_and_white_do_not_drift() {
+        assert_eq!(quantize_short_hex([0, 0, 0]), [0, 0, 0]);
+        assert_eq!(quantize_short_hex([255, 255, 255]), [255, 255, 255]);
+    }
+
+    /// Nearest-level rounding must actually behave like rounding: no channel
+    /// may move by more than half of a 17-wide step (rounded up, 8), which is
+    /// what separates it from truncation (`c >> 4`), whose error can reach a
+    /// full step.
+    #[test]
+    fn quantization_error_is_at_most_half_a_step() {
+        for c in 0..=255u8 {
+            let q = quantize_short_hex([c, 0, 0])[0];
+            let err = (q as i16 - c as i16).abs();
+            assert!(err <= 8, "byte {c:#04X} quantized to {q:#04X}, an error of {err}");
+        }
     }
 
     /// The `u8` lookup table must BE the function, for all 256 inputs -- not

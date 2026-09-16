@@ -37,7 +37,9 @@ You need [rust](https://www.rust-lang.org/). A
 | Run the GUI | `just gui` | `cargo run --bin heightmap_gui --features gui` |
 | Type-check | `just check` | `cargo check` |
 | Run the tests | `just test` | `cargo test` |
-| Release build (CLI + GUI) | `just dist` | `cargo build --release --bin heightmap` and `--bin heightmap_gui --features gui` |
+| Release build (CLI + GUI) | `just dist` | `cargo build --release --no-default-features --bin heightmap` and `--bin heightmap_gui --features gui` |
+| Preview the next release notes | `just notes` | -- |
+| Tag a release | `just tag [remote]`, `just tag-all` | -- |
 
 To build the GUI binary without running it:
 `cargo build --bin heightmap_gui --features gui`. `just sandbox` opens a live
@@ -45,6 +47,11 @@ gallery of the Brickadia egui theme.
 
 There is also a WebAssembly build of the GUI (audio, video and MIDI modes run in
 the browser); it is served with [trunk](https://trunkrs.dev/) from `index.html`.
+
+The CLI release build drops the default `gui` feature, so it links none of
+eframe/rfd/rodio and needs no GTK, ALSA or X11 packages to build on Linux.
+Tagging and release notes are covered in
+[`docs/RELEASING.md`](docs/RELEASING.md).
 
 ### Usage
 
@@ -173,12 +180,16 @@ In the GUI they appear in the **Brick Type** row as *Smooth Terrain*,
 `iosevka`, `orbitron`), the `--fill-char`/`--empty-char` glyphs,
 `--char-repeat`, `--width-scale`, `--alpha-threshold` and `--material`
 (`unlit`, `graffiti`, `plastic`, `metallic`, `glow`, `translucent`, `glass`).
-The monospace presets draw a square pixel with ONE character stretched to
-`--width-scale 2` rather than a doubled-up pair, so a render sends half the
-glyphs it used to; colours whose channels all repeat a digit also write the
-short `<color="F00">` tag. `--braille` and `--blocks` pack 8 or
-4 pixels per character for dense monochrome output (`--luma-threshold`,
-`--invert`).
+The monospace presets draw a square pixel with ONE character stretched wide
+rather than a doubled-up pair, so a render sends half the glyphs it used to
+(`--width-scale` defaults to 2.05 for `monaspace`, 2 for `iosevka`; `orbitron`
+is already square at 1, no stretch needed). Colours whose channels all repeat
+a digit write the short `<color="F00">` tag opportunistically; `--short-hex`
+forces it for every colour, quantizing each channel to the nearest of 16
+levels (and merging adjacent runs that land on the same level), trading some
+colour fidelity for up to 3 fewer characters per tag. `--braille` and
+`--blocks` pack 8 or 4 pixels per character for dense monochrome output
+(`--luma-threshold`, `--invert`).
 
 ```
 heightmap picture.png -i --text --font orbitron -o picture.brz

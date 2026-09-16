@@ -14,7 +14,7 @@ pub const MAX_COMPONENT_CHARS: usize = 10_000;
 /// Offset) tuned in-game for that font; values scale with pixel size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontPreset {
-    /// One `█` (or one space) per pixel, drawn at `WidthScale` 2 so the
+    /// One `█` (or one space) per pixel, drawn at `WidthScale` 2.05 so the
     /// half-width glyph cell renders square; monospace, so space-based
     /// transparency lines up.
     MonaspaceArgon,
@@ -93,6 +93,7 @@ impl FontPreset {
             shading: TextShading::None,
             shading_width: 2.0,
             invert_shading: false,
+            short_hex: false,
         };
         match self {
             // at LineHeight 0.61 Monaspace renders 30/32 of the nominal
@@ -101,6 +102,10 @@ impl FontPreset {
             FontPreset::MonaspaceArgon => TextOptions {
                 pitch_x: 30.0 / 32.0,
                 pitch_y: 30.0 / 32.0,
+                // measured in-game: base's 2.0 leaves a hairline seam down
+                // the middle of the square pixel; the half-width cell needs
+                // the extra 0.05 to close it
+                width_scale: 2.05,
                 ..base
             },
             FontPreset::IosevkaTerm => base,
@@ -232,13 +237,16 @@ pub struct TextOptions {
     pub line_world_height: f32,
     /// Component LineHeight (font size).
     pub line_height: f32,
-    /// Component WidthScale: horizontal glyph stretch, the game's 1.0-2.0
-    /// slider. It scales the glyph advance as well as the glyph, so one
-    /// `█` at 2.0 covers exactly what two at 1.0 do -- which is why the
-    /// monospace presets draw a square pixel with a single character
-    /// instead of a doubled-up pair, halving the text every colour mode
-    /// render sends. Purely a ratio, so unlike the world-unit geometry it is
-    /// never rescaled with `line_world_height`.
+    /// Component WidthScale: horizontal glyph stretch. The game's slider
+    /// runs 1.0-2.0, but that is not a hard limit, because the value is
+    /// written straight into the component. That is why Monaspace Argon's
+    /// calibrated default (2.05) sits just past the slider's top. It scales
+    /// the glyph advance as well as the glyph, so one `█` at 2.0 covers
+    /// exactly what two at 1.0 do, which is why the monospace presets draw a
+    /// square pixel with a single character instead of a doubled-up pair,
+    /// halving the text every colour mode render sends. Purely a ratio, so
+    /// unlike the world-unit geometry it is never rescaled with
+    /// `line_world_height`.
     pub width_scale: f32,
     /// Component LineOffset.
     pub line_offset: f32,
@@ -286,6 +294,20 @@ pub struct TextOptions {
     pub shading_width: f32,
     /// Invert Shading (the component's bFlipShading).
     pub invert_shading: bool,
+    /// Round every pixel's colour to the nearest [`crate::util::is_short_hex`]
+    /// level (`crate::util::quantize_short_hex`) before it is compared
+    /// against the running colour run and written as a `<color=...>` tag.
+    ///
+    /// This is a size/fidelity trade, and it is lossy: distinct nearby
+    /// colours can quantize to the same 16-level value, which loses the
+    /// original palette but is exactly what buys the size. A quantized run
+    /// always writes the three-digit tag (three characters cheaper than the
+    /// six-digit form), and pixels that used to end a run on a one-value
+    /// difference now often merge into their neighbour's run instead, paying
+    /// for one tag rather than two. Text mode's whole cost is characters, so
+    /// on a photographic image this can be substantial. Off by default: an
+    /// existing render must stay byte-identical unless this is turned on.
+    pub short_hex: bool,
 }
 
 impl TextOptions {
@@ -617,11 +639,14 @@ const COLOR_TAG_CLOSE: &str = "\">";
 const COLOR_TAG_CHARS: usize = COLOR_TAG_OPEN.len() + 6 + COLOR_TAG_CLOSE.len();
 
 /// The same tag in the three-digit form the game also parses: `<color="F00">`
-/// for `FF0000`. Available whenever all three channels have matching nibbles
-/// (16 values each: `00`, `11`, ... `FF`), which is exactly when the short
-/// form re-expands to the same colour -- so it is a pure size win, never a
-/// colour change. Three characters off every qualifying run adds up: a run is
-/// as short as one pixel, and text mode's whole cost is characters.
+/// for `FF0000`. Written opportunistically whenever all three channels
+/// already have matching nibbles (16 values each: `00`, `11`, ... `FF`),
+/// which is exactly when the short form re-expands to the same colour, so it
+/// is a pure size win and never a colour change. With `TextOptions::short_hex`
+/// on, every colour is quantized to a matching-nibble level first, so every
+/// tag qualifies rather than only the ones that already happen to. Three
+/// characters off every qualifying run adds up: a run is as short as one
+/// pixel, and text mode's whole cost is characters.
 ///
 /// The band layout deliberately does NOT budget for this (see
 /// `crate::anim::text_layout::TAG_CHARS`): it must hold for any frame, and a
@@ -664,7 +689,15 @@ fn encode_row(
         chars += pending_empty * opts.char_repeat;
         pending_empty = 0;
 
-        let rgb = [p[0], p[1], p[2]];
+        // Quantized BEFORE the run comparison below, not just before the tag
+        // is written: that is what lets two adjacent pixels whose real colours
+        // differ but land on the same short level merge into one run and pay
+        // for a single tag.
+        let rgb = if opts.short_hex {
+            crate::util::quantize_short_hex([p[0], p[1], p[2]])
+        } else {
+            [p[0], p[1], p[2]]
+        };
         if *last_color != Some(rgb) {
             // Byte-for-byte the `format!("<color=\"{:02X}{:02X}{:02X}\">", ..)`
             // this replaced -- see `crate::util::hex_pair` for why the
@@ -1464,7 +1497,7 @@ mod tests {
     }
 
     /// Encode with defaults -- one glyph per pixel, since the default preset
-    /// draws its square pixel with `width_scale` 2 rather than a doubled-up
+    /// draws its square pixel with `width_scale` 2.05 rather than a doubled-up
     /// character -- asserting a single band results.
     fn text(i: &RgbaImage) -> String {
         let bands = encode_bands(i, &TextOptions::default()).unwrap();
@@ -1561,6 +1594,96 @@ mod tests {
             text(&img(&[&[RED, GREEN]])),
             "<color=\"F00\">█<color=\"0F0\">█"
         );
+    }
+
+    /// With `short_hex` on, a colour that would otherwise need all six
+    /// digits (no channel's nibbles repeat) must still emit the three-digit
+    /// tag, and the long six-digit form must not appear anywhere in the
+    /// output. The flag is meant to make every colour cheap, not just the
+    /// ones that already qualified.
+    #[test]
+    fn short_hex_forces_the_three_digit_tag_for_an_arbitrary_colour() {
+        let opts = TextOptions {
+            short_hex: true,
+            ..Default::default()
+        };
+        let i = img(&[&[Rgba([0x12, 0x34, 0x56, 255])]]);
+        let bands = encode_bands(&i, &opts).unwrap();
+        let out = &bands[0].text;
+        assert_eq!(out.matches('<').count(), 1, "exactly one tag: {out}");
+        assert_eq!(out, "<color=\"135\">█", "nearest 4-bit level of 12/34/56");
+        assert_eq!(
+            out.chars().count(),
+            COLOR_TAG_SHORT_CHARS + 1,
+            "the short tag plus one glyph"
+        );
+        assert!(
+            !out.contains("123456"),
+            "no six-digit tag may appear once short_hex is on: {out}"
+        );
+    }
+
+    /// The same image without `short_hex` must still write the long form,
+    /// which is what makes the flag genuinely opt-in.
+    #[test]
+    fn short_hex_off_keeps_the_six_digit_tag() {
+        let i = img(&[&[Rgba([0x12, 0x34, 0x56, 255])]]);
+        assert_eq!(text(&i), "<color=\"123456\">█");
+    }
+
+    /// Two adjacent pixels whose colours differ but quantize to the same
+    /// short level must merge into ONE run once `short_hex` is on. This is
+    /// the whole run-merging win the option exists for, and it only works
+    /// because quantization happens before the `last_color` comparison in
+    /// `encode_row`, not merely at the point the tag text is chosen. With the
+    /// flag off the same two pixels are genuinely different colours, so they
+    /// must still emit two tags.
+    #[test]
+    fn adjacent_pixels_quantizing_the_same_merge_into_one_run() {
+        // 0x10 and 0x18 both round to 0x11: different colours, neither
+        // already short, quantizing together.
+        let a = [0x10u8, 0x10, 0x10];
+        let b = [0x18u8, 0x18, 0x18];
+        assert_eq!(
+            crate::util::quantize_short_hex(a),
+            crate::util::quantize_short_hex(b),
+            "test setup: these two colours must quantize to the same value"
+        );
+        assert_ne!(a, b, "test setup: the two source colours must actually differ");
+
+        let i = img(&[&[Rgba([a[0], a[1], a[2], 255]), Rgba([b[0], b[1], b[2], 255])]]);
+
+        let quantized = TextOptions {
+            short_hex: true,
+            ..Default::default()
+        };
+        let merged = encode_bands(&i, &quantized).unwrap();
+        assert_eq!(merged[0].text.matches('<').count(), 1, "one merged run");
+
+        let split = encode_bands(&i, &TextOptions::default()).unwrap();
+        assert_eq!(split[0].text.matches('<').count(), 2, "two distinct runs");
+    }
+
+    /// `bands[].chars` must equal the actual character count of `text` with
+    /// `short_hex` on too, the same convention every other test in this file
+    /// checks. The encoder budgets bands against this count, so a mismatch
+    /// here would mean a band could silently overrun the component limit.
+    #[test]
+    fn short_hex_row_char_count_matches_what_is_emitted() {
+        let opts = TextOptions {
+            short_hex: true,
+            ..Default::default()
+        };
+        let i = img(&[&[
+            Rgba([0x12, 0x34, 0x56, 255]),
+            Rgba([0x78, 0x9A, 0xBC, 255]),
+            CLEAR,
+            Rgba([0x12, 0x34, 0x56, 255]),
+        ]]);
+        let bands = encode_bands(&i, &opts).unwrap();
+        for b in &bands {
+            assert_eq!(b.chars, b.text.chars().count(), "{:?}", b.text);
+        }
     }
 
     #[test]

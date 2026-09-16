@@ -39,6 +39,9 @@ pub struct TextApp {
     mode: PixelMode,
     luma_threshold: u8,
     invert: bool,
+    // short_hex is a user choice rather than calibration, so `load_preset`
+    // leaves it alone, the same treatment `material` gets
+    short_hex: bool,
     /// world units between calibration tile anchors (tiny = tiny displays)
     cube_spacing: u32,
     // material; not reseeded by presets -- a user choice, not calibration
@@ -78,6 +81,7 @@ impl Default for TextApp {
             mode: d.mode,
             luma_threshold: d.luma_threshold,
             invert: d.invert,
+            short_hex: d.short_hex,
             cube_spacing: 30,
             material: d.material,
             material_intensity: d.material_intensity,
@@ -112,6 +116,7 @@ impl TextApp {
             mode: self.mode,
             luma_threshold: self.luma_threshold,
             invert: self.invert,
+            short_hex: self.short_hex,
             material: self.material,
             material_intensity: self.material_intensity,
             scuff: self.scuff,
@@ -278,7 +283,7 @@ impl TextApp {
                             ui.label("Width");
                             widgets::slider(
                                 ui,
-                                egui::Slider::new(&mut self.width_scale, 1.0..=2.0).step_by(0.05),
+                                egui::Slider::new(&mut self.width_scale, 1.0..=2.5).step_by(0.05),
                             )
                             .on_hover_text(
                                 "Component WidthScale: stretches each glyph (and its advance) \
@@ -286,6 +291,13 @@ impl TextApp {
                                  halving the text a render sends. Mono modes draw 2 pixels per \
                                  character already and always use 1",
                             );
+                            widgets::toggle(ui, &mut self.short_hex, "3-digit color")
+                                .on_hover_text(
+                                    "Force the three-digit colour tag (<color=\"FFF\">), saving \
+                                     3 characters a tag plus merging runs whose colours land on \
+                                     the same quantized level, at the cost of quantizing every \
+                                     colour to 4 bits per channel",
+                                );
                         });
                     });
                 },

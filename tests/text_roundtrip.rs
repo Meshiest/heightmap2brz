@@ -44,8 +44,8 @@ fn text_component_roundtrips_through_brz() {
         for c in comps {
             let text = c.prop("Text").unwrap().as_brdb_str().unwrap();
             // One glyph per pixel (the preset draws a square pixel with
-            // WidthScale 2 instead of a doubled-up character), and the short
-            // three-digit colour tags FF0000/00FF00 are allowed to take.
+            // WidthScale 2.05 instead of a doubled-up character), and the
+            // short three-digit colour tags FF0000/00FF00 are allowed to take.
             assert_eq!(text, "<color=\"F00\">██\n<color=\"0F0\">█ <color=\"F00\">█");
             let anchor = c.prop("Anchor").unwrap();
             assert_eq!(anchor.prop("X").unwrap().as_brdb_f32().unwrap(), 0.0);
@@ -56,7 +56,7 @@ fn text_component_roundtrips_through_brz() {
             // the stretch that makes one monospace glyph a square pixel --
             // read back out of the save, not just off the options struct
             let width_scale = c.prop("WidthScale").unwrap().as_brdb_f32().unwrap();
-            assert_eq!(width_scale, 2.0);
+            assert_eq!(width_scale, 2.05);
             let offset = c.prop("Offset").unwrap();
             assert_eq!(offset.prop("X").unwrap().as_brdb_f32().unwrap(), 0.0);
             assert_eq!(offset.prop("Y").unwrap().as_brdb_f32().unwrap(), -0.2);
@@ -145,7 +145,7 @@ fn a_label_stays_unstretched_while_the_picture_it_annotates_does_not() {
     img.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
 
     let opts = TextOptions::default();
-    assert_eq!(opts.width_scale, 2.0, "the preset must be the stretched one");
+    assert_eq!(opts.width_scale, 2.05, "the preset must be the stretched one");
 
     let mut world = World::new();
     add_text_bricks(&mut world, encode_bands(&img, &opts).unwrap(), &opts);
@@ -176,7 +176,7 @@ fn a_label_stays_unstretched_while_the_picture_it_annotates_does_not() {
     assert_eq!(
         seen,
         vec![
-            ("<color=\"F00\">█".to_string(), 2.0),
+            ("<color=\"F00\">█".to_string(), 2.05),
             ("a label".to_string(), 1.0),
         ],
         "the picture stretches, the label does not"

@@ -32,11 +32,13 @@ use crate::text::MAX_COMPONENT_CHARS;
 /// (2). The worst-case row bound assumes every pixel emits one, which is what
 /// `heightmap::text::encode_row` does when no two neighbours share a colour.
 ///
-/// Deliberately the LONG form, even though the encoder writes a 13-character
-/// short tag whenever all three channels repeat a digit: the layout is fixed
-/// once for the whole clip, before any frame is seen, so it has to hold for
-/// the frame whose colours cannot shorten. Budgeting 13 here would band a
-/// clip that a single long-form frame then overruns.
+/// Deliberately the LONG form. Without `--short-hex` the encoder writes the
+/// 13-character short tag only when a run's channels already repeat a digit;
+/// with it, every tag does. Either way 13 stays under 16, so budgeting the
+/// long form here bounds both cases. The layout is fixed once for the whole
+/// clip, before any frame is seen, so it has to hold for the frame whose
+/// colours cannot shorten. Budgeting 13 here would band a clip that a single
+/// long-form frame then overruns.
 const TAG_CHARS: usize = 16;
 
 /// One `TextDisplay`'s worth of image rows, fixed for the whole clip.
@@ -132,7 +134,7 @@ mod tests {
     #[test]
     fn rows_per_band_matches_the_documented_constants() {
         // one glyph per pixel: the default, since the presets draw a square
-        // pixel by stretching a single character to `width_scale` 2
+        // pixel by stretching a single character to `width_scale` ~2
         assert_eq!(plan_bands(192, 108, 1).unwrap()[0].rows, 3);
         assert_eq!(plan_bands(96, 108, 1).unwrap()[0].rows, 6);
         assert_eq!(plan_bands(64, 108, 1).unwrap()[0].rows, 9);

@@ -108,8 +108,9 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg fillchar: --("fill-char") +takes_value "Text mode: glyph for opaque pixels (default █)")
         (@arg emptychar: --("empty-char") +takes_value "Text mode: glyph for transparent pixels (default space)")
         (@arg charrepeat: --("char-repeat") +takes_value "Text mode: glyph characters emitted per pixel (default 1). One character is a square pixel at --width-scale 2; raise this only to stretch a pixel wider still")
-        (@arg widthscale: --("width-scale") +takes_value "Text mode: component WidthScale -- horizontal glyph stretch, 1.0-2.0 in game (default 2 for the monospace presets, 1 for orbitron and the monochrome modes). It scales the glyph advance too, so one character at 2 covers what two at 1 do, for half the characters")
+        (@arg widthscale: --("width-scale") +takes_value "Text mode: component WidthScale, the horizontal glyph stretch. The game's slider runs 1.0-2.0, but that is not a hard limit, because the value is written straight into the component (default 2.05 for Monaspace Argon, past the slider's top; 2 for Iosevka Term, 1 for orbitron and the monochrome modes). It scales the glyph advance too, so one character at 2 covers what two at 1 do, for half the characters")
         (@arg alphathreshold: --("alpha-threshold") +takes_value "Text mode: alpha below this is transparent (default 128)")
+        (@arg shorthex: --("short-hex") "Text mode: force the three-digit colour tag (<color=\"FFF\">), saving 3 characters a tag plus merging runs whose colours land on the same quantized level, at the cost of quantizing every colour to 4 bits per channel (default off)")
         (@arg lineheight: --("line-height-world") +takes_value "Text mode: world units per pixel row / pixel size (default 1)")
         (@arg font: --font +takes_value "Text mode: font preset (monaspace, iosevka, orbitron; default monaspace)")
         (@arg braille: --braille "Text mode: monochrome braille glyphs (8 pixels per character)")
@@ -141,7 +142,7 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg midipolyphony: --("polyphony-cap") +takes_value "MIDI: maximum speakers per instrument, however many notes it plays at once (default 8). A busier instrument steals its oldest sounding note")
         (@arg midirate: --("playback-rate") +takes_value "MIDI: playback speed multiplier baked into the clock (default 1.0; 2.0 = double speed, 0.5 = half). The generated Rate pin still overrides it at runtime")
         (@arg nopercussion: --("no-percussion") "MIDI: skip the percussion channel (10). By default each drum note plays a oneshot sample, mapped from its General MIDI drum note through a fold table; this builds only the pitched instruments")
-        (@arg animmode: --("anim-mode") +takes_value "Animation output mode (brick, text). 'brick' builds one display brick per pixel, driven by the encoding --anim-encoding selects. 'text' builds one animated Component_TextDisplay per BAND of image rows instead -- roughly two orders of magnitude fewer gates (a 192x108 clip is 113 gates against 4613), at the cost of glyph-grid rendering rather than real bricks. Text mode reuses --font, --char-repeat, --width-scale, --fill-char, --empty-char, --alpha-threshold and --line-height-world, and adds --colors")
+        (@arg animmode: --("anim-mode") +takes_value "Animation output mode (brick, text). 'brick' builds one display brick per pixel, driven by the encoding --anim-encoding selects. 'text' builds one animated Component_TextDisplay per BAND of image rows instead, roughly two orders of magnitude fewer gates (a 192x108 clip is 113 gates against 4613), at the cost of glyph-grid rendering rather than real bricks. Text mode reuses --font, --char-repeat, --width-scale, --fill-char, --empty-char, --alpha-threshold, --line-height-world and --short-hex, and adds --colors")
         (@arg animcolors: --("colors") +takes_value "Text mode: quantize to at most N colours with a median-cut palette (default 0 = full 24-bit colour). Fewer colours means longer same-colour runs and a smaller save; useful values are 16 to 64")
         (@arg animencoding: --("anim-encoding") +takes_value "Animation pixel encoding (hex, color-array; default hex). 'hex' packs each frame into a shared RRGGBB string per chunk; 'color-array' gives each pixel its own colour array -- fewer gate evaluations and no string work, at the cost of more host RAM to build")
         (@arg animfps: --fps +takes_value "Animation output frame rate (default 10)")
@@ -1715,7 +1716,8 @@ fn log_cost(mode: AnimMode, cost: &cost::Cost, width: u32, height: u32, char_rep
                         "  {} band(s) of {rows} row(s); UPPER BOUND {per_band} character(s) per \
                          band per frame ({row} per {width}-pixel row: 16 for a colour tag + \
                          {repeat} glyph char(s) per pixel, worst case every pixel starting its \
-                         own run; a tag whose channels all repeat a digit spends 13). NOT an \
+                         own run; a tag spends 13 when its channels repeat a digit, or always \
+                         with --short-hex). NOT an \
                          estimate -- real length is content-dependent, which is why no character \
                          total is reported above; --colors is what shortens it",
                         plan.len(),
@@ -1917,8 +1919,10 @@ fn anim_options(
 /// The `TextOptions` every text-rendering path shares: `--font`,
 /// `--fill-char`, `--empty-char`, `--char-repeat`, `--width-scale`, `--alpha-threshold`,
 /// `--line-height-world`, `--braille`/`--blocks`, `--luma-threshold`,
-/// `--invert`, `--material`. Numeric values go through [`parse_arg`], so a
-/// mistyped `--char-repeat two` is a CLI error naming the flag.
+/// `--invert`, `--material`, `--short-hex`. Numeric values go through
+/// [`parse_arg`], so a mistyped `--char-repeat two` is a CLI error naming the
+/// flag. Called on both the image2text path and `--anim-mode text`, so
+/// `--short-hex` covers both from this one flag.
 #[cfg(not(target_arch = "wasm32"))]
 fn text_options(matches: &clap::ArgMatches) -> Result<TextOptions, String> {
     let preset = match matches.value_of("font").map(|s| s.to_lowercase()).as_deref() {
@@ -1994,6 +1998,7 @@ fn text_options(matches: &clap::ArgMatches) -> Result<TextOptions, String> {
         )?,
         invert: matches.is_present("invert"),
         material,
+        short_hex: matches.is_present("shorthex"),
         ..d
     };
     let text_opts = if text_opts.mode == PixelMode::Color {
