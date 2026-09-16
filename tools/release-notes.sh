@@ -36,6 +36,7 @@ done
 # matches one for `0.1.0`.
 SECTION="$(
     awk -v ver="$VERSION" '
+        { sub(/\r$/, "") }  # CHANGELOG.md may be checked out CRLF
         index($0, "## ") == 1 {
             if (found) exit
             rest = substr($0, 4)

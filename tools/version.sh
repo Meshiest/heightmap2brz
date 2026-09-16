@@ -14,7 +14,7 @@ VERSION="$(
     awk '
         /^\[package\]/ { in_pkg = 1; next }
         /^\[/          { in_pkg = 0 }
-        in_pkg && /^version[[:space:]]*=/ { gsub(/[",]/, ""); print $3; exit }
+        in_pkg && /^version[[:space:]]*=/ { gsub(/[",\r]/, ""); print $3; exit }
     ' Cargo.toml
 )"
 
