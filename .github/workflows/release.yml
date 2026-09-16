@@ -41,7 +41,7 @@ jobs:
       - name: Check tag matches Cargo.toml
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
-          crate="$(tools/version.sh)"
+          crate="$(bash tools/version.sh)"
           if [ "$tag" != "$crate" ]; then
             echo "tag $tag does not match Cargo.toml $crate" >&2
             exit 1
@@ -50,10 +50,10 @@ jobs:
       - name: Extract release notes
         id: notes
         run: |
-          version="$(tools/version.sh)"
+          version="$(bash tools/version.sh)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "title=$(tools/release-notes.sh "$version" --title)" >> "$GITHUB_OUTPUT"
-          tools/release-notes.sh "$version" --body > release-notes.md
+          echo "title=$(bash tools/release-notes.sh "$version" --title)" >> "$GITHUB_OUTPUT"
+          bash tools/release-notes.sh "$version" --body > release-notes.md
           echo "--- release body ---"
           cat release-notes.md
 

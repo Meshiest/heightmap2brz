@@ -29,7 +29,7 @@ for arg in "$@"; do
         *) VERSION="$arg" ;;
     esac
 done
-[ -n "$VERSION" ] || VERSION="$(tools/version.sh)"
+[ -n "$VERSION" ] || VERSION="$(bash tools/version.sh)"
 
 # The heading is matched on the version followed by end-of-line or a space, so
 # `## 0.1.0` never matches a lookup for `0.1` and `## 0.10.0 - ...` never

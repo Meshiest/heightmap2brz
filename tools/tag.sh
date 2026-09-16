@@ -23,12 +23,12 @@ else
     REMOTES=("${REMOTE:-origin}")
 fi
 
-VERSION="$(tools/version.sh)"
+VERSION="$(bash tools/version.sh)"
 TAG="${VERSION}"
 
 # The release body comes from CHANGELOG.md, so a missing section means CI would
 # publish an empty release. Fail here, where it costs a commit rather than a tag.
-if ! tools/release-notes.sh "$VERSION" >/dev/null; then
+if ! bash tools/release-notes.sh "$VERSION" >/dev/null; then
     echo "!> add a '## ${VERSION} - <theme>' section to CHANGELOG.md before tagging" >&2
     exit 1
 fi
@@ -77,7 +77,7 @@ for REMOTE in "${REMOTES[@]}"; do
     fi
 done
 
-TITLE="$(tools/release-notes.sh "$VERSION" --title)"
+TITLE="$(bash tools/release-notes.sh "$VERSION" --title)"
 
 git tag -a "${TAG}" -m "${TITLE}"
 for REMOTE in "${REMOTES[@]}"; do
