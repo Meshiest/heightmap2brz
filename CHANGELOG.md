@@ -7,6 +7,10 @@ release body, so **the heading is the release title**: write it as
 version this file does not mention.
 
 
+## 0.20.0 - Optimized the quad optimizer
+
+- The quadtree optimizer uses about 6x less memory and runs about 10x faster. Output is unchanged.
+
 ## 0.19.0 - Stitched Seams
 
 - `--stitch` removes the same pixels `--cull` does, but treats them as a MASK

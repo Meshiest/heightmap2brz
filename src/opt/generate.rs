@@ -1,5 +1,5 @@
 use super::{
-    BitMask, QuadTree, gen_rampify_heightmap, gen_terrain_heightmap, gen_wedge_heightmap,
+    BitMask, TileGrid, gen_rampify_heightmap, gen_terrain_heightmap, gen_wedge_heightmap,
     greedy_mesh_binary_plane,
 };
 use crate::map::*;
@@ -64,7 +64,8 @@ pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
     gen_quad_heightmap(heightmap, colormap, options, progress_f)
 }
 
-/// Generate a heightmap using quadtree optimization
+/// Generate a heightmap using quadtree optimization: quad passes while
+/// `options.quadtree` allows, then line passes until none merges.
 pub fn gen_quad_heightmap<F: Fn(f32) -> bool>(
     heightmap: &dyn Heightmap,
     colormap: &dyn Colormap,
@@ -84,7 +85,7 @@ pub fn gen_quad_heightmap<F: Fn(f32) -> bool>(
     let quadtree_build_start = Instant::now();
     let (width, height) = heightmap.size();
     let area = width * height;
-    let mut quad = QuadTree::new(heightmap, colormap)?;
+    let mut quad = TileGrid::new(heightmap, colormap)?;
     let quadtree_build_duration = quadtree_build_start.elapsed();
     info!(
         "Built quadtree in {:.2}s",
