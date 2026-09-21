@@ -6,7 +6,23 @@ release body, so **the heading is the release title**: write it as
 `## <version> - <theme>` before tagging, and `just tag` will refuse to tag a
 version this file does not mention.
 
-Entries up to 0.16.2 were backfilled from the GitHub releases they shipped as.
+
+## 0.19.0 - Stitched Seams
+
+- `--stitch` removes the same pixels `--cull` does, but treats them as a MASK
+  rather than a hole: the height field keeps the terrain under them, so
+  `--wedge` and `--rampify` shape the surface the way a full render would and
+  stop square at the seam. One map can then be built in several passes, a
+  coarse distant render beside a fine near one, each masking out the other's
+  ground. `--cull` cannot, because it chamfers and slopes both sides away from
+  the seam and leaves a gap. Nothing is built over a masked pixel and no slope
+  runs into one. In the GUI it is a **Keep Shape** toggle under the Brick Type
+  buttons, shown once Wedge Terrain or Rampify is selected.
+- The text pane's Pixel Size slider runs to 64 units per pixel row and no
+  longer clamps a typed value, so the GUI can reach the sizes
+  `--line-height-world` always accepted. A text render is vector glyphs on
+  1x1x1 anchor cubes, so a large value only spreads the cubes apart, which is
+  what an image meant to be read from a long way off needs.
 
 ## 0.18.0 - Shorter Color Tags
 

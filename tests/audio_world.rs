@@ -1292,26 +1292,43 @@ fn the_cluster_layout_is_deterministic() {
         }
     }
 
-    // A FIXED oracle for the default bank, written out rather than
-    // recomputed. Repeating the call proves only that the layout is
-    // self-consistent WITHIN one process, which a per-process shuffle (a
-    // hash-order dependency, a seed taken once at startup) also is. Only a
-    // constant catches that: the mapping is x fastest, then y, then z, over a
-    // 4x3x3 box on the measured (10, 10, 12) cell.
-    for (band, want) in [
-        (0usize, (5, 5, 6)),
-        (1, (15, 5, 6)),
-        (3, (35, 5, 6)),
-        (4, (5, 15, 6)),
-        (11, (35, 25, 6)),
-        (12, (5, 5, 18)),
-        (31, (35, 15, 30)),
+    // A FIXED oracle for the default bank: the SLOT of the 4x3x3 box each
+    // band takes, x fastest, then y, then z. Repeating the call proves only
+    // that the layout is self-consistent WITHIN one process, which a
+    // per-process shuffle (a hash-order dependency, a seed taken once at
+    // startup) also is. Only a constant catches that.
+    //
+    // The slots are constants; the CELL is measured, because the cell is the
+    // speaker brick's own box and the GAME owns that number, the same reason
+    // `controls::measured_half` derives it at runtime.
+    let half = speaker_half();
+    assert_eq!(
+        (half.x, half.y, half.z),
+        (5, 5, 2),
+        "the measured half-extent of B_1x1F_Speaker changed, which resizes the whole \
+         cluster: check that DEFAULT_INNER_RADIUS still sits inside its diagonal, \
+         then update this line"
+    );
+    for (band, slot) in [
+        (0usize, (0, 0, 0)),
+        (1, (1, 0, 0)),
+        (3, (3, 0, 0)),
+        (4, (0, 1, 0)),
+        (11, (3, 2, 0)),
+        (12, (0, 0, 1)),
+        (31, (3, 1, 2)),
     ] {
         let p = speaker_position(band, 32);
+        let got = (
+            (p.x - half.x) / (2 * half.x),
+            (p.y - half.y) / (2 * half.y),
+            (p.z - half.z) / (2 * half.z),
+        );
         assert_eq!(
-            (p.x, p.y, p.z),
-            want,
-            "band {band} of 32 must always sit at {want:?}"
+            got, slot,
+            "band {band} of 32 must always take slot {slot:?} of the 4x3x3 box; \
+             it sat at ({}, {}, {})",
+            p.x, p.y, p.z
         );
     }
 

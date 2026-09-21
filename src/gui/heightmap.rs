@@ -116,6 +116,10 @@ pub struct HeightmapApp {
     horizontal_size: u16,
     optimization: OptimizationMode,
     opt_cull: bool,
+    /// Which KIND of removal Cull performs. Only the two renderers that
+    /// shape outlines read it, so the row that sets it is drawn only for
+    /// those. See [`CullMode`].
+    opt_stitch: bool,
     opt_nocollide: bool,
     opt_hdmap: bool,
     opt_snap: bool,
@@ -138,6 +142,7 @@ impl Default for HeightmapApp {
             horizontal_size: 1,
             optimization: OptimizationMode::Quad,
             opt_cull: false,
+            opt_stitch: false,
             opt_nocollide: false,
             opt_snap: false,
             opt_glow: false,
@@ -218,16 +223,31 @@ impl HeightmapApp {
         }
     }
 
-    fn options(&self, img_only: bool) -> GenOptions {
-        let img = img_only || (self.heightmaps.is_empty() && self.colormap.is_some());
-        // The sloped renderers are for a heightmap only. A flat image has no
-        // ground to slope, so the Image2Brick page uses blocks. If it did not,
-        // it would fill a level plane with wedges.
-        let surface = if img {
+    /// Is this render a flat image rather than terrain? The Image2Brick page
+    /// always is, and the heightmap page is too once a colormap is picked
+    /// with no heightmap to raise it.
+    fn is_img(&self, img_only: bool) -> bool {
+        img_only || (self.heightmaps.is_empty() && self.colormap.is_some())
+    }
+
+    /// The renderer this pane will actually run.
+    ///
+    /// The sloped renderers are for a heightmap only. A flat image has no
+    /// ground to slope, so the Image2Brick page uses blocks. If it did not,
+    /// it would fill a level plane with wedges. The Brick Type row still
+    /// offers the sloped buttons on that page, so a control that only a
+    /// sloped renderer reads has to follow THIS and not the button.
+    fn surface(&self, img_only: bool) -> SurfaceMode {
+        if self.is_img(img_only) {
             SurfaceMode::Blocks
         } else {
             self.mode.surface()
-        };
+        }
+    }
+
+    fn options(&self, img_only: bool) -> GenOptions {
+        let img = self.is_img(img_only);
+        let surface = self.surface(img_only);
         GenOptions {
             // `--size` counts STUDS in each mode, but micro mode counts
             // micro units. Use a saturating multiply: the slider does not
@@ -239,7 +259,11 @@ impl HeightmapApp {
                 self.horizontal_size.saturating_mul(5)
             },
             scale: self.vertical_scale,
-            cull: self.opt_cull,
+            cull: match (self.opt_cull, self.opt_stitch) {
+                (false, _) => CullMode::Off,
+                (true, false) => CullMode::Holes,
+                (true, true) => CullMode::Stitch,
+            },
             asset: match self.mode {
                 BrickMode::Default => PB_DEFAULT_BRICK,
                 BrickMode::Tile => PB_DEFAULT_BRICK,
@@ -574,11 +598,32 @@ impl HeightmapApp {
                                  terrain",
                             );
                     });
-                    if self.mode.surface() != SurfaceMode::Blocks {
+                    // The RENDER, not the button: the Image2Brick page and a
+                    // colormap with no heightmap both build flat-topped
+                    // blocks whatever Brick Type says, and the optimizers do
+                    // apply there.
+                    if self.surface(img_only) != SurfaceMode::Blocks {
                         ui.colored_label(
                             Color32::from_rgb(255, 200, 100),
                             "Note: this mode picks its own bricks per cell, so the Optimization and \
                              Snap settings above do not apply",
+                        );
+                    }
+                    // Beside the buttons that gate it, not up in the Options row:
+                    // only these two renderers read it, and a control that appears
+                    // above the click revealing it cannot be found.
+                    if matches!(
+                        self.surface(img_only),
+                        SurfaceMode::Wedge | SurfaceMode::Rampify
+                    ) {
+                        widgets::toggle(ui, &mut self.opt_stitch, "Keep Shape").on_hover_text(
+                            "Keep the ground under the pixels Cull removes, so the edges\n\
+                             around them stay square instead of sloping down into the gap\n\
+                             Lets you build one map in several passes: a coarse render for\n\
+                             the distance and a fine one up close, each hiding the other's\n\
+                             ground. Without it both passes slope away from where they meet\n\
+                             and leave a gap\n\
+                             Needs Cull, which is what removes the pixels",
                         );
                     }
                 });
@@ -840,6 +885,28 @@ mod tests {
         }
     }
 
+    /// Cull is the master switch and Keep Shape picks which KIND of removal
+    /// it is, so the pane can never ask for a stitch that removes nothing.
+    #[test]
+    fn the_cull_toggles_choose_the_removal_mode() {
+        let mut app = HeightmapApp::default();
+        app.mode = BrickMode::Wedge;
+        assert_eq!(app.options(false).cull, CullMode::Off);
+
+        app.opt_cull = true;
+        assert_eq!(app.options(false).cull, CullMode::Holes);
+
+        app.opt_stitch = true;
+        assert_eq!(app.options(false).cull, CullMode::Stitch);
+
+        app.opt_cull = false;
+        assert_eq!(
+            app.options(false).cull,
+            CullMode::Off,
+            "Keep Shape is a kind of removal, not a removal of its own"
+        );
+    }
+
     /// The readout must follow what the slider COUNTS in the selected mode.
     ///
     /// Micro mode counts micro units, and each other mode counts studs. The
@@ -920,6 +987,105 @@ mod tests {
         }
     }
 
+    /// The Keep Shape toggle appears only where it does something.
+    #[test]
+    fn keep_shape_is_painted_only_for_a_mode_that_reads_it() {
+        fn painted(mode: BrickMode, cull: bool) -> bool {
+            painted_on(mode, cull, false)
+        }
+        fn painted_on(mode: BrickMode, cull: bool, img_only: bool) -> bool {
+            let ctx = Context::default();
+            crate::gui::theme::install(&ctx);
+            let mut app = HeightmapApp::default();
+            app.mode = mode;
+            app.opt_cull = cull;
+            let mut shared = SharedOptions::default();
+            let mut texts: Vec<String> = Vec::new();
+            for _ in 0..4 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(900.0, 2400.0),
+                    )),
+                    ..Default::default()
+                };
+                let out = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.draw_settings(ui, &mut shared, img_only);
+                    });
+                });
+                texts = out
+                    .shapes
+                    .iter()
+                    .filter_map(|c| match &c.shape {
+                        egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            assert!(
+                texts.iter().any(|t| t == "Cull"),
+                "the Options row itself must be painted: {texts:?}"
+            );
+            texts.iter().any(|t| t == "Keep Shape")
+        }
+
+        // Visible on the strength of the Brick Type click alone. Requiring
+        // Cull as well hid it behind a second switch in a row ABOVE the one
+        // that reveals it, which is how it came to be reported missing.
+        assert!(painted(BrickMode::Wedge, false), "wedge shapes outlines");
+        assert!(painted(BrickMode::Rampify, false), "rampify shapes outlines");
+        assert!(painted(BrickMode::Wedge, true), "and still there with Cull on");
+        assert!(
+            !painted(BrickMode::Default, true),
+            "a flat-top mode builds the same save either way"
+        );
+        assert!(
+            !painted(BrickMode::Terrain, true),
+            "smooth terrain reads the heightmap directly and ignores the mode"
+        );
+        // The Brick Type row offers the sloped modes on the Image page too,
+        // but `options` forces Blocks there: a flat picture has no ground to
+        // shape. The toggle must follow the RENDER, not the button.
+        assert!(
+            !painted_on(BrickMode::Wedge, true, true),
+            "an image render is always flat-topped, whatever Brick Type says"
+        );
+    }
+
+    /// Does the pane paint the sloped-mode note?
+    fn painted_note(mode: BrickMode, img_only: bool) -> bool {
+        let ctx = Context::default();
+        crate::gui::theme::install(&ctx);
+        let mut app = HeightmapApp::default();
+        app.mode = mode;
+        let mut shared = SharedOptions::default();
+        let mut texts: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 2400.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_settings(ui, &mut shared, img_only);
+                });
+            });
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+        }
+        texts.iter().any(|t| t.starts_with("Note: this mode picks its own bricks"))
+    }
+
     /// The Brick Type and Optimization notes must sit BELOW their buttons, at
     /// the full width of the control column.
     ///
@@ -942,6 +1108,10 @@ mod tests {
         let mut app = HeightmapApp::default();
         app.mode = BrickMode::Terrain;
         let mut shared = SharedOptions::default();
+        assert!(
+            !painted_note(BrickMode::Terrain, true),
+            "an image render is flat-topped, so the optimizers DO apply and the note lies"
+        );
 
         let mut texts: Vec<(egui::Rect, String)> = Vec::new();
         // Four frames to settle: a table learns its column widths from the

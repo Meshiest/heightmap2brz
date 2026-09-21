@@ -81,9 +81,12 @@ impl Chip {
     ///
     /// This is the only way to put a brick in a chip. `half` is the brick's
     /// half-size, which the caller must supply: it cannot be derived
-    /// reliably, because `Brick::local_bounds` guesses `(5, 5, 6)` for any
-    /// basic brick, and every gate this crate emits is actually
-    /// [`GATE_HALF`] = `(5, 5, 2)`. The center is read from `brick.position`
+    /// reliably, because `Brick::local_bounds` falls back to `(5, 5, 6)` for
+    /// any basic brick missing from brdb's dump-derived size table, and every
+    /// gate this crate emits is actually [`GATE_HALF`] = `(5, 5, 2)`. A brick
+    /// the table does know reports its authored size, so the answer depends
+    /// on the catalog the dependency was built from. The center is read from
+    /// `brick.position`
     /// rather than passed separately, so there is no way for the recorded
     /// bounds to disagree with where the brick actually is.
     pub fn add_brick(&mut self, brick: Brick, half: IntVector) -> usize {

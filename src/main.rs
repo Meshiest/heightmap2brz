@@ -87,7 +87,8 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg colormap: -c --colormap +takes_value "Input colormap image (PNG/JPG)")
         (@arg vertical: -v --vertical +takes_value "Vertical scale multiplier (default 1)")
         (@arg size: -s --size +takes_value "Brick stud size (default 1)")
-        (@arg cull: --cull "Automatically remove bottom level bricks and fully transparent bricks")
+        (@arg cull: --cull "Automatically remove bottom level bricks and fully transparent bricks. The removed pixels become HOLES: --wedge and --rampify treat them as the outside of the build, chamfering and sloping the terrain down toward them")
+        (@arg stitch: --stitch "Remove the same pixels --cull does, but keep the ground under them: the edges around a removed region stay square instead of sloping down into it, so --wedge and --rampify shape the surface the way a full render would. Use it to build one map in several passes, a coarse render for the distance beside a fine one up close, each hiding the other's ground. --cull cannot, because it slopes both sides away from where they meet and leaves a gap. Implies removal, so it is used INSTEAD of --cull, not with it")
         (@arg tile: --tile "Render bricks as tiles")
         (@arg smooth: --smooth "Render bricks as smooth tiles")
         (@arg micro: --micro "Render bricks as micro bricks")
@@ -1531,7 +1532,10 @@ fn run_heightmap(
     let options = GenOptions {
         size: half_extent,
         scale,
-        cull: matches.is_present("cull"),
+        cull: match cull_mode(&matches) {
+            Ok(mode) => mode,
+            Err(e) => fail(e),
+        },
         asset: if matches.is_present("micro") {
             PB_DEFAULT_MICRO_BRICK
         } else if matches.is_present("tile") {
@@ -1554,6 +1558,14 @@ fn run_heightmap(
         greedy: matches.is_present("greedy"),
         surface,
     };
+
+    if options.cull == CullMode::Stitch && !matches!(surface, SurfaceMode::Wedge | SurfaceMode::Rampify) {
+        warn!(
+            "--stitch and --cull remove the same pixels and differ only in how --wedge \
+             and --rampify shape the terrain around them, so this render is the same \
+             either way"
+        );
+    }
 
     info!("Reading image files");
 
@@ -1824,6 +1836,27 @@ fn load_subtitles(
 // `main` branch needs, in one function instead of one copy per branch: two
 // parsers over the same flags drift apart silently, and the only symptom is
 // that identical input builds two different results.
+
+/// Which removal mode the flags ask for.
+///
+/// `--cull` and `--stitch` remove exactly the same pixels; they differ in
+/// what the removed cell MEANS to the renderers that shape outlines. They are
+/// one choice, so asking for both is refused the way two surface modes are,
+/// rather than one quietly winning.
+#[cfg(not(target_arch = "wasm32"))]
+fn cull_mode(matches: &clap::ArgMatches) -> Result<CullMode, String> {
+    match (matches.is_present("cull"), matches.is_present("stitch")) {
+        (true, true) => Err("--cull and --stitch remove the same pixels and differ only \
+             in what is left behind: --cull makes a HOLE, whose outline --wedge and \
+             --rampify close by chamfering and sloping the terrain into it, and --stitch \
+             makes a MASK, under which the terrain keeps its shape so another render can \
+             meet it at the seam. Pass one"
+            .to_string()),
+        (false, true) => Ok(CullMode::Stitch),
+        (true, false) => Ok(CullMode::Holes),
+        (false, false) => Ok(CullMode::Off),
+    }
+}
 
 /// The target size `--width`/`--height` name, or `None` when neither was
 /// passed and the source's own dimensions stand. `0` is refused: a
@@ -2621,6 +2654,19 @@ mod tests {
         }
         let err = target_size(&args(&["--width", "abc"]), 320, 240).expect_err("a typo");
         assert!(err.contains("--width"), "{err}");
+    }
+
+    /// The two removal flags are one choice, not a flag and a modifier:
+    /// `--stitch` stands alone, and asking for both is a contradiction
+    /// rather than a precedence puzzle.
+    #[test]
+    fn the_removal_flags_are_one_choice() {
+        assert_eq!(cull_mode(&args(&[])), Ok(CullMode::Off));
+        assert_eq!(cull_mode(&args(&["--cull"])), Ok(CullMode::Holes));
+        assert_eq!(cull_mode(&args(&["--stitch"])), Ok(CullMode::Stitch));
+        let err = cull_mode(&args(&["--cull", "--stitch"]))
+            .expect_err("both at once must be refused");
+        assert!(err.contains("--cull") && err.contains("--stitch"), "{err}");
     }
 
     /// **A glyph flag that cannot be honoured is refused, not reinterpreted.**

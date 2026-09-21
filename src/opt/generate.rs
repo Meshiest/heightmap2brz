@@ -203,7 +203,7 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
             let h = heightmap.at(x, y);
             let c = colormap.at(x, y);
             // Only add non-transparent pixels (or all if not culling)
-            if !options.cull || (h > 0 && c[3] > 0) {
+            if !options.cull.is_on() || (h > 0 && c[3] > 0) {
                 height_color_pairs.insert((h, c));
             }
         }
@@ -237,7 +237,7 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
             let h = heightmap.at(x, y);
             let c = colormap.at(x, y);
 
-            if !options.cull || (h > 0 && c[3] > 0) {
+            if !options.cull.is_on() || (h > 0 && c[3] > 0) {
                 if let Some(&plane_idx) = plane_map.get(&(h, c)) {
                     all_planes[plane_idx][x as usize].set_bit(y);
                 }

@@ -422,11 +422,23 @@ impl TextApp {
                 "Pixel Size",
                 Some("World units per pixel row (1.0 = calibrated glyph fit)"),
                 |ui| {
+                    // A text render is vector glyphs on 1x1x1 anchor cubes, so
+                    // this value only scales the glyphs and spreads the cubes
+                    // further apart. Nothing here approaches the brick size
+                    // limit, and the overlap hazard is at the SMALL end. The
+                    // track therefore stops where a render stops being useful
+                    // rather than where the format stops, and a typed value
+                    // goes past it, as --line-height-world has no ceiling.
                     if ui
                         .add(
-                            egui::Slider::new(&mut self.pixel_size, 0.01..=8.0)
+                            egui::Slider::new(&mut self.pixel_size, 0.01..=64.0)
+                                .clamping(egui::SliderClamping::Never)
                                 .logarithmic(true)
                                 .text("units"),
+                        )
+                        .on_hover_text(
+                            "The track stops at 64 units per pixel row, a wall-sized render. \
+                             Type a larger value to go above it, as --line-height-world does",
                         )
                         .changed()
                     {

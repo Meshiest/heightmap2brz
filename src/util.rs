@@ -31,11 +31,49 @@ pub enum SurfaceMode {
     Wedge,
 }
 
+/// What a removed pixel MEANS to the renderers that shape outlines.
+///
+/// `--cull` has always meant two things at once: place no brick here, and
+/// treat the cell as the outside of the build. [`SurfaceMode::Wedge`] and
+/// [`SurfaceMode::Rampify`] act on the second half by flattening the cell to
+/// nothing and chamfering the terrain around it, which is right for a hole
+/// and wrong for a region another build covers. `Stitch` splits the two apart:
+/// still no brick, but the height field keeps the cell's real terrain, so the
+/// surface runs through it unshaped and two renders of the same map meet
+/// flush at the seam.
+///
+/// The flat-top modes ([`SurfaceMode::Blocks`], and the quadtree and greedy
+/// optimizers) shape nothing across cells, so the two removal modes are
+/// indistinguishable there and only [`CullMode::is_on`] matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CullMode {
+    /// Keep every pixel. The default.
+    Off,
+    /// `--cull`: a removed pixel is a hole, and the outline closes around it.
+    Holes,
+    /// `--stitch`: a removed pixel is covered by another build, and the
+    /// surface continues under it.
+    Stitch,
+}
+
+impl CullMode {
+    /// Is any pixel removed at all? The only question the flat-top modes ask.
+    pub fn is_on(self) -> bool {
+        self != CullMode::Off
+    }
+
+    /// Does the surface continue under a removed pixel, rather than ending
+    /// at it? Only the two shaping renderers ask this.
+    pub fn stitches(self) -> bool {
+        self == CullMode::Stitch
+    }
+}
+
 pub struct GenOptions {
     pub size: u16,
     pub scale: u32,
     pub asset: BString,
-    pub cull: bool,
+    pub cull: CullMode,
     pub micro: bool,
     pub stud: bool,
     pub snap: bool,

@@ -264,7 +264,7 @@ impl QuadTree {
         self.tiles
             .iter()
             .flat_map(|t| {
-                if t.parent.is_some() || options.cull && (t.height == 0 || t.color[3] == 0) {
+                if t.parent.is_some() || options.cull.is_on() && (t.height == 0 || t.color[3] == 0) {
                     return vec![];
                 }
 

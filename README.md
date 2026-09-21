@@ -71,6 +71,8 @@ Common:
   -s, --size <n>          Brick stud size per pixel (default 1)
   -v, --vertical <n>      Vertical scale / height multiplier (default 1)
       --cull              Drop bottom-level and fully transparent bricks
+      --stitch            Drop the same bricks, but keep the terrain under
+                          them, so a masked render meets another one flush
       --glow              Emit at 0 glow intensity
       --nocollide         Disable brick collision
       --hdmap             RGB-encoded high-detail heightmap
@@ -165,6 +167,31 @@ pixel on real maps.
 ```
 heightmap heightmap.png -c colormap.png --wedge -v 4 -o wedged.brz
 ```
+
+#### Building one map in several passes
+
+`--cull` drops bottom-level and fully transparent pixels. `--wedge` and
+`--rampify` read a dropped pixel as a **hole**, the outside of the build, and
+close the outline around it by chamfering and sloping the terrain down toward
+it.
+
+That is wrong when the dropped pixels are ground that a second render covers,
+such as a coarse distant map beside a fine near one. Both passes then chamfer
+away from the shared seam and leave a gap. `--stitch` drops the same pixels as
+a **mask** instead. The height field keeps the terrain under them, so erosion,
+chamfering, ramp fitting and box merging all read continuous ground, and each
+pass stops square at the seam. Nothing is built over a masked pixel and no
+slope runs into one.
+
+```
+heightmap map.png -c near.png  --wedge -s 1  --stitch -o near.brz
+heightmap map.png -c far.png   --wedge -s 8  --stitch -o far.brz
+```
+
+Only `--wedge` and `--rampify` shape outlines across cells; every other mode
+builds the same save from either flag. Pass one or the other, never both. The
+GUI shows the choice as a **Keep Shape** toggle under the Brick Type buttons,
+once one of those two modes is selected.
 
 Add `--prefab` to any of them (or to any heightmap/`--img` render) to write a
 prefab bundle instead of a world, so the save can be dropped into Brickadia's

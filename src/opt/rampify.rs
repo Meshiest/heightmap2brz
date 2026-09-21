@@ -111,6 +111,12 @@ struct Field {
     height: i32,
     /// The number of solid cells in each column. The column fills `0..cells`.
     cells: Vec<i32>,
+    /// Columns that are removed from the build. Under `--cull` they are
+    /// empty anyway; under `--stitch` they keep their real height, so every
+    /// shape query still reads ordinary ground there and only PLACEMENT is
+    /// barred. The build that masked the column in is the one that fills it.
+    /// See [`CullMode`].
+    culled: Vec<bool>,
     colors: Vec<[u8; 4]>,
     /// The Z ranges of each column that a slope uses, with both ends included.
     /// A column holds only a small number of these, so a short `Vec` uses much
@@ -130,6 +136,12 @@ impl Field {
 
     fn exists(&self, cell: Cell) -> bool {
         cell.2 >= 0 && cell.2 < self.column(cell)
+    }
+
+    /// May a brick cover this column? Off the map is not placeable either:
+    /// a slope's footprint has to land on cells that exist.
+    fn placeable(&self, cell: Cell) -> bool {
+        self.index(cell.0, cell.1).is_some_and(|i| !self.culled[i])
     }
 
     fn is_ramp(&self, cell: Cell) -> bool {
@@ -181,6 +193,9 @@ impl Field {
             if !self.exists(cell + up + forward * run)
                 && self.exists(cell + forward * (run + 1))
                 && !self.is_ramp(cell + forward * (run + 1))
+                // the cell the run is about to claim is under the BRICK, so
+                // a masked column stops the run rather than being built over
+                && self.placeable(cell + forward * (run + 1))
             {
                 run += 1;
             } else {
@@ -259,7 +274,10 @@ impl Field {
             for i in 0..cells_a {
                 for j in 0..cells_b {
                     let footprint = cell + forward_a * i + forward_b * j;
-                    if !self.exists(footprint) || self.is_ramp(footprint) {
+                    if !self.exists(footprint)
+                        || self.is_ramp(footprint)
+                        || !self.placeable(footprint)
+                    {
                         return false;
                     }
                     let on_far_a = i == cells_a - 1;
@@ -518,6 +536,7 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
         width: width as i32,
         height: height as i32,
         cells: vec![0; count],
+        culled: vec![false; count],
         colors: vec![[0, 0, 0, 255]; count],
         claimed: vec![Vec::new(); count],
     };
@@ -527,7 +546,12 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
             let color = colormap.at(x, y);
             let shade = heightmap.at(x, y).min(i32::MAX as u32) as i32;
             field.colors[index] = color;
-            field.cells[index] = if options.cull && (shade == 0 || color[3] == 0) {
+            // Which removal mode decides what a removed cell MEANS to the
+            // terrain around it. A hole is empty, so the rampifier slopes
+            // the ground down into it; a stitched cell keeps its real
+            // column, so the ramps fit it as ordinary ground.
+            field.culled[index] = options.cull.is_on() && (shade == 0 || color[3] == 0);
+            field.cells[index] = if field.culled[index] && !options.cull.stitches() {
                 0
             } else {
                 // The `+ 1` gives a black pixel one plate of ground and not a
@@ -556,7 +580,7 @@ pub fn gen_rampify_heightmap<F: Fn(f32) -> bool>(
     // top. To sort by height and then by position visits the cells in the same
     // sequence as the loops over z, y and x.
     let mut anchors: Vec<u32> = (0..count as u32)
-        .filter(|i| field.cells[*i as usize] > 0)
+        .filter(|i| field.cells[*i as usize] > 0 && !field.culled[*i as usize])
         .collect();
     anchors.sort_unstable_by_key(|i| {
         let i = *i as usize;
@@ -772,7 +796,7 @@ fn fill_gaps<F: Fn(f32) -> bool>(
 /// holds.
 fn unclaimed_spans(field: &Field, index: usize) -> Vec<(i32, i32)> {
     let top = field.cells[index];
-    if top <= 0 {
+    if top <= 0 || field.culled[index] {
         return Vec::new();
     }
     let mut claimed = field.claimed[index].clone();
@@ -826,6 +850,7 @@ mod tests {
             width,
             height,
             cells,
+            culled: vec![false; count],
             colors: vec![[9, 8, 7, 255]; count],
             claimed: vec![Vec::new(); count],
         }
@@ -1048,6 +1073,113 @@ mod tests {
         }
     }
 
+    /// A heightmap from a closure, for whole-pipeline tests.
+    struct Fn2D(u32, u32, fn(u32, u32) -> u32);
+    impl Heightmap for Fn2D {
+        fn at(&self, x: u32, y: u32) -> u32 {
+            (self.2)(x, y)
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.0, self.1)
+        }
+    }
+
+    /// Transparent on the left half, opaque on the right.
+    struct HalfClear(u32, u32);
+    impl Colormap for HalfClear {
+        fn at(&self, x: u32, _y: u32) -> [u8; 4] {
+            [128, 128, 128, if x < self.0 / 2 { 0 } else { 255 }]
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.0, self.1)
+        }
+    }
+
+    fn gen_options(cull: CullMode) -> GenOptions {
+        GenOptions {
+            size: 5,
+            scale: 4,
+            asset: PB_DEFAULT_BRICK,
+            cull,
+            micro: false,
+            stud: false,
+            snap: false,
+            img: false,
+            glow: false,
+            hdmap: false,
+            nocollide: false,
+            quadtree: true,
+            greedy: false,
+            surface: SurfaceMode::Rampify,
+        }
+    }
+
+    fn rampify(hm: &dyn Heightmap, cm: &dyn Colormap, cull: CullMode) -> Vec<Brick> {
+        gen_rampify_heightmap(hm, cm, gen_options(cull), |_| true).unwrap()
+    }
+
+    /// Every brick that is a slope rather than a box: ramps, wedges and
+    /// corner ramps.
+    fn slopes(bricks: &[Brick]) -> usize {
+        bricks
+            .iter()
+            .filter(|b| asset(b) != PB_DEFAULT_BRICK.as_ref())
+            .count()
+    }
+
+    /// A hole is a cliff, and the rampifier answers a cliff by sloping the
+    /// terrain down into it. That carves away exactly the material the build
+    /// on the other side of the seam expects to meet. Under `--stitch`
+    /// the removed cells keep their height, so the plateau stays flat and
+    /// only its real outer edges slope.
+    #[test]
+    fn stitched_cells_do_not_slope_the_terrain_around_them() {
+        let hm = Fn2D(16, 16, |_, _| 2);
+        let holes = rampify(&hm, &HalfClear(16, 16), CullMode::Holes);
+        let stitched = rampify(&hm, &HalfClear(16, 16), CullMode::Stitch);
+        assert!(
+            slopes(&holes) > slopes(&stitched),
+            "--cull slopes the seam into the hole ({} slope(s)); --stitch must not ({})",
+            slopes(&holes),
+            slopes(&stitched)
+        );
+    }
+
+    /// A brick's half extents in WORLD axes. Unlike the wedge writer, the
+    /// rampifier stores a slope's run on the local X axis and lets the
+    /// rotation turn it, so an odd rotation swaps the two.
+    fn world_half(brick: &Brick) -> (i32, i32) {
+        let BrickType::Procedural { size, .. } = &brick.asset else {
+            panic!("rampify makes procedural bricks only")
+        };
+        match brick.rotation {
+            Rotation::Deg90 | Rotation::Deg270 => (size.y as i32, size.x as i32),
+            _ => (size.x as i32, size.y as i32),
+        }
+    }
+
+    /// `--stitch` removes the same cells `--cull` does; only the shape of
+    /// what is left changes. Nothing may be built over a masked cell, neither
+    /// a fill box nor a slope running in from the terrain beside it.
+    #[test]
+    fn stitched_cells_emit_no_bricks() {
+        // Rising toward -X, so every slope that fits wants to run INTO the
+        // masked half. A flat map would prove nothing here.
+        let hm = Fn2D(16, 16, |x, _| 16 - x);
+        let bricks = rampify(&hm, &HalfClear(16, 16), CullMode::Stitch);
+        assert!(!bricks.is_empty(), "the opaque half must still be built");
+        // Cells 0..8 are masked; the world seam between cell 7 and 8 is at
+        // -(16*5) + 8*10 = 0.
+        for b in &bricks {
+            assert!(
+                b.position.x - world_half(b).0 >= 0,
+                "a brick reaches into the masked half: {} - {}",
+                b.position.x,
+                world_half(b).0
+            );
+        }
+    }
+
     /// A zero brick size must be refused with an error, not a divide-by-zero
     /// panic in `fill_gaps` (`MAX_HALF_EXTENT / layout.half`).
     #[test]
@@ -1074,7 +1206,7 @@ mod tests {
             size: 0,
             scale: 4,
             asset: PB_DEFAULT_BRICK,
-            cull: false,
+            cull: CullMode::Off,
             micro: false,
             stud: false,
             snap: false,

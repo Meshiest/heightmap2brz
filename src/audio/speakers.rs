@@ -74,9 +74,13 @@ const VOLUME_SCALE: f64 = 1.0;
 
 /// The speaker brick's half-size as `layout::assert_bricks_dont_overlap`
 /// measures it (from `local_bounds`), floored at the true size
-/// ([`SPEAKER_HALF`]). brdb 0.9.1 returns a flat (5, 5, 6) guess for every
-/// basic brick; spacing on the guess is always safe (bigger, never smaller),
-/// while a hardcoded true height reads as a collision and is rejected.
+/// ([`SPEAKER_HALF`]).
+///
+/// The floor is what makes this safe when `local_bounds` answers with brdb's
+/// flat (5, 5, 6) fallback rather than the brick's authored size. Spacing on
+/// a measured value that is too BIG only wastes room, while a hardcoded true
+/// height under an inflated measurement reads as a collision and is rejected:
+/// always space on what the check measures, and never hardcode it.
 pub fn speaker_half() -> IntVector {
     let (min, max) = Brick {
         asset: BrickType::from(SPEAKER_BRICK),

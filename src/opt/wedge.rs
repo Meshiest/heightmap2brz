@@ -362,6 +362,11 @@ struct Plan<'a> {
     val: &'a [i32],
     colors: &'a [[u8; 4]],
     culled: &'a [bool],
+    /// Does the surface continue under a removed cell? See [`CullMode`].
+    /// Only [`Plan::shell_bottom`] asks: with a hole the drop to the floor
+    /// closes the outside of the build, and with a stitch the neighbouring
+    /// build's ground is already there to close it.
+    stitch: bool,
     /// Cells a wedge has claimed. Culled cells start claimed, so no pass
     /// puts a piece over them.
     consumed: Vec<bool>,
@@ -674,16 +679,22 @@ impl Plan<'_> {
     /// solid only up to the base of its wedge, and stopping at the height
     /// would leave a slot open under the wedge.
     ///
-    /// Anything on the map border, or against a culled cell, goes to the
-    /// floor: that is the outside of the build, with nothing beyond it to
-    /// hide a hollow.
+    /// Anything on the map border, or against a hole, goes to the floor:
+    /// that is the outside of the build, with nothing beyond it to hide a
+    /// hollow. A STITCHED cell is not the outside, because another build
+    /// covers it, so its own top bounds the shell and the seam stays flush
+    /// instead of hanging a wall down through ground that is already there.
     fn shell_bottom(&self, x: i32, y: i32, w: i32, hgt: i32, top: i32, floor: i32) -> i32 {
         if x == 0 || y == 0 || x + w == self.f.cols || y + hgt == self.f.rows {
             return floor;
         }
         let bt = |xx: i32, yy: i32| -> i32 {
             let i = self.idx(xx, yy);
-            if self.culled[i] { floor } else { self.box_to[i] }
+            if self.culled[i] && !self.stitch {
+                floor
+            } else {
+                self.box_to[i]
+            }
         };
         let mut lowest = i32::MAX;
         for dy in 0..hgt {
@@ -849,12 +860,15 @@ pub fn gen_wedge_heightmap<F: Fn(f32) -> bool>(
             let color = colormap.at(x, y);
             let shade = heightmap.at(x, y).min(1 << 24) as i32;
             colors[i] = color;
-            // The same rule as the other modes: with --cull, a fully
-            // transparent pixel and a pixel at the lowest level are removed.
-            // A culled cell keeps height zero, so its neighbours grow a
-            // proper chamfered cliff toward the hole.
-            culled[i] = options.cull && (shade == 0 || color[3] == 0);
-            field.h[i] = if culled[i] {
+            // The same rule as the other modes: with --cull or --stitch, a
+            // fully transparent pixel and a pixel at the lowest level are
+            // removed. Which of the two decides what the cell MEANS to the
+            // terrain around it: a hole keeps height zero, so its neighbours
+            // grow a proper chamfered cliff toward it, while a stitched cell
+            // keeps its real height, so erosion, chamfering and box merging
+            // all see ordinary ground running through it.
+            culled[i] = options.cull.is_on() && (shade == 0 || color[3] == 0);
+            field.h[i] = if culled[i] && !options.cull.stitches() {
                 0
             } else {
                 shade.saturating_mul(terrace).min(1 << 24)
@@ -891,6 +905,7 @@ pub fn gen_wedge_heightmap<F: Fn(f32) -> bool>(
         val: &val,
         colors: &colors,
         culled: &culled,
+        stitch: options.cull.stitches(),
         consumed: culled.clone(),
         box_to: field.h.clone(),
         pieces: Vec::new(),
@@ -1025,7 +1040,7 @@ mod tests {
             size: 5,
             scale,
             asset: PB_DEFAULT_MICRO_BRICK,
-            cull: false,
+            cull: CullMode::Off,
             micro: false,
             stud: false,
             snap: false,
@@ -1198,7 +1213,7 @@ mod tests {
     fn culled_cells_emit_no_bricks() {
         let hm = Fn2D(16, 16, |_, _| 2);
         let mut opts = options(4);
-        opts.cull = true;
+        opts.cull = CullMode::Holes;
         let bricks = build(&hm, &HalfClear(16, 16), opts);
         assert!(!bricks.is_empty(), "the opaque half must still be built");
         // Cells 0..8 are culled; the world seam between cell 7 and 8 is at
@@ -1214,6 +1229,207 @@ mod tests {
                 size.x
             );
         }
+    }
+
+    /// A plateau with everything outside its first quadrant masked out of
+    /// the colormap, so the kept block ends in a CONVEX corner at (7,7):
+    /// two adjacent masked sides and a masked diagonal. That is the corner
+    /// `--cull` chamfers away, and exactly the material a second build,
+    /// rendered from the same map with the mask inverted, expects to meet at
+    /// the seam.
+    struct KeepOneQuadrant(u32, u32);
+    impl Colormap for KeepOneQuadrant {
+        fn at(&self, x: u32, y: u32) -> [u8; 4] {
+            let masked = x >= self.0 / 2 || y >= self.1 / 2;
+            [128, 128, 128, if masked { 0 } else { 255 }]
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.0, self.1)
+        }
+    }
+
+    /// The point of `--stitch`: a removed cell keeps its real height, so the
+    /// terrain beside it sees ordinary flat ground rather than a cliff and
+    /// keeps its corner. Two renders masked into each other then meet flush
+    /// instead of both chamfering away from the seam.
+    #[test]
+    fn stitched_cells_do_not_chamfer_the_terrain_around_them() {
+        let hm = Fn2D(16, 16, |_, _| 2);
+        let mut opts = options(4);
+        opts.cull = CullMode::Holes;
+        let holes = build(&hm, &KeepOneQuadrant(16, 16), opts);
+        assert!(
+            side_wedges(&holes).count() > 0,
+            "control: --cull must cut the corner the mask exposes"
+        );
+
+        let mut opts = options(4);
+        opts.cull = CullMode::Stitch;
+        let stitched = build(&hm, &KeepOneQuadrant(16, 16), opts);
+        assert_eq!(
+            side_wedges(&stitched).count(),
+            0,
+            "--stitch must leave a uniform plateau unshaped"
+        );
+    }
+
+    /// `--stitch` removes the same cells `--cull` does; only the shape of
+    /// what is left changes. Nothing may be built over a masked cell.
+    #[test]
+    fn stitched_cells_emit_no_bricks() {
+        let hm = Fn2D(16, 16, |_, _| 2);
+        let mut opts = options(4);
+        opts.cull = CullMode::Stitch;
+        let bricks = build(&hm, &HalfClear(16, 16), opts);
+        assert!(!bricks.is_empty(), "the opaque half must still be built");
+        // Cells 0..8 are masked; the world seam between cell 7 and 8 is at
+        // -(16*5) + 8*10 = 0.
+        for b in &bricks {
+            let BrickType::Procedural { size, .. } = &b.asset else {
+                unreachable!()
+            };
+            assert!(
+                b.position.x - size.x as i32 >= 0,
+                "a brick reaches into the masked half: {} - {}",
+                b.position.x,
+                size.x
+            );
+        }
+    }
+
+    /// A box beside a hole drops to the map floor, because a hole is the
+    /// outside of the build and the drop is what closes it. A box beside a
+    /// STITCHED cell has the neighbouring build's ground against it, so it
+    /// stays a shell at the surface instead of hanging a wall into terrain
+    /// that is already there.
+    #[test]
+    fn a_stitched_seam_keeps_its_bricks_at_the_surface() {
+        /// A low strip on the left drags the map floor well below the
+        /// plateau; the red patch bounds the merge so the boxes around the
+        /// mask touch no map border, where the floor rule would apply
+        /// anyway.
+        struct Patch(u32, u32);
+        impl Colormap for Patch {
+            fn at(&self, x: u32, y: u32) -> [u8; 4] {
+                if (10..12).contains(&x) && (10..12).contains(&y) {
+                    [200, 40, 40, 0]
+                } else if (8..14).contains(&x) && (8..14).contains(&y) {
+                    [200, 40, 40, 255]
+                } else {
+                    [128, 128, 128, 255]
+                }
+            }
+            fn size(&self) -> (u32, u32) {
+                (self.0, self.1)
+            }
+        }
+
+        let hm = Fn2D(16, 16, |x, _| if x < 3 { 1 } else { 6 });
+        let mut opts = options(4);
+        opts.cull = CullMode::Stitch;
+        let bricks = build(&hm, &Patch(16, 16), opts);
+        // Cell c spans world x in [-80 + 10c, -70 + 10c] at half extent 5.
+        let patch: Vec<_> = bricks
+            .iter()
+            .filter(|b| (0..40).contains(&b.position.x) && (0..40).contains(&b.position.y))
+            .collect();
+        assert!(!patch.is_empty(), "the ring around the mask must be built");
+        for b in &patch {
+            let BrickType::Procedural { size, .. } = &b.asset else {
+                unreachable!()
+            };
+            assert_eq!(
+                size.z, 2,
+                "a box beside a stitched cell must stay one plate, not reach the floor"
+            );
+        }
+    }
+
+    /// The top of the terrain in each cell, as the emitted bricks leave it:
+    /// the highest brick covering the cell, in plates above the map floor.
+    /// `None` where nothing was built.
+    ///
+    /// Wedge footprints are pre-swapped for rotation by the writer, so the
+    /// half extents are already world axes.
+    fn surface_tops(bricks: &[Brick], cols: i32, rows: i32) -> Vec<Option<i32>> {
+        let half = 5;
+        let mut tops = vec![None; (cols * rows) as usize];
+        for b in bricks {
+            let BrickType::Procedural { size, .. } = &b.asset else {
+                unreachable!()
+            };
+            let top = b.position.z + size.z as i32;
+            let cell = |v: i32, n: i32| (v + n * half) / (2 * half);
+            let x0 = cell(b.position.x - size.x as i32, cols);
+            let x1 = cell(b.position.x + size.x as i32, cols);
+            let y0 = cell(b.position.y - size.y as i32, rows);
+            let y1 = cell(b.position.y + size.y as i32, rows);
+            for y in y0.max(0)..y1.min(rows) {
+                for x in x0.max(0)..x1.min(cols) {
+                    let slot = &mut tops[(y * cols + x) as usize];
+                    *slot = Some(slot.map_or(top, |t: i32| t.max(top)));
+                }
+            }
+        }
+        tops
+    }
+
+    /// **The point of the whole feature, measured on rough ground.**
+    ///
+    /// One map is built in two passes that mask each other out. Put the two
+    /// results together and compare the surface, cell by cell, against the
+    /// single full render of the same map. Every cell where the pair sits
+    /// lower than the whole does is a gap the seam ate.
+    ///
+    /// `--cull` eats plenty, because each pass reads the other's ground as a
+    /// hole and chamfers down toward it. `--stitch` reads the same height
+    /// field the full render does, so the two passes agree with it and with
+    /// each other.
+    #[test]
+    fn two_stitched_passes_rebuild_the_surface_of_one_full_render() {
+        /// Rough ground, so nearly every cell has something to classify.
+        const HM: Fn2D = Fn2D(24, 24, |x, y| {
+            (3 + (x % 5) + 2 * (y % 3) + ((x / 4 + y / 4) % 4)) as u32
+        });
+        /// The near pass owns an interior rectangle; the far pass owns the
+        /// rest. Between them they cover every cell exactly once.
+        struct Half(bool);
+        impl Colormap for Half {
+            fn at(&self, x: u32, y: u32) -> [u8; 4] {
+                let inner = (8..16).contains(&x) && (8..16).contains(&y);
+                [128, 128, 128, if inner == self.0 { 255 } else { 0 }]
+            }
+            fn size(&self) -> (u32, u32) {
+                (24, 24)
+            }
+        }
+
+        let full = surface_tops(&build(&HM, &Grey(24, 24), options(4)), 24, 24);
+        let mut gaps = Vec::new();
+        for mode in [CullMode::Holes, CullMode::Stitch] {
+            let mut opts = options(4);
+            opts.cull = mode;
+            let near = build(&HM, &Half(true), opts);
+            let mut opts = options(4);
+            opts.cull = mode;
+            let far = build(&HM, &Half(false), opts);
+            let pair = surface_tops(&[near, far].concat(), 24, 24);
+            gaps.push(
+                (0..full.len())
+                    .filter(|&i| pair[i].unwrap_or(i32::MIN) < full[i].unwrap_or(i32::MIN))
+                    .count(),
+            );
+        }
+        let (holes, stitched) = (gaps[0], gaps[1]);
+        assert!(
+            holes > 0,
+            "control: --cull must eat the seam, or this map proves nothing"
+        );
+        assert_eq!(
+            stitched, 0,
+            "two --stitch passes left {stitched} cell(s) below the full render, \
+             where --cull left {holes}"
+        );
     }
 
     /// Merges must not cross a colour edge: a brick is one colour, so a
@@ -1282,3 +1498,4 @@ mod tests {
         }
     }
 }
+

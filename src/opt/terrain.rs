@@ -388,7 +388,7 @@ pub fn gen_terrain_heightmap<F: Fn(f32) -> bool>(
             // This is the rule that the other modes use. With --cull, the
             // code removes a fully transparent pixel and a pixel at the lowest
             // level.
-            culled[index] = options.cull && (heightmap.at(x, y) == 0 || color[3] == 0);
+            culled[index] = options.cull.is_on() && (heightmap.at(x, y) == 0 || color[3] == 0);
             floors[index] = *corners_at(x, y).iter().min().expect("four corners");
         }
         if y % 64 == 0 {
@@ -968,7 +968,7 @@ mod tests {
             size: 5,
             scale: 2,
             asset: PB_DEFAULT_MICRO_BRICK,
-            cull: false,
+            cull: CullMode::Off,
             micro: false,
             stud: false,
             snap: false,
