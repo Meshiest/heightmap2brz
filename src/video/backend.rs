@@ -269,7 +269,7 @@ pub fn open_video_ensuring(
                 return Err(format!(
                     "{}: neither decode backend can handle this file.\n  \
                      builtin backend: {builtin_err}\n  ffmpeg backend: {ffmpeg_err}\n\n\
-                     Switching backends will not help -- both have already refused this exact \
+                     Switching backends will not help: both have already refused this exact \
                      file. Install ffmpeg (and make sure it is on PATH) if it is genuinely \
                      unavailable, or try a different source file.",
                     path.display()
@@ -288,7 +288,7 @@ fn bt2020_refusal(label: &str) -> String {
     format!(
         "{label}: this H.264 stream's SPS declares a BT.2020 colour matrix (matrix_coefficients \
          9 or 10), which the builtin decoder falls back to a BT.601 conversion for rather than \
-         decoding correctly -- measured 2.83-2.91 mean abs per-channel difference against \
+         decoding correctly: measured 2.83-2.91 mean abs per-channel difference against \
          ffmpeg on synthetic content, close enough to this project's 3.0 \"wrong\" threshold \
          that real saturated footage could silently exceed it; use --backend ffmpeg instead"
     )
@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(
             classify_builtin_failure(&cavlc),
             BuiltinFailure::Guard,
-            "the container parses fine here -- only a guard refused it"
+            "the container parses fine here; only a guard refused it"
         );
         let _ = std::fs::remove_file(&cavlc);
     }

@@ -918,7 +918,7 @@ pub fn analyze_voices(
         || !(0.0..=MAX_PITCH_SNAP_CENTS).contains(&opts.pitch_snap_cents)
     {
         return Err(format!(
-            "--pitch-snap must be between 0 (off) and {MAX_PITCH_SNAP_CENTS} cents -- half a \
+            "--pitch-snap must be between 0 (off) and {MAX_PITCH_SNAP_CENTS} cents. That is half a \
              semitone, and no pitch is ever further than that from the nearest one, so a \
              larger value cannot mean anything a listener would hear differently from \
              {MAX_PITCH_SNAP_CENTS}. Got {}",
@@ -1016,7 +1016,7 @@ pub fn analyze_voices(
 
     if frame_count == 0 {
         return Err(
-            "audio produced 0 analysis frames -- the source is shorter than one STFT window \
+            "audio produced 0 analysis frames: the source is shorter than one STFT window \
              (try a smaller --window, or check --start/--duration)"
                 .to_string(),
         );
@@ -1234,7 +1234,7 @@ mod tests {
             assert!(
                 (PITCH_MIN as f64..=PITCH_MAX as f64).contains(&snapped),
                 "snapping {hz:.2} Hz gave {snapped}, outside the emitter's legal \
-                 {PITCH_MIN}..{PITCH_MAX} -- `build_voice_world` refuses this, AFTER the \
+                 {PITCH_MIN}..{PITCH_MAX}; `build_voice_world` refuses this, AFTER the \
                  whole analysis has run, with an error that blames the data"
             );
             hz *= 1.0005;
@@ -1375,7 +1375,7 @@ mod tests {
         assert!(
             err < 5.0,
             "a tone half a bin off centre must be located within 5 cents, got \
-             {err:.2} ({} Hz vs {freq} Hz) -- without parabolic interpolation this \
+             {err:.2} ({} Hz vs {freq} Hz); without parabolic interpolation this \
              is {uninterpolated_error:.1}",
             peaks[0].hz
         );
@@ -1533,7 +1533,7 @@ mod tests {
         let mean = t.stats.mean_lifetime();
         assert!(
             mean > t.frame_count as f64 * 0.8,
-            "no tone ever stops, so a voice that takes one must keep it for the whole clip:              mean lifetime {mean:.1} frames of {} over {} run(s). Truncating the candidate              list to --max-voices before matching drops a partial the moment two others              outrank it, and the voice dies and is reborn instead of holding.",
+            "no tone ever stops, so a voice that takes one must keep it for the whole clip: mean lifetime {mean:.1} frames of {} over {} run(s). Truncating the candidate list to --max-voices before matching drops a partial the moment two others outrank it, and the voice dies and is reborn instead of holding.",
             t.frame_count,
             t.stats.lifetimes.len()
         );
@@ -1616,7 +1616,7 @@ mod tests {
                     assert!(
                         semitones_between(hz, prev) < 1.0,
                         "voice {v} moved from {prev:.1} Hz to {hz:.1} Hz at frame {f} \
-                         while still sounding -- a match tolerance wide enough to \
+                         while still sounding; a match tolerance wide enough to \
                          span a minor third makes voices wander between notes"
                     );
                 }
@@ -1659,7 +1659,7 @@ mod tests {
         }
         assert!(
             faded,
-            "at least one voice must end on a frame quieter than the one before it -- \
+            "at least one voice must end on a frame quieter than the one before it; \
              a note that cuts straight to zero is a click"
         );
     }
@@ -1678,7 +1678,7 @@ mod tests {
                 assert!(
                     p.is_finite() && p >= PITCH_MIN as f64 && p <= PITCH_MAX as f64,
                     "voice {v} frame {f} pitch {p} is outside the emitter's legal \
-                     {PITCH_MIN}..{PITCH_MAX} range -- a silent voice must HOLD its \
+                     {PITCH_MIN}..{PITCH_MAX} range; a silent voice must HOLD its \
                      last pitch, never be written as 0"
                 );
             }
@@ -1797,7 +1797,7 @@ mod tests {
         for (leveling, mix, frame) in measured {
             assert!(
                 mix <= 1.0 + 1e-6,
-                "--leveling {leveling} mixes frame {frame} to {mix}x full scale -- the \
+                "--leveling {leveling} mixes frame {frame} to {mix}x full scale. The \
                  emitters sum incoherently in the game's mixer and anything above 1.0 clips"
             );
         }
@@ -1859,7 +1859,7 @@ mod tests {
         assert!(
             worst > 0.85,
             "the quiet half must still be dragged to full scale by --leveling 1 (worst \
-             frame mix {worst}) -- bounding the mix by attenuating is the loudness \
+             frame mix {worst}); bounding the mix by attenuating is the loudness \
              regression the bound was supposed to avoid"
         );
     }
@@ -1944,7 +1944,7 @@ mod tests {
         let out = t.stats.jitter_rms_cents();
         assert!(
             raw > 1.0,
-            "the fixture must actually wobble as tracked, got {raw:.2} cents rms -- \
+            "the fixture must actually wobble as tracked, got {raw:.2} cents rms; \
              otherwise there is nothing for the smoothing to remove"
         );
         assert!(
@@ -1989,7 +1989,7 @@ mod tests {
                 let hz = t.pitches[v][f] * BASE_HZ as f64;
                 assert!(
                     semitones_between(hz, 660.0) < 0.6,
-                    "voice {v} starts its new note at {hz:.1} Hz instead of 660 -- a birth \
+                    "voice {v} starts its new note at {hz:.1} Hz instead of 660; a birth \
                      must jump, not glide up from wherever the speaker was left"
                 );
                 checked += 1;
@@ -2332,7 +2332,7 @@ mod tests {
         assert_eq!(
             short, 0.0,
             "--voice-release 0 clamps to one frame, which writes zero on the frame after \
-             the partial ends -- no tail at all"
+             the partial ends: no tail at all"
         );
     }
 

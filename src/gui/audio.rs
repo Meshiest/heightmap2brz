@@ -362,7 +362,7 @@ impl AudioApp {
                 "An UPPER BOUND on how many bands may sound at once; every other band in \
                  the frame is set to exactly zero. 0 = every band, which is the setting \
                  that made the render sound like noise. This is usually NOT what limits a \
-                 dense frame -- Peak Gate is, and it leaves only 12-24 candidates, so \
+                 dense frame; Peak Gate is, and it leaves only 12-24 candidates, so \
                  raising this past that changes nothing at all."
             }
             AudioMode::Voice => {
@@ -612,7 +612,7 @@ impl AudioApp {
     /// contains, so hiding it would hide the size of the build.
     fn draw_settings(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
         ui.label(
-            "Turn a song into a cluster of wired, pitched speaker bricks: the spectrum is \
+            "Turn a song into a cluster of pitched speaker bricks: the spectrum is \
              analysed once and written into wire arrays, and a chip plays it back.",
         );
 
@@ -634,7 +634,7 @@ impl AudioApp {
                 "Playback",
                 Some(
                     "Loop: repeat the track forever (the default). Off: play through once and \
-                     stop on the last analysis frame -- the timer is given a limit of \
+                     stop on the last analysis frame: the timer is given a limit of \
                      (frames - 0.5) / fps, which expires halfway through the final frame. \
                      Costs nothing either way: same gates, same wires, same speakers.",
                 ),
@@ -821,7 +821,7 @@ impl AudioApp {
         let mut chosen = None;
         ui.horizontal(|ui| {
             ui.label("Preset").on_hover_text(
-                "Settings found BY EAR, per content type, across dozens of renders -- window, \
+                "Settings found BY EAR, per content type, across dozens of renders. Window, \
                  band count, voices, peak gate and release move together, because that is how \
                  they were listened to. Selecting one seeds those five and leaves every control \
                  below editable. It does NOT touch the analysis rate, gain, subdivision, attack, \
@@ -856,10 +856,10 @@ impl AudioApp {
             "Mode",
             Some(
                 "Pitch-Per-Speaker: a fixed bank of speakers, each one owning a single pitch, \
-                 with only their volumes written -- best for speech and broadband material, and \
+                 with only their volumes written; best for speech and broadband material, and \
                  it never writes a pitch, so it depends on no unverified in-game behaviour. \
                  Pitch Switching: Speakers speakers that TRACK spectral peaks, re-pitching and \
-                 changing volume every frame -- no band grid, so no tuning error; best for tonal \
+                 changing volume every frame, with no band grid and so no tuning error; best for tonal \
                  material such as piano. THE 'Max Voices' CONTROL MEANS SOMETHING DIFFERENT IN \
                  EACH.",
             ),
@@ -878,7 +878,7 @@ impl AudioApp {
             ui,
             "Analysis FPS",
             Some(
-                "Analysis frames per second -- how often every speaker's volume is rewritten. \
+                "Analysis frames per second: how often every speaker's volume is rewritten. \
                  The wire graph ticks at 60 Hz on a dedicated server and faster locally, so 30 \
                  is comfortable; raising it multiplies the array data without adding detail the \
                  window can resolve.",
@@ -896,7 +896,7 @@ impl AudioApp {
             ui,
             "Window",
             Some(
-                "STFT (short-time Fourier transform) window size, in samples -- the single \
+                "STFT (short-time Fourier transform) window size, in samples. It is the single \
                  biggest lever, and the one the \
                  presets differ on most. Long windows resolve pitch (a sustained partial gets a \
                  clean note) and smear transients; short ones do the reverse, which is why \
@@ -917,7 +917,7 @@ impl AudioApp {
             "Max Frames",
             Some(
                 "Hard cap on analysed frames. Frames past 65535 spill into extra wire arrays, \
-                 which costs two gates per stream per extra array and nothing else -- audio \
+                 which costs two gates per stream per extra array and nothing else: audio \
                  writes numbers straight into arrays with no packing, so a long render is cheap \
                  here in a way a long video render is not.",
             ),
@@ -937,7 +937,7 @@ impl AudioApp {
             "Bands",
             Some(
                 "Total speakers, noise bands included. Bands sit on EXACT equal-tempered steps, \
-                 so this selects the SPAN (the steps nearest A440), never the spacing -- and it \
+                 so this selects the SPAN (the steps nearest A440), never the spacing, and it \
                  is symmetric around A440, so narrowing trims the bass and the treble together. \
                  Narrowing helps a music box or solo piano and CRUSHES chiptune bass. Unlimited \
                  = every step the emitter's pitch range holds: 79 at Subdiv 12, 159 at 24.",
@@ -968,7 +968,7 @@ impl AudioApp {
                         self.bands_value = b;
                     }
                 } else {
-                    note(ui, "(Pitch-Per-Speaker only -- Pitch Switching has no band grid)");
+                    note(ui, "(Pitch-Per-Speaker only: Pitch Switching has no band grid)");
                 }
             },
         );
@@ -988,7 +988,7 @@ impl AudioApp {
             Some(
                 "Tonal bands per octave. MULTIPLES OF 12 ONLY, which is why this is a dropdown: \
                  only then does every band land on a real semitone, and anything else was heard \
-                 in game as out of tune -- 14 sharp, 18 flat. 12 (one per semitone) is \
+                 in game as out of tune (14 sharp, 18 flat). 12 (one per semitone) is \
                  preferred; 24 halves the error on a source not tuned to A440 but splits each \
                  note across two speakers.",
             ),
@@ -1010,8 +1010,8 @@ impl AudioApp {
             "Noise Bands",
             Some(
                 "White/pink noise speakers carrying the energy off either end of the tonal \
-                 range. 0 is the default because every source tried in game -- speech, solo \
-                 piano and a full pop mix -- was reported WORSE with them than without. 2 is \
+                 range. 0 is the default because every source tried in game (speech, solo \
+                 piano and a full pop mix) was reported WORSE with them than without. 2 is \
                  worth trying on percussion, which nothing else in the bank can render at all.",
             ),
             |ui| {
@@ -1029,7 +1029,7 @@ impl AudioApp {
             Some(
                 "How far above the mean of its neighbourhood a band must stand to count as a \
                  note at all, as an amplitude ratio (1.5 = 3.5 dB). THIS, not Max Voices, is \
-                 what limits a dense frame -- lower it to sound more bands at once. 1.0 \
+                 what limits a dense frame, so lower it to sound more bands at once. 1.0 \
                  disables it, which is the wall-of-sound behaviour that made an early render \
                  sound like noise: 94 of 96 bands sounding at once is noise by construction.",
             ),
@@ -1037,7 +1037,7 @@ impl AudioApp {
                 if self.shows_band_grid_controls() {
                     widgets::slider(ui, egui::Slider::new(&mut self.opts.peak_gate, 1.0..=6.0));
                 } else {
-                    note(ui, "(Pitch-Per-Speaker only -- Pitch Switching gates over FFT bins)");
+                    note(ui, "(Pitch-Per-Speaker only: Pitch Switching gates over FFT bins)");
                 }
             },
         );
@@ -1069,7 +1069,7 @@ impl AudioApp {
             "Attack",
             Some(
                 "How fast a speaker's level RISES toward what the analysis measured, in \
-                 milliseconds. Short by design -- an attack is what makes a render sound like an \
+                 milliseconds. Short by design: an attack is what makes a render sound like an \
                  instrument being struck rather than a pad swelling.",
             ),
             |ui| {
@@ -1090,7 +1090,7 @@ impl AudioApp {
                  selected, in milliseconds. THIS is what stops one-frame selections sounding \
                  like beeps. 150 suits sustained music; SPEECH WANTS 30-60, because a phoneme \
                  is 50-100 ms long and a 150 ms release smears clean across it. Do not tune this \
-                 by maximising mean run length -- that was tried and made speech much worse.",
+                 by maximising mean run length; that was tried and made speech much worse.",
             ),
             |ui| {
                 ui.add(
@@ -1108,7 +1108,7 @@ impl AudioApp {
             Some(
                 "Pitch Switching only: how long a voice takes to fade to EXACTLY zero once its \
                  partial has gone. Distinct from Release, which is a time constant on a voice \
-                 that is still sounding and never reaches zero. The material decides it -- a \
+                 that is still sounding and never reaches zero. The material decides it: a \
                  sustained note can afford 150, a spoken phoneme cannot.",
             ),
             |ui| {
@@ -1120,7 +1120,7 @@ impl AudioApp {
                             .range(0.0..=2000.0),
                     );
                 } else {
-                    note(ui, "(Pitch Switching only -- a fixed-pitch band has no note-off to time)");
+                    note(ui, "(Pitch Switching only: a fixed-pitch band has no note-off to time)");
                 }
             },
         );
@@ -1131,7 +1131,7 @@ impl AudioApp {
             Some(
                 "Pitch Switching only: pull a continuing voice onto the nearest equal-tempered \
                  semitone when it is within this many cents. 0 = off, which is the default \
-                 because Pitch Switching's whole claim is that it needs no grid -- snapping quantises \
+                 because Pitch Switching's whole claim is that it needs no grid, and snapping quantises \
                  real vibrato and glissando away along with the jitter.",
             ),
             |ui| {
@@ -1159,7 +1159,7 @@ impl AudioApp {
             ui,
             "Gain",
             Some(
-                "Post-normalisation multiplier, applied and then CLAMPED at 1.0 -- so this is a \
+                "Post-normalisation multiplier, applied and then CLAMPED at 1.0, so this is a \
                  way to make a render quieter, never louder. Above 1.0 it only clips (the file \
                  even gets smaller as it rises), which is why the slider stops there.",
             ),
@@ -1173,8 +1173,8 @@ impl AudioApp {
             "Leveling",
             Some(
                 "Per-frame automatic gain control: 0 keeps the track's own dynamics, 1 drags \
-                 every frame toward full scale. 1.0 was best on EVERY source tried in game -- \
-                 piano, speech and a music box alike -- which reversed the argument that it \
+                 every frame toward full scale. 1.0 was best on EVERY source tried in game (\
+                 piano, speech and a music box alike), which reversed the argument that it \
                  would flatten music. A bank of sine emitters has ~30 dB of usable range where a \
                  master has 60, so a track's dynamics do not survive the trip regardless.",
             ),
@@ -1208,7 +1208,7 @@ impl AudioApp {
             ui,
             "Waveform",
             Some(
-                "The synth the TONAL bands play through -- the four basic waves. Sine (the \
+                "The synth the TONAL bands play through: the four basic waves. Sine (the \
                  default) is the classic bank tone; square, triangle and sawtooth are brighter \
                  and buzzier. Applies to tonal bands in both modes; white/pink noise bands keep \
                  their own noise assets and are unaffected.",
@@ -1224,13 +1224,27 @@ impl AudioApp {
 
         t.row_hover(
             ui,
+            "Driver",
+            Some(
+                "Wires: every speaker's volume (and pitch) is its own array, Get and wire. Refs: one loop sets every speaker through component references, so more speakers cost no gates. Refs needs the speakers on the main grid.",
+            ),
+            |ui| {
+                ui.horizontal(|ui| {
+                    widgets::radio(ui, &mut self.opts.driver, crate::anim::bricks::Driver::Wires, "Wires");
+                    widgets::radio(ui, &mut self.opts.driver, crate::anim::bricks::Driver::Refs, "Refs");
+                });
+            },
+        );
+
+        t.row_hover(
+            ui,
             "Placement",
             Some(
                 "Where the speaker cluster goes. Beside the chip on the main grid (the \
                  default), or IN the microchip's own inner grid, which makes the whole audio \
                  device one portable microchip. The speakers play from the chip's ORIGIN \
-                 either way -- an AudioEmitter on a microchip inner grid emits from the chip's \
-                 world position -- so this only moves the bricks, it does not change the \
+                 either way (an AudioEmitter on a microchip inner grid emits from the chip's \
+                 world position), so this only moves the bricks, it does not change the \
                  sound, and costs nothing (same speakers, gates and wires).",
             ),
             |ui| {
@@ -1331,7 +1345,7 @@ impl AudioApp {
                             }
                             None => "length not read yet".to_string(),
                         };
-                        ui.label(format!("{} -- {detail}", input.name));
+                        ui.label(format!("{}: {detail}", input.name));
                     });
                 }
             }
@@ -1360,7 +1374,7 @@ impl AudioApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Decode Backend").on_hover_text(
                     "Auto: ffmpeg when it is already installed (it covers codecs the builtin \
-                     decoder is not built for), otherwise the pure-Rust builtin -- and it \
+                     decoder is not built for), otherwise the pure-Rust builtin, and it \
                      never downloads. Builtin: pure Rust only. ffmpeg: always, downloading it \
                      first if it is missing and consented to.",
                 );
@@ -1375,7 +1389,7 @@ impl AudioApp {
                 ui.label("Audio Track").on_hover_text(
                     "Which audio stream to decode, 0 = first. Dual-audio releases commonly \
                      carry the original language first and the dub second, so which one is \
-                     'first' is a container-ordering accident. Needs the ffmpeg backend -- \
+                     'first' is a container-ordering accident. Needs the ffmpeg backend; \
                      the builtin decoder always uses the container's default track.",
                 );
                 reprobe |= ui
@@ -1413,7 +1427,7 @@ impl AudioApp {
                             }
                             None => "length not read yet".to_string(),
                         };
-                        ui.label(format!("{} -- {detail}", input.name));
+                        ui.label(format!("{}: {detail}", input.name));
                     });
                 }
             }
@@ -1487,7 +1501,7 @@ impl AudioApp {
             ui.colored_label(
                 Color32::from_rgb(255, 140, 60),
                 format!(
-                    "{} gates is a large build -- frame drops start around 20000 and it may \
+                    "{} gates is a large build: frame drops start around 20000 and it may \
                      be slow to paste in-game",
                     cost.gates
                 ),
@@ -1779,6 +1793,14 @@ impl AudioApp {
 
 #[cfg(test)]
 mod tests {
+    /// The pane's defaults on the wired driver, which these tests' gate
+    /// counts (`grids[0]` is the chip) describe.
+    fn wired_app() -> AudioApp {
+        let mut app = AudioApp::default();
+        app.opts.driver = crate::anim::bricks::Driver::Wires;
+        app
+    }
+
     use super::*;
     use crate::audio::source::{AudioSource, SampleClip};
     use crate::audio::track::DEFAULT_RELEASE_MS;
@@ -1813,7 +1835,7 @@ mod tests {
     /// length-dependent half of the readout has real numbers without a real
     /// file or a real decode.
     fn with_source(duration_s: f64) -> AudioApp {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.input = Some(PickedAudio {
             path: std::path::PathBuf::from("song.mp3"),
             name: "song.mp3".to_string(),
@@ -1824,7 +1846,7 @@ mod tests {
 
     #[test]
     fn ticking_past_an_estimated_total_grows_it_rather_than_overflowing_the_bar() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         let (tx, rx) = std::sync::mpsc::channel();
         app.progress_rx = Some(rx);
 
@@ -1847,7 +1869,7 @@ mod tests {
 
     #[test]
     fn ticking_a_totalless_phase_never_invents_a_denominator() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         let (tx, rx) = std::sync::mpsc::channel();
         app.progress_rx = Some(rx);
         tx.send(ProgressMsg::Begin { label: "analyzing audio".into(), total: None }).expect("send");
@@ -1859,7 +1881,7 @@ mod tests {
 
     #[test]
     fn a_fresh_pane_starts_with_no_noise_bands_and_full_leveling() {
-        let app = AudioApp::default();
+        let app = wired_app();
         assert_eq!(app.preset, AudioPreset::Default);
         assert_eq!(app.audio_opts().noise_bands, 0);
         assert_eq!(app.audio_opts().leveling, 1.0);
@@ -1867,7 +1889,7 @@ mod tests {
 
     #[test]
     fn selecting_a_preset_reaches_the_options_the_render_uses() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.load_preset(AudioPreset::Speech);
         let o = app.audio_opts();
         let v = AudioPreset::Speech.values();
@@ -1884,7 +1906,7 @@ mod tests {
 
     #[test]
     fn every_control_is_still_editable_after_a_preset_is_applied() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.load_preset(AudioPreset::Tonal);
         assert_eq!(app.audio_opts().window, 16384);
 
@@ -1908,7 +1930,7 @@ mod tests {
 
     #[test]
     fn switching_presets_replaces_every_value_rather_than_merging_them() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.load_preset(AudioPreset::Tonal);
         app.load_preset(AudioPreset::Speech);
         let o = app.audio_opts();
@@ -1926,7 +1948,7 @@ mod tests {
     // "every band" without resetting a tuned span.
     #[test]
     fn the_band_limit_remembers_its_value_across_a_round_trip() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.opts.bands = Some(42);
         app.bands_value = 42;
         // Untick.
@@ -1942,7 +1964,7 @@ mod tests {
     fn every_subdiv_the_widget_offers_is_accepted_by_the_renderer() {
         for s in SUBDIVS {
             assert_eq!(s % 12, 0, "the dropdown must offer multiples of 12 only");
-            let mut app = AudioApp::default();
+            let mut app = wired_app();
             app.opts.subdiv = s;
             assert!(app.validate().is_ok(), "--subdiv {s} must be renderable");
             assert!(app.live_cost().is_ok(), "--subdiv {s} must be costable");
@@ -1951,7 +1973,7 @@ mod tests {
 
     #[test]
     fn a_subdiv_off_the_semitone_grid_is_refused_by_the_readout_and_the_button() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.opts.subdiv = 14;
         let err = app.validate().expect_err("14 is not a multiple of 12");
         assert!(err.contains("--subdiv must be a multiple of 12"), "{err}");
@@ -1966,7 +1988,7 @@ mod tests {
     // with no speakers in voice mode.
     #[test]
     fn a_zero_speaker_count_is_legal_in_bank_mode_and_refused_after_switching_to_voice() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.opts.max_voices = 0;
         app.mode = AudioMode::Bank;
         assert!(app.validate().is_ok(), "0 = every band is a legal bank render");
@@ -1980,7 +2002,7 @@ mod tests {
 
     #[test]
     fn the_speaker_control_is_labelled_for_the_mode_it_is_in() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.mode = AudioMode::Bank;
         let bank_label = app.max_voices_label();
         let bank_hint = app.max_voices_hint();
@@ -1994,7 +2016,7 @@ mod tests {
 
     #[test]
     fn the_band_grid_controls_are_shown_only_where_they_do_something() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.mode = AudioMode::Bank;
         assert!(app.shows_band_grid_controls());
         app.mode = AudioMode::Voice;
@@ -2044,7 +2066,7 @@ mod tests {
     // Reports the single-bank floor rather than inventing a frame count.
     #[test]
     fn an_unprobed_source_still_costs_everything_that_does_not_depend_on_length() {
-        let app = AudioApp::default();
+        let app = wired_app();
         assert_eq!(app.estimated_frames(), None, "nothing picked, nothing probed");
         let c = app.live_cost().expect("the options alone are renderable");
         assert_eq!(c.speakers, 79);
@@ -2054,7 +2076,7 @@ mod tests {
 
     #[test]
     fn a_source_with_no_duration_hint_has_no_frame_estimate() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.input = Some(PickedAudio {
             path: std::path::PathBuf::from("stream.mkv"),
             name: "stream.mkv".to_string(),
@@ -2066,7 +2088,7 @@ mod tests {
 
     #[test]
     fn the_frame_cap_is_clamped_the_way_the_cli_clamps_it() {
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.opts.max_frames = usize::MAX;
         assert_eq!(app.audio_opts().max_frames, crate::anim::pack::MAX_FRAMES);
         app.opts.max_frames = 0;
@@ -2109,9 +2131,9 @@ mod tests {
     #[test]
     fn the_gain_default_sits_at_the_top_of_the_offered_range() {
         assert_eq!(
-            AudioApp::default().audio_opts().gain,
+            wired_app().audio_opts().gain,
             1.0,
-            "1.0 is both the default and the maximum the slider offers -- above it the \
+            "1.0 is both the default and the maximum the slider offers; above it the \
              pipeline only clamps"
         );
     }
@@ -2123,7 +2145,7 @@ mod tests {
     #[test]
     fn the_readout_describes_the_world_the_bank_pipeline_actually_builds() {
         let clip = tone(4.0);
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         // A narrow span and a preset's window, so this exercises settings a
         // user would really be on rather than only the defaults.
         app.opts.bands = Some(12);
@@ -2156,7 +2178,7 @@ mod tests {
     #[test]
     fn the_readout_describes_the_world_the_voice_pipeline_actually_builds() {
         let clip = tone(4.0);
-        let mut app = AudioApp::default();
+        let mut app = wired_app();
         app.mode = AudioMode::Voice;
         app.opts.max_voices = 6;
         app.opts.window = 2048;
@@ -2182,7 +2204,7 @@ mod tests {
     fn every_preset_renders_a_real_world_at_the_settings_it_carries() {
         let clip = tone(3.0);
         for p in AudioPreset::ALL {
-            let mut app = AudioApp::default();
+            let mut app = wired_app();
             app.load_preset(p);
             app.input = Some(PickedAudio {
                 path: std::path::PathBuf::from("tone.wav"),

@@ -484,7 +484,7 @@ mod advance_tests {
         assert_eq!(
             nexts.get(),
             0,
-            "no frame may be pulled one at a time -- that is the path that resizes every \
+            "no frame may be pulled one at a time: that is the path that resizes every \
              source frame, including the 20 this render never looks at"
         );
         assert!(

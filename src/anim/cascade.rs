@@ -26,7 +26,7 @@
 use super::bricks::{BRANCH, COMPARE_GE, SUBTRACT};
 use super::chip::Chip;
 use super::clock::gate;
-use brdb::{AsBrdbValue, Position, WirePort, World, schema::WireVariant};
+use brdb::{AsBrdbValue, Position, WirePort, World, schema::WireValue};
 
 /// The three per-bank vectors every renderer feeds its own per-unit wiring
 /// from. See the module documentation.
@@ -75,7 +75,7 @@ pub fn bank_cascade(
         let sub = gate(chip, "B_1x1_Gate_Expr_MathSubtract", SUBTRACT,
             place(k as i32, -6), vec![(
                 "InputB",
-                Box::new(WireVariant::Number((k * bank_size) as f64)) as Box<dyn AsBrdbValue>,
+                Box::new(WireValue::Number((k * bank_size) as f64)) as Box<dyn AsBrdbValue>,
             )]);
         world.add_wire_connection(frame_index.clone(), WirePort::new(sub, SUBTRACT, "InputA"));
         index_of_bank.push(WirePort::new(sub, SUBTRACT, "Output"));
@@ -89,7 +89,7 @@ pub fn bank_cascade(
         let cmp = gate(chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE,
             place(k as i32, -7), vec![(
                 "InputB",
-                Box::new(WireVariant::Int((k * bank_size) as i64)) as Box<dyn AsBrdbValue>,
+                Box::new(WireValue::Int((k * bank_size) as i64)) as Box<dyn AsBrdbValue>,
             )]);
         world.add_wire_connection(frame_index.clone(), WirePort::new(cmp, COMPARE_GE, "InputA"));
         ge.push(WirePort::new(cmp, COMPARE_GE, "bOutput"));

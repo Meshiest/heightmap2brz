@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn a_totalless_phase_gets_a_spinner_that_still_counts() {
         let mut p = CliProgress::new();
-        p.begin("packing frames (total unknown -- source did not report one)", None);
+        p.begin("packing frames (total unknown: source did not report one)", None);
         p.tick(1);
         p.tick(9_999);
         let b = p.bar.as_ref().expect("bar");

@@ -496,8 +496,8 @@ mod tests {
             }
         }
         // The sweep is worthless if it only ever produced one answer.
-        assert!(saw_overlap > 20, "only {saw_overlap} overlapping cases -- not a real sweep");
-        assert!(saw_clear > 20, "only {saw_clear} clear cases -- not a real sweep");
+        assert!(saw_overlap > 20, "only {saw_overlap} overlapping cases, which is not a real sweep");
+        assert!(saw_clear > 20, "only {saw_clear} clear cases, which is not a real sweep");
     }
 
     /// The complexity itself, as a number rather than as a stopwatch.
@@ -549,15 +549,15 @@ mod tests {
         for (n, tested) in [(small.len(), tested_s), (big.len(), tested_b)] {
             assert!(
                 tested <= 40 * n,
-                "{tested} pair tests for {n} bricks is not proportional -- all-pairs \
-                 would be {}",
+                "{tested} pair tests for {n} bricks is not proportional (all-pairs \
+                 would be {})",
                 n * (n - 1) / 2
             );
         }
         // ...and doubling the lattice must not more than roughly double it.
         assert!(
             tested_b < 3 * tested_s,
-            "doubling the lattice took {tested_b} tests against {tested_s} -- that is \
+            "doubling the lattice took {tested_b} tests against {tested_s}, which is \
              super-linear growth"
         );
     }

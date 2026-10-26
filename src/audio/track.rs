@@ -148,6 +148,9 @@ pub struct AudioOptions {
     pub bank_size: usize,
     pub max_frames: usize,
     pub external_clock: bool,
+    /// Wires, or one loop over the speakers through component refs
+    /// ([`super::stream_refs`]). See [`AudioOptions::uses_refs`].
+    pub driver: crate::anim::bricks::Driver,
     /// Repeat the track forever (`true`, the default) or stop on its last
     /// analysis frame (`false`). Same field and effect as
     /// [`crate::anim::bricks::AnimOptions::loop_playback`]: both render paths
@@ -176,6 +179,23 @@ pub struct AudioOptions {
     pub tonal_synth: SynthWave,
 }
 
+impl AudioOptions {
+    /// The defaults with the wired driver.
+    pub fn wired() -> Self {
+        AudioOptions { driver: crate::anim::bricks::Driver::Wires, ..AudioOptions::default() }
+    }
+
+    /// Whether a render of `frames` frames takes the ref driver: asked for,
+    /// speakers on the main grid (refs into the chip's own grid are
+    /// unverified), and each speaker's frames fit one array. Otherwise it is
+    /// built wired.
+    pub fn uses_refs(&self, frames: usize) -> bool {
+        self.driver == crate::anim::bricks::Driver::Refs
+            && !self.speakers_in_chip
+            && frames <= self.bank_size.max(1)
+    }
+}
+
 impl Default for AudioOptions {
     fn default() -> Self {
         Self {
@@ -202,6 +222,7 @@ impl Default for AudioOptions {
             bank_size: BANK_FRAMES,
             max_frames: BANK_FRAMES * 16,
             external_clock: false,
+            driver: crate::anim::bricks::Driver::Refs,
             loop_playback: true,
             speakers_in_chip: false,
             control_buttons: true,
@@ -503,7 +524,7 @@ pub fn check_subdiv(subdiv: u32) -> Result<(), String> {
         return Err(format!(
             "--subdiv must be a multiple of 12, got {}: only then does every band land on a \
              real semitone. {} bands per octave spaces them {:.3} semitones apart, so the \
-             whole render is pulled off pitch (and audibly so -- 14 was heard as sharp, 18 \
+             whole render is pulled off pitch (and audibly so: 14 was heard as sharp, 18 \
              as flat). Use 12 (one per semitone, preferred), 24 (quarter-tones, for a source \
              not tuned to A440) or 36",
             subdiv,
@@ -686,7 +707,7 @@ pub fn analyze(
 
     if frame_count == 0 {
         return Err(
-            "audio produced 0 analysis frames -- the source is shorter than one STFT window \
+            "audio produced 0 analysis frames: the source is shorter than one STFT window \
              (try a smaller --window, or check --start/--duration)"
                 .to_string(),
         );
@@ -1145,7 +1166,7 @@ mod tests {
             assert!(
                 (mix - 1.0).abs() < 1e-3,
                 "at {bands} bands the loudest incoherent mix must be exactly full scale, got \
-                 {mix} -- below 1 is the 19-24 dB deficit that normalising by the per-frame \
+                 {mix}. Below 1 is the 19-24 dB deficit that normalising by the per-frame \
                  SUM of all bands costs, above 1 is the overshoot that normalising by the \
                  loudest single band causes, and both were shipped"
             );
@@ -1161,7 +1182,7 @@ mod tests {
                 assert!(
                     (peak - expected).abs() < 0.05,
                     "six equal tones must each sit at 1/sqrt(6) = {expected:.3} of full scale \
-                     at {bands} bands, got {peak} -- 1/6 = 0.167 is the per-frame-sum defect, \
+                     at {bands} bands, got {peak}; 1/6 = 0.167 is the per-frame-sum defect, \
                      1.0 is the single-band overshoot, and a lone band at 1.0 with the other \
                      five silent would pass the mix check above"
                 );
@@ -1188,7 +1209,7 @@ mod tests {
                     assert!(
                         mix <= 1.0 + 1e-6,
                         "at {bands} bands and --leveling {leveling}, frame {f} mixes to {mix}x \
-                         full scale -- N uncorrelated sinusoids peak at sqrt(sum of squares), \
+                         full scale. N uncorrelated sinusoids peak at sqrt(sum of squares), \
                          and anything above 1.0 there is distortion the listener hears at \
                          --gain 1.0"
                     );
@@ -1260,7 +1281,7 @@ mod tests {
             assert!(
                 mix <= 1.0 + 1e-6,
                 "--leveling {leveling} mixes frame {frame} to {mix}x full scale. The bank \
-                 sums incoherently in the game's mixer, so anything above 1.0 clips -- and \
+                 sums incoherently in the game's mixer, so anything above 1.0 clips, and \
                  the fix is not to turn the leveling down, it is to reference its boost to \
                  the same quantity the global scale targets"
             );
@@ -1285,7 +1306,7 @@ mod tests {
         assert!(
             worst > 0.9,
             "the quiet half must still be dragged to full scale by --leveling 1 (worst \
-             frame mix {worst}) -- a fix that bounds the mix by attenuating is the \
+             frame mix {worst}); a fix that bounds the mix by attenuating is the \
              loudness regression the bound was supposed to avoid"
         );
     }
@@ -1303,7 +1324,7 @@ mod tests {
         assert!(
             peak_sum > 1.0,
             "six equal tones must put six speakers near full scale at once (bank sum \
-             {peak_sum}) -- a bank sum pinned at 1.0 means each band was scaled down by \
+             {peak_sum}); a bank sum pinned at 1.0 means each band was scaled down by \
              the number of bands sounding, which is the defect this replaced"
         );
         // The mix is still bounded: N incoherent bands peak near
@@ -1337,7 +1358,7 @@ mod tests {
         assert!(
             (0.05..0.2).contains(&ratio),
             "the quiet half is 1/10 the amplitude of the loud half and must stay that way \
-             (loud {loud}, quiet {quiet}, ratio {ratio}) -- a per-frame scale is an automatic \
+             (loud {loud}, quiet {quiet}, ratio {ratio}); a per-frame scale is an automatic \
              gain control that normalises the dynamics away"
         );
     }
@@ -1439,7 +1460,7 @@ mod tests {
             assert!(
                 v > 0.0,
                 "band {companion} frame {f} is 40 dB below its own frame's peak and must \
-                 survive the floor, got exactly zero -- a floor measured against the TRACK \
+                 survive the floor, got exactly zero; a floor measured against the TRACK \
                  peak silences a quiet passage's detail while keeping a loud one's"
             );
             assert!(
@@ -1694,7 +1715,7 @@ mod tests {
             assert!(
                 (mean - n as f64).abs() < 0.5,
                 "--max-voices {n} must leave about {n} bands sounding per frame, got {mean:.2} \
-                 of 81 -- a bank with most of its speakers on at once is noise, not music"
+                 of 81; a bank with most of its speakers on at once is noise, not music"
             );
         }
     }
@@ -1718,7 +1739,7 @@ mod tests {
         assert!(
             off > 40.0,
             "24 tones across a 96-band bank must light most of the bank with selection off \
-             (got {off:.2}) -- otherwise the comparison below proves nothing"
+             (got {off:.2}); otherwise the comparison below proves nothing"
         );
         assert!(
             on < off / 4.0,
@@ -1734,8 +1755,8 @@ mod tests {
         assert_ne!(d.max_voices, 0, "the default must not disable peak selection");
         assert!(
             (6..=16).contains(&d.max_voices),
-            "the default must sit at the measured knee of the energy/voice curve -- 6 to 12 \
-             buys 1.11 dB of frame power for six voices, 12 to 24 buys 0.68 dB for twelve -- \
+            "the default must sit at the measured knee of the energy/voice curve (6 to 12 \
+             buys 1.11 dB of frame power for six voices, 12 to 24 buys 0.68 dB for twelve), \
              got {}",
             d.max_voices
         );
@@ -1791,7 +1812,7 @@ mod tests {
         assert!(
             (at_64 - at_24).abs() < 1.0,
             "at the default gate, 24 and 64 voices must land on the same handful of \
-             candidates ({at_24:.2} vs {at_64:.2}) -- if this ever stops being true the \
+             candidates ({at_24:.2} vs {at_64:.2}); if this ever stops being true the \
              flag documentation is wrong, not the code"
         );
 
@@ -1881,7 +1902,7 @@ mod tests {
         assert!(
             bare < 5.0,
             "the fixture must actually chatter without an envelope, got {bare:.2} frames per \
-             run -- otherwise there is nothing here for the envelope to fix"
+             run; otherwise there is nothing here for the envelope to fix"
         );
         assert!(
             smoothed > bare * 2.0,
@@ -1900,8 +1921,8 @@ mod tests {
         assert_eq!(d.release_ms, DEFAULT_RELEASE_MS);
         assert!(
             d.release_ms > d.attack_ms * 4.0,
-            "attack and release are asymmetric BY DESIGN -- fast up keeps transients punchy, \
-             slow down stops the chatter -- and collapsing them into one constant loses one \
+            "attack and release are asymmetric BY DESIGN (fast up keeps transients punchy, \
+             slow down stops the chatter), and collapsing them into one constant loses one \
              or the other. Got attack {} release {}",
             d.attack_ms,
             d.release_ms
@@ -2097,7 +2118,7 @@ mod tests {
         assert!(
             handovers * 3 < crossings,
             "the voice slot must not change hands on every rank swap ({handovers} handovers \
-             vs {crossings} crossings) -- at 30 fps that is a 33 ms chirp per swap"
+             vs {crossings} crossings); at 30 fps that is a 33 ms chirp per swap"
         );
     }
 
@@ -2123,7 +2144,7 @@ mod tests {
         assert!(
             (got - 2.0).abs() < 1e-5,
             "prominence must average the {PROMINENCE_WIDTH} bands either side and no others: \
-             expected 3.0/1.5 = 2.0, got {got} -- 1.5 means the neighbourhood is one band too \
+             expected 3.0/1.5 = 2.0, got {got}; 1.5 means the neighbourhood is one band too \
              narrow, 0.96 means it is one band too wide"
         );
     }
@@ -2166,7 +2187,7 @@ mod tests {
             got,
             vec![20],
             "the one voice must go to the spike that stands 6x over its neighbourhood, not to \
-             the louder apex that stands 1.67x over its own -- ranking by raw magnitude picks \
+             the louder apex that stands 1.67x over its own. Ranking by raw magnitude picks \
              band 8 here, which is how a bank spends its slots on rumble and hiss"
         );
         // Prominence decides which band sounds, never how loud it is.
@@ -2233,7 +2254,7 @@ mod tests {
             got,
             vec![5, 25],
             "with more slots than candidates the GATE, not the top-N truncation, has to be \
-             what keeps the bank sparse -- got {got:?}"
+             what keeps the bank sparse. Got {got:?}"
         );
     }
 
@@ -2279,7 +2300,7 @@ mod tests {
             assert!(
                 share(r) > 15.0,
                 "the {name} third won only {:.1}% of the voice slots (low {:.1}%, mid {:.1}%, \
-                 high {:.1}%) -- with every tone at the SAME amplitude a fair selector spreads \
+                 high {:.1}%); with every tone at the SAME amplitude a fair selector spreads \
                  its slots over the whole range, and starving a third of the spectrum is \
                  exactly what makes a render sound muffled",
                 share(r),
@@ -2290,7 +2311,7 @@ mod tests {
             assert!(
                 share(r) < 55.0,
                 "the {name} third took {:.1}% of the voice slots (low {:.1}%, mid {:.1}%, \
-                 high {:.1}%) -- equal-amplitude tones must not let one region hog the bank",
+                 high {:.1}%); equal-amplitude tones must not let one region hog the bank",
                 share(r),
                 share(0),
                 share(1),

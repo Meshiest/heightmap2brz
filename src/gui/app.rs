@@ -107,13 +107,13 @@ impl Menu {
                 "Select a heightmap and colormap to generate optimized brick terrain."
             }
             Menu::Video => {
-                "Convert an animated image or frame sequence into wired, animated bricks."
+                "Convert an animated image or frame sequence into animated display bricks."
             }
             Menu::Audio => {
-                "Turn a song into a cluster of wired, pitched speaker bricks that play it back."
+                "Turn a song into a cluster of pitched speaker bricks that play it back."
             }
             Menu::Midi => {
-                "Turn a MIDI file into wired, pitched speaker bricks, one synth tone per instrument."
+                "Turn a MIDI file into pitched speaker bricks, one synth tone per instrument."
             }
         }
     }

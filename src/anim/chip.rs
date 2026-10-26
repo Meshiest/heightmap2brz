@@ -127,15 +127,18 @@ impl Chip {
         );
         self.entity.data = entities::microchip_grid_entity(self.collapsed, center, extent);
 
-        // Centre the plane over the display: the lattice is origin-anchored
-        // (0..N), so its midpoint sits half a plane-width from the grid
-        // origin and the correction goes on the entity, not the bricks
-        // (moving them toward the origin would drive the low-x pixel gates
-        // negative). Accounts for `PLANE_SPIN`, a -90 degree yaw about world
-        // Z mapping grid-local (x, y) onto world (y, -x): the x-extent
-        // corrects world Y and the y-extent corrects world X.
-        self.entity.location.x -= extent.y as f32;
-        self.entity.location.y += extent.x as f32;
+        // A linked grid's location is measured from its shell brick, not the
+        // world origin: every expanded chip the game saves has a location
+        // within a few studs of zero, wherever its shell is. So the plane is
+        // put on the shell: its centre over the shell's, its underside on the
+        // shell's top. `PLANE_SPIN`, a -90 degree yaw about Z, maps grid-local
+        // (x, y) onto (y, -x), so the plane centre lands at (cy, -cx) from the
+        // location and the location cancels it.
+        self.entity.location = Vector3f {
+            x: -center.y as f32,
+            y: center.x as f32,
+            z: PLANE_LIFT as f32,
+        };
     }
 }
 
@@ -150,20 +153,17 @@ impl Chip {
 /// with the true extent. Callers should pass a small, legal (non-degenerate)
 /// value here, not a deliberately generous one: nothing about that generosity
 /// survives to the published entity.
-pub fn new_chip(
-    world: &mut World,
-    position: Position,
-    entity_location: Vector3f,
-    plane_extent: IntVector,
-) -> Chip {
+pub fn new_chip(world: &mut World, position: Position, plane_extent: IntVector) -> Chip {
     // Start collapsed: a pasted animation is meant to be looked at, not
     // edited, and an expanded chip's interaction plane is large enough
     // (see `plane_extent_for`) to be visually in the way of the screen it
     // drives. `Chip` carries this through to `recompute_plane_extent`, which
     // rebuilds the entity data, so the two can never disagree.
     const COLLAPSED: bool = true;
+    // The location is set in `finish`, once the plane's size is known.
+    let location = Vector3f { x: 0.0, y: 0.0, z: 0.0 };
     let (brick_id, entity_id, (entity, bricks)) =
-        world.add_microchip(position, entity_location, plane_extent, COLLAPSED);
+        world.add_microchip(position, location, plane_extent, COLLAPSED);
     let mut entity = entity;
     entity.rotation = PLANE_SPIN;
     let mut chip = Chip {
@@ -189,6 +189,35 @@ pub fn new_chip(
         chip.add_brick(brick, half);
     }
     chip
+}
+
+/// Start the plane of a loop or function shell that already sits in some
+/// grid as brick `shell_brick_id`: a new collapsed grid entity linked to that
+/// brick, placed on it by [`finish`]. Populate it like any chip, then
+/// [`finish`] it.
+pub fn new_plane(world: &mut World, shell_brick_id: usize) -> Chip {
+    const COLLAPSED: bool = true;
+    let entity_id = Brick::next_id();
+    world.register_microchip_link(shell_brick_id, entity_id);
+    let entity = Entity {
+        asset: entities::MICROCHIP_GRID,
+        id: Some(entity_id),
+        rotation: PLANE_SPIN,
+        data: entities::microchip_grid_entity(
+            COLLAPSED,
+            IntVector { x: 0, y: 0, z: 0 },
+            IntVector { x: 5, y: 5, z: PLANE_HALF_THICKNESS },
+        ),
+        ..Default::default()
+    };
+    Chip {
+        brick_id: shell_brick_id,
+        entity_id,
+        entity,
+        collapsed: COLLAPSED,
+        bricks: Vec::new(),
+        placed: Vec::new(),
+    }
 }
 
 fn add_pin(chip: &mut Chip, label: &str, pos: Position, is_input: bool) -> usize {
@@ -325,6 +354,11 @@ pub fn plane_bounds_for(placed: &[(Position, IntVector)]) -> (IntVector, IntVect
         IntVector { x: ex, y: ey, z: PLANE_HALF_THICKNESS },
     )
 }
+
+/// Height of the plane's centre above its shell's centre: a 1x1 shell is 2
+/// units from centre to top, and the plane is [`PLANE_HALF_THICKNESS`]
+/// thick below its centre, so the plane rests on the shell.
+const PLANE_LIFT: i32 = 2 + PLANE_HALF_THICKNESS;
 
 /// Half-thickness of the chip's interaction plane, in grid units.
 ///

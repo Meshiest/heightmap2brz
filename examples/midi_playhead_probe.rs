@@ -15,7 +15,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let world = heightmap::audio::speakers::build_playhead_probe_world()?;
     std::fs::write("./midi_playhead_probe.brz", world.to_brz_vec()?)?;
-    println!("wrote ./midi_playhead_probe.brz -- load it in game and press play.");
+    println!("wrote ./midi_playhead_probe.brz; load it in game and press play.");
     println!("expect: an ascending 8-note scale, one note per second, then silence.");
     Ok(())
 }

@@ -55,7 +55,7 @@ fn finish(result: Result<(), Halt>) -> Result<(), String> {
     match result {
         Ok(()) => Ok(()),
         Err(Halt::Cancelled) => {
-            info!("Render cancelled -- no save written");
+            info!("Render cancelled; no save written");
             Ok(())
         }
         Err(Halt::Failed(e)) => Err(e),
@@ -592,7 +592,7 @@ impl HeightmapApp {
                         widgets::radio(ui, &mut self.mode, BrickMode::Wedge, "Wedge Terrain")
                             .on_hover_text(
                                 "Build TERRACED terrain: tops stay flat, and terrace outlines are cut \n\
-                                 at 45 degrees by vertical side wedges -- corners chamfered, \n\
+                                 at 45 degrees by vertical side wedges: corners chamfered, \n\
                                  staircases merged into large wedges, flat tops merged into boxes. \n\
                                  Slopes are not approximated; this is the look of hand-built brick \n\
                                  terrain",
@@ -848,7 +848,7 @@ mod tests {
     fn a_cancelled_render_reports_success_rather_than_an_error_dialog() {
         assert!(
             finish(Err(Halt::Cancelled)).is_ok(),
-            "a cancel must never reach draw_progress as an Err -- that is the red \
+            "a cancel must never reach draw_progress as an Err; that is the red \
              'Error: Stopped by user' dialog the policy forbids"
         );
     }

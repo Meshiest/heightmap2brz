@@ -337,7 +337,7 @@ fn assert_columns_line_up(pane: &Pane, name: &str, section_titles: &[&str]) {
         assert!(
             rect.left() <= c1 + 1.0 || rect.left() >= c1 + column_width - 1.0,
             "{name}: {text:?} starts at {:.1}, inside the label column (which runs \
-             {c1:.1}..{:.1}) -- its row is putting a label and a control in one grid cell",
+             {c1:.1}..{:.1}), so its row is putting a label and a control in one grid cell",
             rect.left(),
             c1 + column_width
         );
@@ -345,7 +345,7 @@ fn assert_columns_line_up(pane: &Pane, name: &str, section_titles: &[&str]) {
             assert!(
                 rect.right() <= c1 + column_width - 2.0,
                 "{name}: the label {text:?} is wider than LABEL_COLUMN_WIDTH, so its \
-                 section's column 2 no longer lines up with the others -- raise the constant",
+                 section's column 2 no longer lines up with the others; raise the constant",
             );
         }
     }
@@ -382,7 +382,7 @@ fn assert_headers_are_not_spread_apart(pane: &Pane, name: &str, section_titles: 
         assert!(
             gap <= upper.height(),
             "{name}: {gap:.1} points between two collapsed headers, more than the \
-             {:.1} a line of text occupies -- something in the header row is \
+             {:.1} a line of text occupies, so something in the header row is \
              allocating layout space it should not",
             upper.height()
         );

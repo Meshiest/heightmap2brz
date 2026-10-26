@@ -186,6 +186,11 @@ pub struct MidiOptions {
     /// [`crate::audio::percussion::PALETTE_ROLES`]. Empty (the default and the
     /// CLI) uses the baked fold table; the GUI's drum-kit dropdowns fill it.
     pub drum_kit: Vec<crate::audio::percussion::OneShotSound>,
+    /// Build each playhead as a call of one shared function (about 4 gates a
+    /// speaker, and every note that ends inside a tick is passed in that
+    /// tick) instead of a ~16-gate wired chain per speaker. See
+    /// [`crate::audio::midi_functions`].
+    pub functions: bool,
 }
 
 impl Default for MidiOptions {
@@ -205,6 +210,7 @@ impl Default for MidiOptions {
             tones: ToneAssignment::default(),
             build_percussion: true,
             drum_kit: Vec::new(),
+            functions: true,
         }
     }
 }

@@ -12,7 +12,7 @@
 //!
 //! | | hex mode | colour-array mode |
 //! |---|---|---|
-//! | array | one per 1666-pixel chunk, one ~10 KB string per frame | one per PIXEL, one `(R,G,B,A)` per frame |
+//! | array | one per 5461-pixel chunk, one ~32 KB string per frame | one per PIXEL, one `(R,G,B,A)` per frame |
 //! | `ArrayVar_Get` | one per chunk | one per pixel |
 //! | pixel gates | `Substring` + `MakeColorHex` | none |
 //! | components/pixel | 2 | 2 |
@@ -50,8 +50,8 @@ use crate::progress::{FrameTotal, Progress};
 use crate::video::stream::FrameSource;
 use brdb::{
     AsBrdbValue, WirePort, World,
-    schema::WireArrayVariant,
 };
+use crate::wire_array::WireArray;
 
 /// Lattice stages a single pixel occupies, per bank: its `ArrayVar` and its
 /// `ArrayVar_Get`.
@@ -125,7 +125,7 @@ pub fn build_color_array_world(
     // would divide by zero in-game on every tick.
     if frame_count == 0 {
         return Err(
-            "clip has 0 frames -- nothing to render (check --start/--duration, or the GUI's \
+            "clip has 0 frames: nothing to render (check --start/--duration, or the GUI's \
              Start/Duration, against the source's length)"
                 .to_string(),
         );
@@ -144,7 +144,7 @@ pub fn build_color_array_world(
     // silently dropping a brick) is one that must not be able to drift between
     // modes.
     let (brick_of, geometry) = super::bricks::add_display_bricks(&mut world, opts, w, h, &visible);
-    let mut chip = super::bricks::new_screen_chip(&mut world, w, h, &geometry);
+    let mut chip = super::bricks::new_screen_chip(&mut world, &geometry);
 
     let bank_size = opts.bank_size.max(1);
     let n_banks = frame_count.div_ceil(bank_size).max(1);
@@ -245,7 +245,7 @@ pub fn build_color_array_world(
         debug_assert_eq!(
             banks.len(),
             n_banks,
-            "every pixel's colour list must bank identically -- they are all frame_count long"
+            "every pixel's colour list must bank identically, since they are all frame_count long"
         );
 
         // One (ArrayVar, Get) pair per bank, each pair on its own two stages.
@@ -259,7 +259,7 @@ pub fn build_color_array_world(
                 lattice_pos_staged(col, row, array_stage, h, GATE_HALF, STAGE_PITCH),
                 vec![(
                     "Value",
-                    Box::new(WireArrayVariant::LinearColorArray(frames.to_vec()))
+                    Box::new(WireArray::LinearColor(frames.to_vec()))
                         as Box<dyn AsBrdbValue>,
                 )],
             );
@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(
             accumulator_bytes(1, 1) / super::super::pack::HEX_STRIDE,
             2,
-            "16 bytes against hex's 6 -- the ~2.7x the docs quote"
+            "16 bytes against hex's 6, the ~2.7x the docs quote"
         );
     }
 
@@ -519,7 +519,7 @@ mod tests {
                 assert_eq!(
                     p.capacity(),
                     frames,
-                    "pixel {i}: {frames} frames must occupy exactly {frames} slots -- \
+                    "pixel {i}: {frames} frames must occupy exactly {frames} slots; \
                      a capacity of {} is the growth-doubling slack accumulator_bytes \
                      does not report",
                     p.capacity()

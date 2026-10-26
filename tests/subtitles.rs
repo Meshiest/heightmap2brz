@@ -134,7 +134,7 @@ fn chip_bricks_and_wires(path: &Path) -> (u64, u64) {
 /// the written file exactly as `tests/anim_text.rs::band_strings` does. The
 /// bytes are never compared -- only the structure is read back.
 fn string_arrays(path: &Path) -> Vec<Vec<String>> {
-    use brdb::schema::WireArrayVariant;
+    use heightmap::wire_array::WireArray;
     let db = brdb::Brz::open(path).expect("reopen").into_reader();
     let mut gid = None;
     for index in db.entity_chunk_index().expect("entity chunk index") {
@@ -149,12 +149,12 @@ fn string_arrays(path: &Path) -> Vec<Vec<String>> {
     for chunk in &db.brick_chunk_index(gid).expect("chunk index") {
         let (_soa, structs) = db.component_chunk(gid, chunk.index).expect("components");
         for s in &structs {
-            if s.get_name() == "BrickComponentData_WireGraphPseudo_ArrayVar"
+            if s.get_name() == "BrickComponentData_ArrayVar"
                 && let Some(value) = s.get("Value")
             {
-                let variant: WireArrayVariant =
+                let variant: WireArray =
                     value.try_into().expect("ArrayVar Value must decode");
-                if let WireArrayVariant::StringArray(v) = variant {
+                if let WireArray::Str(v) = variant {
                     out.push(v);
                 }
             }
@@ -289,7 +289,7 @@ fn a_real_render_with_subtitles_adds_exactly_two_gates() {
     assert_eq!(
         estimated_gates(&with.log) - estimated_gates(&without.log),
         2,
-        "the READOUT must rise by the same 2 the render does -- with {}, without {}",
+        "the READOUT must rise by the same 2 the render does (with {}, without {})",
         estimated_gates(&with.log),
         estimated_gates(&without.log),
     );
@@ -352,7 +352,7 @@ fn subtitles_are_timed_against_the_clip_start_offset() {
     assert_eq!(entries.len(), 16, "16 frames left after skipping 2 s at 4 fps");
     assert_eq!(
         entries[0], CUE_TWO,
-        "frame 0 of a --start 2 render is at SOURCE t=2.00s -- a subtitle file is \
+        "frame 0 of a --start 2 render is at SOURCE t=2.00s; a subtitle file is \
          in source time, so hard-coding the offset to 0 puts every cue 2 s early"
     );
     assert_eq!(entries[3], CUE_TWO, "frame 3 is at t=2.75s");

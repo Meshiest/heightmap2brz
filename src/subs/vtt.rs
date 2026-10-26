@@ -49,7 +49,7 @@ pub fn parse(input: &str) -> Result<Subtitles, String> {
         let first = normalized.lines().next().unwrap_or("");
         return Err(format!(
             "not a WebVTT file: it must begin with a \"WEBVTT\" signature line, but it \
-             begins with {first:?}. If this is really a SubRip file, name it .srt -- its \
+             begins with {first:?}. If this is really a SubRip file, name it .srt; its \
              timestamps use \",\" for the fraction and would be misread here."
         ));
     }

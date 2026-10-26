@@ -15,7 +15,7 @@
 //!
 //! The button carries the animated-button component
 //! ([`BUTTON`]), whose `PromptCustomLabel` is a bare `str` schema field, so its
-//! literal is baked as a plain [`String`], not a `WireVariant`. The visible
+//! literal is baked as a plain [`String`], not a `WireValue`. The visible
 //! label is a second component on the SAME brick, not a separate cube.
 //!
 //! # Three things this cannot verify -- the owner must confirm on a test render
@@ -194,7 +194,7 @@ mod tests {
     use super::*;
     use crate::anim::chip::{MICROCHIP_INPUT, add_input_pin, new_chip};
     use crate::anim::layout::assert_bricks_dont_overlap;
-    use brdb::{IntVector, Vector3f};
+    use brdb::IntVector;
 
     /// A world with a microchip carrying three input pins, standing in for the
     /// clock's Pause/Restart/Resume. Returns the world and the three pin ids.
@@ -203,7 +203,6 @@ mod tests {
         let mut chip = new_chip(
             &mut world,
             Position { x: -20, y: 0, z: 2 },
-            Vector3f { x: -20.0, y: 0.0, z: 40.0 },
             IntVector { x: 5, y: 5, z: 5 },
         );
         let pause = add_input_pin(&mut chip, "Pause", Position { x: 5, y: 5, z: 6 });

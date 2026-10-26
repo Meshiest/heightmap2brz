@@ -2,12 +2,17 @@ use brdb::{
     AsBrdbValue, BrdbSchemaError, Brick, BrickSize, BrickType, Collision, Color, Direction,
     Position, PrefabJson, SavedBrickColor, Vector3f, WirePort, World,
     assets::{LiteralComponent, bricks::PB_DEFAULT_MICRO_BRICK},
-    schema::{BrdbInterned, BrdbSchema, BrdbValue, WireVariant},
+    schema::{BrdbInterned, BrdbSchema, BrdbValue, WireValue},
 };
 use image::RgbaImage;
 
-/// Maximum characters (Unicode chars, not bytes) a TextDisplay component accepts.
-pub const MAX_COMPONENT_CHARS: usize = 10_000;
+/// Maximum characters (Unicode chars, not bytes) of one string: a
+/// TextDisplay's text or one string array element.
+///
+/// The game caps a string at 32,768. This sits one under, so whether that
+/// cap counts inclusively or not, the last character of a full band is
+/// never cut.
+pub const MAX_COMPONENT_CHARS: usize = 32_767;
 
 /// Calibrated font presets for the text renderer. Each preset carries the
 /// glyph scheme and the component geometry (LineHeight/LineOffset/Kerning/
@@ -1134,9 +1139,9 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
             ..Default::default()
         }
         .with_component(
-            LiteralComponent::new("BrickComponentType_WireGraphPseudo_Var").with_data([(
+            LiteralComponent::new("BrickComponentType_Var").with_data([(
                 "Value",
-                Box::new(WireVariant::Number(value as f64)) as Box<dyn AsBrdbValue>,
+                Box::new(WireValue::Number(value as f64)) as Box<dyn AsBrdbValue>,
             )]),
         )
         .with_component(text_display_component(
@@ -1175,7 +1180,7 @@ pub fn build_calibration_world(opts: &TextOptions, cube_spacing: f32) -> World {
     for (var_id, (_, port, _)) in var_ids.iter().zip(variables) {
         for &text_id in &text_ids {
             world.add_wire_connection(
-                WirePort::new(*var_id, "BrickComponentType_WireGraphPseudo_Var", "Value"),
+                WirePort::new(*var_id, "BrickComponentType_Var", "Value"),
                 WirePort::new(text_id, "Component_TextDisplay", port),
             );
         }
@@ -1710,12 +1715,12 @@ mod tests {
 
     /// 20-wide row of per-pixel alternating colors. Both are repeated-digit
     /// colours, so each pixel costs a 13-char short tag plus its one glyph:
-    /// 20 × 14 = 280 chars. Band capacity: 280 + 281·(n−1) ≤ 10 000 ⇒ 35
-    /// rows. 60 rows ⇒ 35+25.
+    /// 20 × 14 = 280 chars. Band capacity: 280 + 281·(n−1) ≤ 32 767 ⇒ 116
+    /// rows. 200 rows ⇒ 116+84.
     #[test]
     fn bands_split_at_char_limit() {
-        let mut i = RgbaImage::new(20, 60);
-        for y in 0..60 {
+        let mut i = RgbaImage::new(20, 200);
+        for y in 0..200 {
             for x in 0..20 {
                 i.put_pixel(x, y, if x % 2 == 0 { RED } else { GREEN });
             }
@@ -1723,9 +1728,9 @@ mod tests {
         let bands = encode_bands(&i, &TextOptions::default()).unwrap();
         assert_eq!(
             bands.iter().map(|b| b.start_row).collect::<Vec<_>>(),
-            vec![0, 35]
+            vec![0, 116]
         );
-        assert_eq!(bands.iter().map(|b| b.rows).sum::<usize>(), 60);
+        assert_eq!(bands.iter().map(|b| b.rows).sum::<usize>(), 200);
         for b in &bands {
             assert!(b.chars <= MAX_COMPONENT_CHARS);
             assert_eq!(b.chars, b.text.chars().count());
@@ -1741,16 +1746,18 @@ mod tests {
         }
     }
 
-    /// The same 20x60 image in colours no channel can shorten costs 17 per
+    /// The same 20x200 image in colours no channel can shorten costs 17 per
     /// pixel instead of 14, and bands three ways instead of two -- the size
     /// win from the short tag, measured rather than asserted in a comment.
-    /// (20 × 17 = 340; 340 + 341·(n−1) ≤ 10 000 ⇒ 29 rows ⇒ 29+29+2.)
+    /// (20 × 17 = 340; 340 + 341·(n−1) ≤ 32 767 ⇒ 96 rows. The second band
+    /// also carries 96 leading padding newlines, which costs it a row:
+    /// 96+95+9.)
     #[test]
     fn colours_that_cannot_shorten_band_sooner() {
         let long_a = Rgba([0x12, 0x34, 0x56, 255]);
         let long_b = Rgba([0x78, 0x9A, 0xBC, 255]);
-        let mut i = RgbaImage::new(20, 60);
-        for y in 0..60 {
+        let mut i = RgbaImage::new(20, 200);
+        for y in 0..200 {
             for x in 0..20 {
                 i.put_pixel(x, y, if x % 2 == 0 { long_a } else { long_b });
             }
@@ -1758,9 +1765,9 @@ mod tests {
         let bands = encode_bands(&i, &TextOptions::default()).unwrap();
         assert_eq!(
             bands.iter().map(|b| b.start_row).collect::<Vec<_>>(),
-            vec![0, 29, 58]
+            vec![0, 96, 191]
         );
-        assert_eq!(bands.iter().map(|b| b.rows).sum::<usize>(), 60);
+        assert_eq!(bands.iter().map(|b| b.rows).sum::<usize>(), 200);
     }
 
     #[test]
@@ -2002,10 +2009,10 @@ mod tests {
 
     #[test]
     fn row_too_wide_is_error() {
-        // 800 px x (13-char short tag + 1 glyph) = 11 200, past the 10 000
+        // 2400 px x (13-char short tag + 1 glyph) = 33 600, past the 32 767
         // limit no band layout can split a single row below
-        let mut i = RgbaImage::new(800, 1);
-        for x in 0..800 {
+        let mut i = RgbaImage::new(2400, 1);
+        for x in 0..2400 {
             i.put_pixel(x, 0, if x % 2 == 0 { RED } else { GREEN });
         }
         let err = encode_bands(&i, &TextOptions::default()).unwrap_err();
@@ -2054,8 +2061,8 @@ mod tests {
     #[test]
     fn bricks_stack_one_per_band() {
         use brdb::{Position, World};
-        let mut i = RgbaImage::new(20, 60);
-        for y in 0..60 {
+        let mut i = RgbaImage::new(20, 200);
+        for y in 0..200 {
             for x in 0..20 {
                 i.put_pixel(x, y, if x % 2 == 0 { RED } else { GREEN });
             }

@@ -9,10 +9,12 @@ pub mod cost;
 pub mod layout;
 pub mod pack;
 pub mod palette;
+pub mod ref_player;
 pub mod subtitle_display;
 pub mod text_bricks;
 pub mod text_layout;
 pub mod text_pack;
+pub mod text_refs;
 
 use crate::progress::Progress;
 use crate::video::stream::FrameSource;
@@ -26,7 +28,7 @@ use brdb::World;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AnimEncoding {
     /// Frame-major hex strings (see [`bricks`] and [`pack`]). One `ArrayVar`
-    /// per 1666-pixel chunk holding one ~10 KB `RRGGBB...` string per frame;
+    /// per 5461-pixel chunk holding one ~32 KB `RRGGBB...` string per frame;
     /// per pixel a `Substring` slices its own 6 characters out and a
     /// `MakeColorHex` parses them.
     ///
@@ -69,6 +71,23 @@ impl AnimEncoding {
         opts: &bricks::AnimOptions,
         progress: &mut dyn Progress,
     ) -> Result<World, String> {
+        let info = source.info();
+        let frames = info.frame_count_hint.or(source.frame_count_estimate());
+        if bricks::uses_refs(opts, info.width, info.height, frames) {
+            let encoding = match self {
+                Self::Hex => ref_player::RecordEncoding::Hex,
+                Self::ColorArray => ref_player::RecordEncoding::ColorArray,
+            };
+            return ref_player::build_ref_world(source, opts, encoding, progress);
+        }
+        if opts.driver == bricks::Driver::Refs {
+            log::info!(
+                "{}x{} over {} frame(s) does not fit the ref driver's one-array tables; using wires",
+                info.width,
+                info.height,
+                frames.map_or("?".to_string(), |f| f.to_string())
+            );
+        }
         match self {
             Self::Hex => bricks::build_brick_world(source, opts, progress),
             Self::ColorArray => color_bricks::build_color_array_world(source, opts, progress),
@@ -92,6 +111,13 @@ impl AnimEncoding {
         frames: usize,
         opts: &bricks::AnimOptions,
     ) -> cost::Cost {
+        if bricks::uses_refs(opts, width, height, Some(frames)) {
+            let encoding = match self {
+                Self::Hex => ref_player::RecordEncoding::Hex,
+                Self::ColorArray => ref_player::RecordEncoding::ColorArray,
+            };
+            return cost::estimate_refs(width, height, frames, opts, encoding);
+        }
         match self {
             Self::Hex => cost::estimate(width, height, frames, opts),
             Self::ColorArray => cost::estimate_color_array(width, height, frames, opts),
@@ -143,7 +169,7 @@ impl AnimMode {
             "text" => match encoding {
                 None => Ok(Self::Text),
                 Some(s) => Err(format!(
-                    "--anim-encoding '{s}' has no effect under --anim-mode text -- only brick \
+                    "--anim-encoding '{s}' has no effect under --anim-mode text, because only brick \
                      mode has more than one pixel encoding; drop --anim-encoding to render text \
                      mode"
                 )),

@@ -96,7 +96,7 @@ fn both_backends_agree_within_the_established_tolerance() {
         assert!(
             mean < 3.0,
             "frame {i} mean abs channel diff {mean:.2} through the public backend::open_video \
-             selection API -- the builtin decoder is wrong, not merely different from ffmpeg"
+             selection API; the builtin decoder is wrong, not merely different from ffmpeg"
         );
     }
     let _ = std::fs::remove_file(&path);

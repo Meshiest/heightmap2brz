@@ -39,14 +39,15 @@
 //!
 //! Built entirely on the crate's public API; nothing under `src/` is touched.
 use brdb::{
-    AsBrdbValue, BString, Brick, BrickType, IntVector, IntoReader, Position, Vector3f, WirePort,
+    AsBrdbValue, BString, Brick, BrickType, IntVector, IntoReader, Position, WirePort,
     World,
     assets::{
         LiteralComponent,
         external::{ASSET_TYPES, BA_SYNTH_BASIC_SINE, BA_SYNTH_NOISE_PINK, BA_SYNTH_NOISE_WHITE},
     },
-    schema::{BrdbStruct, BrdbValue, WireArrayVariant},
+    schema::{BrdbStruct, BrdbValue},
 };
+use heightmap::wire_array::WireArray;
 use heightmap::anim::bricks::{ARRAY_GET, ARRAY_VAR, CHANGE_DETECTOR};
 use heightmap::anim::chip::{finish, new_chip};
 use heightmap::anim::clock::{build_clock, gate};
@@ -121,7 +122,7 @@ struct SpeakerSpec {
 /// out, so it must not be reintroduced by the diagnostics themselves.
 ///
 /// The value is a [`BrdbValue::Asset`] carrying the reference's index. NOT a
-/// `WireVariant::Object` -- that is the wire-graph value union and a different
+/// `WireValue::Object` -- that is the wire-graph value union and a different
 /// encoding path entirely, and it also compiles.
 fn descriptor_value(world: &mut World, asset_name: &str) -> Result<Box<dyn AsBrdbValue>, String> {
     let (_, known) = ASSET_TYPES
@@ -150,9 +151,9 @@ fn descriptor_value(world: &mut World, asset_name: &str) -> Result<Box<dyn AsBrd
 /// renderer is measuring a different instrument.
 ///
 /// `PitchMultiplier` and `VolumeMultiplier` are bare `f32` fields on
-/// `BrickComponentData_AudioEmitter`, NOT the `WireVariant` tagged union that
-/// wire-graph gate ports use. A `WireVariant::Number` here compiles and then
-/// dies at encode with `UnimplementedCast("f32", WireVariant)`.
+/// `BrickComponentData_AudioEmitter`, NOT the `WireValue` tagged union that
+/// wire-graph gate ports use. A `WireValue::Number` here compiles and then
+/// dies at encode with `UnimplementedCast("f32", WireValue)`.
 fn add_speaker(
     world: &mut World,
     spec: &SpeakerSpec,
@@ -225,13 +226,13 @@ fn chipless_world(description: &str, specs: &[SpeakerSpec]) -> Result<World, Str
 fn assert_chipless(world: &World, name: &str) {
     assert!(
         world.grids.is_empty(),
-        "{name} must contain NO brick grids (i.e. no microchip), found {} -- \
+        "{name} must contain NO brick grids (i.e. no microchip), found {}; \
          a save with a chip in it cannot exonerate the wire-graph layer",
         world.grids.len()
     );
     assert!(
         world.wires.is_empty(),
-        "{name} must contain NO wires, found {} -- the whole point of this save \
+        "{name} must contain NO wires, found {}; the whole point of this save \
          is that nothing drives the speaker at runtime",
         world.wires.len()
     );
@@ -328,11 +329,6 @@ fn one_driven_port(
             y: 0,
             z: 2,
         },
-        Vector3f {
-            x: chip_x as f32,
-            y: 0.0,
-            z: 40.0,
-        },
         IntVector { x: 10, y: 10, z: 2 },
     );
 
@@ -370,7 +366,7 @@ fn one_driven_port(
         service(0, -5),
         vec![(
             "Value",
-            Box::new(WireArrayVariant::DoubleArray(values)) as Box<dyn AsBrdbValue>,
+            Box::new(WireArray::F64(values)) as Box<dyn AsBrdbValue>,
         )],
     );
     let get = gate(
@@ -561,11 +557,11 @@ fn verify_ramp(path: &Path, expected: &[f64]) -> Result<String, String> {
                 .component_chunk_soa(gid, chunk.index)
                 .map_err(|e| format!("component chunk soa: {e}"))?;
             for s in structs {
-                if s.get_name() != "BrickComponentData_WireGraphPseudo_ArrayVar" {
+                if s.get_name() != "BrickComponentData_ArrayVar" {
                     continue;
                 }
                 let v = s.prop("Value").map_err(|e| format!("ArrayVar Value: {e}"))?;
-                let WireArrayVariant::DoubleArray(d) = WireArrayVariant::try_from(v)
+                let WireArray::F64(d) = WireArray::try_from(v)
                     .map_err(|e| format!("ArrayVar Value is not a wire array variant: {e}"))?
                 else {
                     return Err(format!("the ramp must be a DoubleArray, got {v:?}"));
@@ -583,7 +579,7 @@ fn verify_ramp(path: &Path, expected: &[f64]) -> Result<String, String> {
     if arrays[0] != expected {
         return Err(format!(
             "the ramp read back with {} values (expected {}), or with different \
-             contents -- first few: {:?}",
+             contents (first few: {:?})",
             arrays[0].len(),
             expected.len(),
             &arrays[0][..arrays[0].len().min(4)]
@@ -719,7 +715,7 @@ fn verify(path: &Path, specs: &[SpeakerSpec], expect_chipless: bool) -> Result<S
         }
         if bool_prop(s, "bSpatialization")? {
             return Err(format!(
-                "{name}: speaker {i} has bSpatialization TRUE -- the game's own default. \
+                "{name}: speaker {i} has bSpatialization TRUE, which is the game's own default. \
                  Every diagnostic would be measuring 3D panning instead of what it means to."
             ));
         }
@@ -732,8 +728,8 @@ fn verify(path: &Path, specs: &[SpeakerSpec], expect_chipless: bool) -> Result<S
             .map_err(|e| format!("{name}: speaker {i} AudioDescriptor: {e}"))?
         else {
             return Err(format!(
-                "{name}: speaker {i} AudioDescriptor did not decode as Asset(Some(..)) -- \
-                 a WireVariant::Object encodes down a different path entirely"
+                "{name}: speaker {i} AudioDescriptor did not decode as Asset(Some(..)); \
+                 a WireValue::Object encodes down a different path entirely"
             ));
         };
         let (ty, asset) = facts.assets.get(*idx).ok_or_else(|| {
@@ -787,11 +783,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&dir)?;
 
     println!(
-        "Five diagnostic saves. Tests 1, 2 and 4 contain NO microchip and NO wires at all --\n\
+        "Five diagnostic saves. Tests 1, 2 and 4 contain NO microchip and NO wires at all:\n\
          only speaker bricks with baked component data. If one of those fails to make sound,\n\
          the fault is in the emitter/asset/pitch setup and the entire wire-graph layer is\n\
          exonerated. Tests 3 and 5 have a chip, because a chip driving a speaker IS what they\n\
-         test -- 3 writes VolumeMultiplier every frame, 5 writes PitchMultiplier.\n"
+         test: 3 writes VolumeMultiplier every frame, 5 writes PitchMultiplier.\n"
     );
 
     // --- 1 -----------------------------------------------------------------
@@ -803,7 +799,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  EXPECT: one steady, continuous tone (the sine synth's own authored pitch, \
          nominally 440 Hz), forever, at moderate volume.\n  \
-         IF NOT (silence): a baked AudioDescriptor does not make an emitter sound at all -- \
+         IF NOT (silence): a baked AudioDescriptor does not make an emitter sound at all; \
          the asset reference, the component name or bEnabled is wrong, and no amount of \
          wiring will ever fix the render.\n"
     );
@@ -838,11 +834,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ramp_seen = verify_ramp(&p3, &ramp_values())?;
     println!("{}  ({n3} bytes)\n  {seen}\n  {ramp_seen}", p3.display());
     println!(
-        "  EXPECT: a smooth 2-second fade in and back out, repeating -- {RAMP_FRAMES} frames at \
+        "  EXPECT: a smooth 2-second fade in and back out, repeating: {RAMP_FRAMES} frames at \
          {RAMP_FPS} fps.\n  \
          IF NOT (a click, buzz or stutter at 30 Hz instead of a smooth fade): writing \
          VolumeMultiplier RETRIGGERS the voice instead of changing its level, and that single \
-         fact explains the entire failure -- 32 speakers restarted 30 times a second is a \
+         fact explains the entire failure: 32 speakers restarted 30 times a second is a \
          broadband click train, i.e. noise. The per-frame volume approach then cannot work as \
          designed.\n"
     );
@@ -854,7 +850,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seen = verify(&p4, &specs_4(&plan), true)?;
     println!("{}  ({n4} bytes)\n  {seen}", p4.display());
     println!(
-        "  EXPECT: a dense static drone -- {} sine bands from ~44 Hz to ~4.4 kHz plus a white \
+        "  EXPECT: a dense static drone: {} sine bands from ~44 Hz to ~4.4 kHz plus a white \
          and a pink noise bed, all sounding at once.\n  \
          IF NOT (thinner than 32 voices, or bands audibly missing): the game caps concurrent \
          voices and is stealing some of the bank, so the real render is quieter and narrower \
@@ -874,7 +870,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(
             *p as f32 >= PITCH_MIN && *p as f32 <= PITCH_MAX,
             "pitch ramp frame {i} is {p}, outside the emitter's legal \
-             {PITCH_MIN}..{PITCH_MAX} PitchMultiplier range -- the game would clamp it"
+             {PITCH_MIN}..{PITCH_MAX} PitchMultiplier range; the game would clamp it"
         );
     }
     let world = diag_5_pitch_ramp()?;
@@ -892,7 +888,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ramp_seen = verify_ramp(&p5, &pitch_ramp)?;
     println!("{}  ({n5} bytes)\n  {seen}\n  {ramp_seen}", p5.display());
     println!(
-        "  EXPECT: one smooth glissando -- an octave up and back down every two seconds, at a \
+        "  EXPECT: one smooth glissando: an octave up and back down every two seconds, at a \
          constant volume, repeating. {RAMP_FRAMES} frames at {RAMP_FPS} fps, 0.4 semitones per \
          frame.\n  \
          IF NOT (a click, buzz or stutter at 30 Hz, or a machine-gun of separate notes instead \
@@ -905,7 +901,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "\
-Checklist -- work through these in order, in a quiet local world, standing still:
+Checklist: work through these in order, in a quiet local world, standing still:
 
   1. Load diag_1_static_tone.brz. Do you hear a steady tone?
      No  -> STOP. Nothing downstream can work. The emitter setup itself is wrong.
@@ -920,7 +916,7 @@ Checklist -- work through these in order, in a quiet local world, standing still
      One full fade in and back out every two seconds, repeating. Is it SMOOTH?
        Yes -> assumption 3 holds. Per-frame volume writes are usable, and the fault
               is somewhere else entirely.
-       No -- it clicks, buzzes or stutters at a steady rate instead of fading
+       No, it clicks, buzzes or stutters at a steady rate instead of fading
             -> THIS IS THE ANSWER. Writing VolumeMultiplier retriggers the voice
                rather than changing its level. The per-frame volume approach cannot
                work as designed and the renderer needs a different mechanism; a
@@ -933,11 +929,11 @@ Checklist -- work through these in order, in a quiet local world, standing still
 
   5. Load diag_5_pitch_ramp.brz. THIS IS THE ONE THAT GATES --audio-mode voice.
      One octave up and back down every two seconds, at a constant volume,
-     repeating. Is it a SMOOTH GLISSANDO -- one continuous tone sliding?
+     repeating. Is it a SMOOTH GLISSANDO (one continuous tone sliding)?
        Yes -> assumption 4 holds. A speaker can be re-pitched every frame, so a
               voice can be parked on a detected spectral peak and follow it. That
               is what removes the band grid, and with it the tuning error.
-       No -- it clicks, buzzes, stutters, or sounds like a rapid run of separate
+       No, it clicks, buzzes, stutters, or sounds like a rapid run of separate
             notes rather than one sliding tone
             -> writing PitchMultiplier RETRIGGERS the voice. --audio-mode voice
                then cannot re-pitch per frame: it would have to freeze each

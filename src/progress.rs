@@ -64,7 +64,7 @@ impl FrameTotal {
         match self {
             FrameTotal::Exact(_) => phase.to_string(),
             FrameTotal::Estimated(_) => format!("{phase} (estimated total)"),
-            FrameTotal::Unknown => format!("{phase} (total unknown -- source did not report one)"),
+            FrameTotal::Unknown => format!("{phase} (total unknown: source did not report one)"),
         }
     }
 

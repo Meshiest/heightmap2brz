@@ -88,7 +88,7 @@ pub fn assert_wires_valid(path: &Path) {
                     type_indices.len(),
                     csoa.component_brick_indices.len(),
                     "grid {gid} chunk {:?}: {} component type counter instances but {} component \
-                     brick indices -- component SoA is internally inconsistent",
+                     brick indices; component SoA is internally inconsistent",
                     chunk.index,
                     type_indices.len(),
                     csoa.component_brick_indices.len(),
@@ -176,7 +176,7 @@ pub fn assert_wires_valid(path: &Path) {
         }
     }
 
-    assert!(checked > 0, "save contains no wires -- nothing was validated");
+    assert!(checked > 0, "save contains no wires, so nothing was validated");
 }
 
 /// Validate one wire endpoint against the chunk contents gathered in pass 1.
@@ -233,7 +233,7 @@ fn check_endpoint(
         .unwrap_or(&[]);
     assert!(
         carried.contains(&component_type_index),
-        "{at} references {wanted}, but that brick does not carry that component type -- it \
+        "{at} references {wanted}, but that brick does not carry that component type; it \
          carries {}",
         if carried.is_empty() {
             "no components at all".to_string()

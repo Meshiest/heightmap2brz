@@ -3,21 +3,21 @@
 //! convention work, does 3D gate layering survive a paste, does remote-wire
 //! fan-out across the chip boundary hold, and is the array limit real.
 use brdb::{
-    AsBrdbValue, Brick, IntVector, Position, Vector3f, WirePort, World,
+    AsBrdbValue, Brick, IntVector, Position, WirePort, World,
     assets::LiteralComponent,
-    schema::WireArrayVariant,
 };
+use heightmap::wire_array::WireArray;
 use heightmap::anim::{
     chip,
     clock::{build_clock, gate},
     layout::{GATE_HALF, lattice_pos},
 };
 
-const SUBSTRING: &str = "BrickComponentType_WireGraph_Expr_String_Substring";
-const MAKE_COLOR_HEX: &str = "BrickComponentType_WireGraph_Expr_MakeColorHex";
-const ARRAY_VAR: &str = "BrickComponentType_WireGraphPseudo_ArrayVar";
-const ARRAY_GET: &str = "BrickComponentType_WireGraph_Exec_ArrayVar_Get";
-const CHANGE_DETECTOR: &str = "BrickComponentType_WireGraph_Expr_ChangeDetectorExec";
+const SUBSTRING: &str = "BrickComponentType_Expr_String_Substring";
+const MAKE_COLOR_HEX: &str = "BrickComponentType_Expr_MakeColorHex";
+const ARRAY_VAR: &str = "BrickComponentType_ArrayVar";
+const ARRAY_GET: &str = "BrickComponentType_Exec_ArrayVar_Get";
+const CHANGE_DETECTOR: &str = "BrickComponentType_Expr_ChangeDetectorExec";
 const PROP_CHANGER: &str = "Component_BrickPropertyChanger";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,7 +61,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = chip::new_chip(
         &mut world,
         Position { x: -20, y: 0, z: 2 },
-        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
         IntVector { x: 5, y: 5, z: 5 },
     );
     let service = |col: i32, row: i32| lattice_pos(col, row, 2, h, GATE_HALF);
@@ -86,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         service(0, 1),
         vec![(
             "Value",
-            Box::new(WireArrayVariant::StringArray(frames)) as Box<dyn AsBrdbValue>,
+            Box::new(WireArray::Str(frames)) as Box<dyn AsBrdbValue>,
         )],
     );
     let get = gate(&mut c, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, service(1, 1), vec![]);

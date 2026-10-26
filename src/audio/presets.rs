@@ -112,19 +112,19 @@ impl AudioPreset {
                  voices, peak gate 1.5, release 150 ms. Selecting this doubles as a reset."
             }
             AudioPreset::Tonal => {
-                "Sustained, near-sinusoidal material -- the best case for this renderer. \
+                "Sustained, near-sinusoidal material: the best case for this renderer. \
                  Long window for pitch resolution, long release so struck notes ring. \
                  Narrow Bands toward 48 for a music box or solo piano; 60 keeps a \
                  guitar's low E in range."
             }
             AudioPreset::Chiptune => {
                 "Square/triangle chip music. Same long window and release as the tonal \
-                 preset, but the FULL band span -- narrowing the range crushes chiptune \
+                 preset, but the FULL band span; narrowing the range crushes chiptune \
                  bass, unlike piano where it helps."
             }
             AudioPreset::Speech => {
                 "Dialogue with no score under it. Short window (formants move), and a \
-                 30-60 ms release because a phoneme is 50-100 ms long -- a 150 ms release \
+                 30-60 ms release because a phoneme is 50-100 ms long: a 150 ms release \
                  smears straight across it and speech comes back 'disembodied'. Low gate."
             }
             AudioPreset::General => {

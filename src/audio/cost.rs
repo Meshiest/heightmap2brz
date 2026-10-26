@@ -151,6 +151,31 @@ pub fn estimate(
         (0, 0)
     };
 
+    if opts.uses_refs(frames) {
+        // One loop graph whatever the speaker count, plus on the main grid one
+        // value array per stream, one array of refs per stream kind, and the
+        // emitter refs. No detector or per-speaker multiply outside the loop.
+        let port = |p: &str| crate::graph::End::Ext(crate::graph::ExtPort::new(0, "Ext", p));
+        let g = super::stream_refs::stream_loop_graph(1, super::stream_refs::StreamPorts {
+            frame_index: port("Frame"),
+            master: port("Master"),
+            volumes: port("Volumes"),
+            pitches: (streams_per_speaker == 2).then(|| port("Pitches")),
+            emitters: port("Emitters"),
+        });
+        let arrays = streams + streams_per_speaker + 1;
+        return Ok(AudioCost {
+            speakers,
+            streams,
+            frames,
+            banks: 1,
+            gates: CLOCK_GATES + PAUSE_MUTE_GATES + g.gate_count() + arrays,
+            wires: CLOCK_WIRES + PAUSE_MUTE_WIRES + 3 * speakers + g.wires.len() + cb_wires,
+            bricks: speakers + 1 + arrays + cb_bricks,
+            elements: streams * frames,
+        });
+    }
+
     Ok(AudioCost {
         speakers,
         streams,
@@ -229,7 +254,7 @@ mod tests {
     use crate::audio::voices::{VoiceStats, VoiceStreams};
 
     fn opts(bank_size: usize) -> AudioOptions {
-        AudioOptions { bank_size, ..Default::default() }
+        AudioOptions { bank_size, ..AudioOptions::wired() }
     }
 
     /// A bank-mode track of `bands` bands and `frames` frames, with the plan
@@ -300,6 +325,29 @@ mod tests {
             assert_eq!(c.wires, world.wires.len(), "{bank_size}/{frames}: wires");
             assert_eq!(c.bricks, world.bricks.len(), "{bank_size}/{frames}: bricks");
         }
+    }
+
+    /// Under the refs driver the gates live in the chip and its loop plane,
+    /// plus the arrays on the main grid.
+    #[test]
+    fn the_refs_estimate_matches_real_builds() {
+        let refs = crate::anim::bricks::Driver::Refs;
+        let all_gates = |w: &brdb::World, arrays: usize| {
+            w.grids.iter().map(|(_, b)| b.len()).sum::<usize>() - CHIP_PINS + arrays
+        };
+        let o = AudioOptions { bands: Some(6), driver: refs, ..opts(64) };
+        let world = build_speaker_world(&track(&o, 40), &o).expect("build");
+        let c = estimate(AudioMode::Bank, 40, &o).expect("estimate");
+        assert_eq!(c.gates, all_gates(&world, 6 + 1 + 1), "bank gates");
+        assert_eq!(c.wires, world.wires.len(), "bank wires");
+        assert_eq!(c.bricks, world.bricks.len(), "bank bricks");
+
+        let o = AudioOptions { max_voices: 5, driver: refs, ..opts(64) };
+        let world = build_voice_world(&streams(5, 40, o.fps), &o).expect("build");
+        let c = estimate(AudioMode::Voice, 40, &o).expect("estimate");
+        assert_eq!(c.gates, all_gates(&world, 10 + 2 + 1), "voice gates");
+        assert_eq!(c.wires, world.wires.len(), "voice wires");
+        assert_eq!(c.bricks, world.bricks.len(), "voice bricks");
     }
 
     /// Bank mode's speaker count follows `--bands`/`--noise-bands`/`--subdiv`

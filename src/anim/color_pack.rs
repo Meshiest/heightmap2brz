@@ -8,13 +8,13 @@
 //! component character limit. Colour-array mode is **pixel-major**: one array
 //! per *pixel*, holding that pixel's own colour for every frame. There is no
 //! chunking at all -- the character limit that forced it does not apply to a
-//! `WireGraphLinearColorArray`, whose length is bounded only by
+//! `LinearColor` array, whose length is bounded only by
 //! [`super::pack::BANK_FRAMES`] like every other wire array.
 //!
 //! ## Colour space
 //!
-//! `WireArrayVariant::LinearColorArray` is documented in `brdb` as `(R, G, B,
-//! A)` f32 elements, linear 0-1. Video frames are sRGB. Unlike the hex path
+//! [`crate::wire_array::WireArray::LinearColor`] holds `(R, G, B, A)` f32
+//! elements, linear 0-1. Video frames are sRGB. Unlike the hex path
 //! -- where the in-game `MakeColorHex` gate does its own conversion from
 //! whatever bytes it is handed -- nothing downstream of this module
 //! transforms colour, so the sRGB -> linear transfer must happen here or the
@@ -45,7 +45,7 @@
 use image::RgbaImage;
 
 /// One array element: linear `(R, G, B, A)`, matching
-/// `WireArrayVariant::LinearColorArray`'s element type exactly so a finished
+/// `WireArray::LinearColor`'s element type exactly so a finished
 /// pixel's `Vec` can be handed to it with no conversion.
 pub type LinearColor = (f32, f32, f32, f32);
 
@@ -142,7 +142,7 @@ impl ColorPacker {
         if frame_w != self.width || frame_h != self.height {
             return Err(format!(
                 "frame {} is {frame_w}x{frame_h}, but the source's SourceInfo reported \
-                 {}x{} -- every frame a FrameStream emits must match info()'s dimensions",
+                 {}x{}; every frame a FrameStream emits must match info()'s dimensions",
                 self.frames_pushed, self.width, self.height
             ));
         }

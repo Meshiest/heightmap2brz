@@ -20,9 +20,9 @@
 //! band of `rows` rows costs `rows * bound + (rows - 1)` characters at worst,
 //! and `rows * (bound + 1) <= MAX + 1` is the same inequality rearranged so
 //! integer division rounds correctly). At the default one glyph per pixel
-//! that constant is 3 rows at width 192, 6 at width 96 and 9 at width 64; at
-//! two glyphs per pixel it is 2, 5 and 8 -- the values this module's tests
-//! pin, in both cases.
+//! that constant is 10 rows at width 192, 20 at width 96 and 30 at width 64;
+//! at two glyphs per pixel it is 9, 18 and 28 -- the values this module's
+//! tests pin, in both cases.
 //!
 //! This module is pure arithmetic over `width` / `height` / `char_repeat`; it
 //! knows nothing about images, bricks, or `World`.
@@ -73,7 +73,7 @@ pub fn plan_bands(width: usize, height: usize, char_repeat: usize) -> Result<Vec
         return Err(format!(
             "row 0: a {width}-pixel row encodes to at most {row} chars ({TAG_CHARS} for a \
              colour tag + {char_repeat} glyph chars per pixel), over the \
-             {MAX_COMPONENT_CHARS}-char TextDisplay limit -- no band layout can fit it, and \
+             {MAX_COMPONENT_CHARS}-char TextDisplay limit. No band layout can fit it, and \
              every other row of this image costs the same; render narrower or with a smaller \
              char_repeat"
         ));
@@ -135,31 +135,31 @@ mod tests {
     fn rows_per_band_matches_the_documented_constants() {
         // one glyph per pixel: the default, since the presets draw a square
         // pixel by stretching a single character to `width_scale` ~2
-        assert_eq!(plan_bands(192, 108, 1).unwrap()[0].rows, 3);
-        assert_eq!(plan_bands(96, 108, 1).unwrap()[0].rows, 6);
-        assert_eq!(plan_bands(64, 108, 1).unwrap()[0].rows, 9);
-        // and the doubled-up encoding, which costs a third of the rows
-        assert_eq!(plan_bands(192, 108, 2).unwrap()[0].rows, 2);
-        assert_eq!(plan_bands(96, 108, 2).unwrap()[0].rows, 5);
-        assert_eq!(plan_bands(64, 108, 2).unwrap()[0].rows, 8);
+        assert_eq!(plan_bands(192, 108, 1).unwrap()[0].rows, 10);
+        assert_eq!(plan_bands(96, 108, 1).unwrap()[0].rows, 20);
+        assert_eq!(plan_bands(64, 108, 1).unwrap()[0].rows, 30);
+        // and the doubled-up encoding, which costs a few rows more per band
+        assert_eq!(plan_bands(192, 108, 2).unwrap()[0].rows, 9);
+        assert_eq!(plan_bands(96, 108, 2).unwrap()[0].rows, 18);
+        assert_eq!(plan_bands(64, 108, 2).unwrap()[0].rows, 28);
     }
 
     #[test]
     fn the_last_band_is_short_rather_than_padded() {
-        // 108 rows at 5 per band -> 21 full bands + 3 rows.
-        let plan = plan_bands(96, 108, 2).unwrap();
-        assert_eq!(plan.last().unwrap().rows, 3);
+        // 100 rows at 18 per band -> 5 full bands + 10 rows.
+        let plan = plan_bands(96, 100, 2).unwrap();
+        assert_eq!(plan.last().unwrap().rows, 10);
     }
 
     #[test]
     fn a_row_too_wide_for_one_component_is_an_error_naming_the_width() {
-        // 10000 / 17 = 588 px is the ceiling at the default char_repeat 1,
-        // and 10000 / 18 = 555 px at char_repeat 2.
-        assert!(plan_bands(588, 10, 1).is_ok(), "588 fits at one glyph per pixel");
-        assert!(plan_bands(589, 10, 1).is_err(), "589 does not");
-        assert!(plan_bands(555, 10, 2).is_ok(), "555 fits");
-        let err = plan_bands(556, 10, 2).expect_err("556 must not fit");
-        assert!(err.contains("556"), "error must name the width: {err}");
+        // 32767 / 17 = 1927 px is the ceiling at the default char_repeat 1,
+        // and 32767 / 18 = 1820 px at char_repeat 2.
+        assert!(plan_bands(1927, 10, 1).is_ok(), "1927 fits at one glyph per pixel");
+        assert!(plan_bands(1928, 10, 1).is_err(), "1928 does not");
+        assert!(plan_bands(1820, 10, 2).is_ok(), "1820 fits");
+        let err = plan_bands(1821, 10, 2).expect_err("1821 must not fit");
+        assert!(err.contains("1821"), "error must name the width: {err}");
         assert!(
             err.contains(&MAX_COMPONENT_CHARS.to_string()),
             "error must name the limit: {err}"

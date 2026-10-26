@@ -9,16 +9,49 @@
 use super::bricks::AnimOptions;
 use super::pack::{HEX_STRIDE, PIXELS_PER_CHUNK};
 
+/// Gate runs in one tick past which a render is likely to drop frames.
+///
+/// Measured with wired renders, where nearly every gate runs on each frame
+/// change: frame drops started around 20,000 gates. A loop runs its body
+/// once per iteration inside one tick, so a loop driver is held to the same
+/// number of gate runs rather than its much smaller gate count.
+pub const TICK_GATE_BUDGET: usize = 20_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cost {
     pub pixels: usize,
     pub gates: usize,
+    /// Worst-case gate runs in the tick a frame changes. A wired render runs
+    /// about every gate it has; a loop driver runs its body once per
+    /// iteration, so this can be far more than `gates`.
+    pub tick_gates: usize,
     pub wires: usize,
     pub bricks: usize,
     pub chunks: usize,
     pub banks: usize,
     pub frames: usize,
     pub chars: usize,
+}
+
+impl Cost {
+    /// The warning to show when the tick a frame changes runs more gates than
+    /// [`TICK_GATE_BUDGET`], or `None` within it.
+    pub fn tick_warning(&self) -> Option<String> {
+        if self.tick_gates <= TICK_GATE_BUDGET {
+            return None;
+        }
+        let fix = if self.tick_gates > self.gates {
+            "turn Loop Gates off (--driver wires), use a smaller picture, or use the \
+             color-array encoding"
+        } else {
+            "use a smaller picture"
+        };
+        Some(format!(
+            "{} gate runs in the tick a frame changes, over the ~{} the game runs in a tick \
+             before frames drop: {fix}",
+            self.tick_gates, TICK_GATE_BUDGET
+        ))
+    }
 }
 
 /// What a subtitle track adds to a render, in `(gates, wires, bricks)`.
@@ -101,15 +134,17 @@ pub fn estimate(width: u32, height: u32, frames: usize, opts: &AnimOptions) -> C
     let boundaries = banks - 1;
     let (sub_gates, sub_wires, sub_bricks) = subtitle_cost(opts, banks);
     let (cb_gates, cb_wires, cb_bricks) = control_button_cost(opts);
+    let gates = 2 * pixels + 2 * chunks * banks + 7 + boundaries * 3 + boundaries * chunks
+        + sub_gates
+        + cb_gates;
     Cost {
         pixels,
         // 2 per pixel + 2 per chunk per bank (ArrayVar, Get) + 6 clock
         // + 1 detector, plus per boundary: comparator, branch, index subtract,
         // and one value select per chunk. The 6 clock gates are the 4 index
         // gates plus the length and progress status taps.
-        gates: 2 * pixels + 2 * chunks * banks + 7 + boundaries * 3 + boundaries * chunks
-            + sub_gates
-            + cb_gates,
+        gates,
+        tick_gates: gates,
         // 3 per pixel + 2 per chunk per bank + exec chain + detector feed
         // + 11 clock (3 chain + 3 control pins + Rate + Done + the length and
         // progress taps: 2 pin writes + 1 shared frame-index read), plus per
@@ -135,6 +170,56 @@ pub fn estimate(width: u32, height: u32, frames: usize, opts: &AnimOptions) -> C
         banks,
         frames,
         chars: pixels * frames * HEX_STRIDE,
+    }
+}
+
+/// Estimate a render under [`super::bricks::Driver::Refs`].
+///
+/// The player is a fixed graph ([`super::ref_player::player_size`]) on top of
+/// the same clock (6 gates, 11 wires) and change detector (1 gate, 1 wire)
+/// as the wire driver. Bricks are the display bricks, the chip shell and five
+/// main-grid arrays: `pixels`, one bank's two record arrays and the two
+/// arrays of refs to the banks. A clip whose records spill into more banks
+/// adds two arrays per extra bank, which the estimate cannot know before
+/// encoding. `chars` is an upper bound (every frame a
+/// keyframe): how many records a delta carries depends on the content.
+pub fn estimate_refs(
+    width: u32,
+    height: u32,
+    frames: usize,
+    opts: &AnimOptions,
+    encoding: super::ref_player::RecordEncoding,
+) -> Cost {
+    let pixels = width as usize * height as usize;
+    let (player_gates, player_wires) =
+        super::ref_player::player_size(encoding, opts.records.dense_keyframes);
+    let (sub_gates, sub_wires, sub_bricks) = subtitle_cost(opts, 1);
+    let (cb_gates, cb_wires, cb_bricks) = control_button_cost(opts);
+    // The bound is every frame a keyframe, which drops the index when dense.
+    let stride = if opts.records.dense_keyframes {
+        6
+    } else {
+        super::ref_player::hex_stride(super::ref_player::index_width(pixels))
+    };
+    // The worst frame change applies a keyframe, one record per pixel. Under
+    // the clock's frame rate one tick shows one frame; a catch-up after a
+    // dropped tick replays more, which only the render can measure.
+    let (fixed, per_record) =
+        super::ref_player::gate_runs(encoding, opts.records.dense_keyframes);
+    Cost {
+        pixels,
+        gates: player_gates + 7 + 5 + sub_gates + cb_gates,
+        tick_gates: fixed + per_record * pixels + 7 + sub_gates,
+        // + 1: the status pin into the chip shell's TextDisplay.
+        wires: player_wires + 11 + 1 + 1 + sub_wires + cb_wires,
+        bricks: pixels + 1 + 5 + sub_bricks + cb_bricks,
+        chunks: 0,
+        banks: 1,
+        frames,
+        chars: match encoding {
+            super::ref_player::RecordEncoding::Hex => pixels * frames * stride,
+            super::ref_player::RecordEncoding::ColorArray => 0,
+        },
     }
 }
 
@@ -169,13 +254,15 @@ pub fn estimate_color_array(width: u32, height: u32, frames: usize, opts: &AnimO
     let boundaries = banks - 1;
     let (sub_gates, sub_wires, sub_bricks) = subtitle_cost(opts, banks);
     let (cb_gates, cb_wires, cb_bricks) = control_button_cost(opts);
+    let gates = pixels * (2 * banks + boundaries) + 7 + boundaries * 3 + sub_gates + cb_gates;
     Cost {
         pixels,
         // per pixel: one ArrayVar + one Get per bank, plus one Select per
         // boundary; plus 6 clock + 1 detector; plus per boundary a comparator,
         // a branch and an index subtract. The 6 clock gates are the 4 index
         // gates plus the length and progress status taps.
-        gates: pixels * (2 * banks + boundaries) + 7 + boundaries * 3 + sub_gates + cb_gates,
+        gates,
+        tick_gates: gates,
         // per pixel: ArrayVarRef + Index + Exec per bank (3), plus
         // bSelectB/InputA/InputB per boundary (3), plus the one wire into the
         // display brick's Color; plus the detector feed (1), the clock's own
@@ -239,7 +326,7 @@ pub fn estimate_color_array(width: u32, height: u32, frames: usize, opts: &AnimO
 /// # Why this returns a `Result` and its two siblings do not
 ///
 /// Text mode is the only encoding whose geometry can be impossible:
-/// [`super::text_layout::plan_bands`] caps the width it can band (588 px at
+/// [`super::text_layout::plan_bands`] caps the width it can band (1927 px at
 /// `char_repeat` 1), and past that there is no layout at all. Swallowing
 /// that into a band count of 0 reads out as "5 gate(s), 1 brick(s)" -- a
 /// plausible, cheap-looking render for a configuration `build_text_world`
@@ -270,13 +357,41 @@ pub fn estimate_text(
     let boundaries = banks - 1;
     let (sub_gates, sub_wires, sub_bricks) = subtitle_cost(opts, banks);
     let (cb_gates, cb_wires, cb_bricks) = control_button_cost(opts);
+    if opts.driver == super::bricks::Driver::Refs && banks == 1 {
+        // The loop graph is the same for any band count; on the main grid,
+        // one string array per band plus the two ref arrays.
+        let port = |p: &str| crate::graph::End::Ext(crate::graph::ExtPort::new(0, "Ext", p));
+        let g = super::text_refs::text_loop_graph(
+            1,
+            super::text_refs::TextLoopPorts {
+                frame_index: port("Frame"),
+                on_change: port("OnChanged"),
+                texts: port("Texts"),
+                displays: port("Displays"),
+            },
+        );
+        let (fixed, per_band) = super::text_refs::gate_runs();
+        return Ok(Cost {
+            pixels: width as usize * height as usize,
+            gates: g.gate_count() + 7 + bands + 2 + sub_gates + cb_gates,
+            tick_gates: fixed + per_band * bands + 7 + sub_gates,
+            wires: g.wires.len() + 1 + 11 + sub_wires + cb_wires,
+            bricks: bands + 1 + bands + 2 + sub_bricks + cb_bricks,
+            chunks: 0,
+            banks,
+            frames,
+            chars: 0,
+        });
+    }
+    let gates = 2 * bands * banks + 7 + boundaries * 3 + boundaries * bands + sub_gates + cb_gates;
     Ok(Cost {
         pixels: width as usize * height as usize,
         // 2 per band per bank (ArrayVar, Get) + 6 clock + 1 detector, plus
         // per boundary: comparator, branch, index subtract, and one select
         // per band. The 6 clock gates are the 4 index gates plus the length
         // and progress status taps.
-        gates: 2 * bands * banks + 7 + boundaries * 3 + boundaries * bands + sub_gates + cb_gates,
+        gates,
+        tick_gates: gates,
         // 3 per band per bank (ArrayVarRef, Index, Exec) + 1 per band (the
         // wire into the TextDisplay's Text port) + detector feed (1) + 3
         // clock chain + 3 control pins + Rate + Done + length/progress taps
@@ -311,7 +426,7 @@ mod tests {
         // stays the button-free number it has always been; the buttons add a
         // flat main-grid cost measured separately in
         // `the_control_buttons_add_a_flat_main_grid_cost`.
-        AnimOptions { bank_size, control_buttons: false, ..AnimOptions::default() }
+        AnimOptions { bank_size, control_buttons: false, ..AnimOptions::wired() }
     }
 
     /// The same, with a subtitle track. The track's content is irrelevant to
@@ -329,13 +444,45 @@ mod tests {
                 end_s: 1.0,
                 text: "hi".to_string(),
             }]))),
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         }
     }
 
     /// The control buttons add a flat main-grid cost -- 3 bricks and 3 wires, no
     /// gate -- on top of any render, in every mode, exactly as
     /// `crate::anim::controls` builds it and each renderer wires it.
+    /// A 128x72 screen is about 18k gates wired, under the budget. Looped, a
+    /// keyframe replays every pixel in one tick, which is over it.
+    #[test]
+    fn a_looped_keyframe_is_held_to_the_tick_budget() {
+        use crate::anim::bricks::Driver;
+        use crate::anim::ref_player::RecordEncoding;
+        let wired = AnimOptions::wired();
+        let wires = estimate(128, 72, 100, &wired);
+        assert_eq!(wires.tick_gates, wires.gates);
+        assert!(wires.tick_warning().is_none(), "{wires:?}");
+
+        let looped = AnimOptions { driver: Driver::Refs, ..AnimOptions::default() };
+        let refs = estimate_refs(128, 72, 100, &looped, RecordEncoding::Hex);
+        let (fixed, per_record) = crate::anim::ref_player::gate_runs(RecordEncoding::Hex, false);
+        assert_eq!(refs.tick_gates, fixed + per_record * 128 * 72 + 7);
+        assert!(refs.tick_gates > refs.gates);
+        let warning = refs.tick_warning().expect("over the budget");
+        assert!(warning.contains("Loop Gates off"), "{warning}");
+        assert!(!warning.contains("  "), "source indentation leaked in: {warning}");
+    }
+
+    #[test]
+    fn a_text_loop_runs_four_gates_per_band() {
+        let looped = AnimOptions::default();
+        let cost = estimate_text(192, 108, 100, &looped).unwrap();
+        let bands = crate::anim::text_layout::plan_bands(192, 108, looped.text.char_repeat)
+            .unwrap()
+            .len();
+        assert_eq!(cost.tick_gates, 1 + 4 * bands + 7);
+        assert!(cost.tick_warning().is_none());
+    }
+
     #[test]
     fn the_control_buttons_add_a_flat_main_grid_cost() {
         use crate::anim::controls::{CONTROL_BRICKS, CONTROL_WIRES};
@@ -370,18 +517,18 @@ mod tests {
 
     #[test]
     fn matches_the_spec_formula() {
-        // 64x36 = 2304 px; ceil(2304/1666) = 2 chunks
-        // gates = 2*2304 + 2*2 + 7 = 4619
-        let c = estimate(64, 36, 300, &opts(BANK_FRAMES));
-        assert_eq!(c.pixels, 2304);
+        // 128x72 = 9216 px; ceil(9216/5461) = 2 chunks
+        // gates = 2*9216 + 2*2 + 7 = 18443
+        let c = estimate(128, 72, 300, &opts(BANK_FRAMES));
+        assert_eq!(c.pixels, 9216);
         assert_eq!(c.chunks, 2);
-        assert_eq!(c.gates, 4619);
+        assert_eq!(c.gates, 18443);
         // wires = 3/pixel + 2/chunk (ArrayVarRef, Index) + chunks exec chain
         //         + 1 detector feed + 11 clock
-        //       = 6912 + 4 + 2 + 1 + 11 = 6930
+        //       = 27648 + 4 + 2 + 1 + 11 = 27666
         // Pinned against a real render in
         // `tests/anim_world.rs::the_hex_cost_estimate_matches_a_real_render`.
-        assert_eq!(c.wires, 6930);
+        assert_eq!(c.wires, 27666);
     }
 
     #[test]
@@ -397,12 +544,12 @@ mod tests {
     #[test]
     fn the_chunk_boundary_is_exact() {
         assert_eq!(
-            estimate(1666, 1, 2, &opts(BANK_FRAMES)).chunks,
+            estimate(PIXELS_PER_CHUNK as u32, 1, 2, &opts(BANK_FRAMES)).chunks,
             1,
             "exactly one chunk's worth"
         );
         assert_eq!(
-            estimate(1667, 1, 2, &opts(BANK_FRAMES)).chunks,
+            estimate(PIXELS_PER_CHUNK as u32 + 1, 1, 2, &opts(BANK_FRAMES)).chunks,
             2,
             "one pixel over spills"
         );
@@ -410,16 +557,16 @@ mod tests {
 
     #[test]
     fn a_sub_limit_clip_is_one_bank_and_costs_what_it_used_to() {
-        let c = estimate(64, 36, 300, &opts(BANK_FRAMES));
+        let c = estimate(128, 72, 300, &opts(BANK_FRAMES));
         assert_eq!(c.banks, 1);
-        assert_eq!(c.gates, 4619, "unchanged from the pre-spillover formula");
+        assert_eq!(c.gates, 18443, "unchanged from the pre-spillover formula");
     }
 
     #[test]
     fn spilling_adds_three_gates_per_boundary_plus_one_select_per_chunk() {
-        // 2304 px -> 2 chunks; 5 frames at bank size 2 -> 3 banks, 2 boundaries
-        let one = estimate(64, 36, 5, &opts(65_535));
-        let three = estimate(64, 36, 5, &opts(2));
+        // 9216 px -> 2 chunks; 5 frames at bank size 2 -> 3 banks, 2 boundaries
+        let one = estimate(128, 72, 5, &opts(65_535));
+        let three = estimate(128, 72, 5, &opts(2));
         assert_eq!(three.banks, 3);
         // per boundary: comparator + branch + subtract, plus a select per chunk
         // plus the extra array/Get pair per chunk per extra bank
@@ -431,10 +578,10 @@ mod tests {
 
     #[test]
     fn spilling_adds_the_boundary_wiring_to_the_wires_estimate() {
-        // Same setup as the gates counterpart above: 2304 px -> 2 chunks;
+        // Same setup as the gates counterpart above: 9216 px -> 2 chunks;
         // 5 frames at bank size 2 -> 3 banks, 2 boundaries.
-        let one = estimate(64, 36, 5, &opts(65_535));
-        let three = estimate(64, 36, 5, &opts(2));
+        let one = estimate(128, 72, 5, &opts(65_535));
+        let three = estimate(128, 72, 5, &opts(2));
         assert_eq!(three.banks, 3);
         let boundaries = 2;
         let chunks = 2;
@@ -506,7 +653,7 @@ mod tests {
         let hex_three = estimate(64, 36, 5, &opts(2));
         assert!(
             three.gates - one.gates > 100 * (hex_three.gates - hex_one.gates),
-            "a colour-array boundary must be enormously more expensive than a hex one -- \
+            "a colour-array boundary must be enormously more expensive than a hex one; \
              that asymmetry is exactly what this separate estimate exists to report"
         );
     }
@@ -538,12 +685,11 @@ mod tests {
 
     #[test]
     fn text_mode_costs_two_gates_per_band_plus_the_clock() {
-        // 192x108 at the default char_repeat 1 -> 36 bands (it was 54 when a
-        // square pixel cost two characters instead of one at width_scale ~2).
+        // 192x108 at the default char_repeat 1 -> 10 rows per band, 11 bands.
         let c = estimate_text(192, 108, 300, &opts(BANK_FRAMES)).expect("a legal geometry must estimate");
         assert_eq!(c.banks, 1);
-        assert_eq!(c.gates, 2 * 36 + 7);
-        assert_eq!(c.bricks, 36 + 1);
+        assert_eq!(c.gates, 2 * 11 + 7);
+        assert_eq!(c.bricks, 11 + 1);
     }
 
     #[test]
@@ -569,14 +715,14 @@ mod tests {
     }
 
     /// An impossible text geometry must read as impossible, not as a bargain:
-    /// `plan_bands` caps the width it can lay out (588 px at `char_repeat` 1),
+    /// `plan_bands` caps the width it can lay out (1927 px at `char_repeat` 1),
     /// and past that a band count of 0 reads out as 5 gates and 1 brick -- a
     /// plausible, unusually cheap render for a config `build_text_world`
     /// refuses outright.
     #[test]
     fn an_unlayoutable_text_geometry_is_an_error_not_a_five_gate_render() {
         let o = opts(BANK_FRAMES);
-        let too_wide = 600u32;
+        let too_wide = 2000u32;
         // The premise: this really is a geometry the renderer cannot build.
         assert!(
             super::super::text_layout::plan_bands(
@@ -611,8 +757,8 @@ mod tests {
         // The widest geometry that is layoutable must still estimate, so this
         // rejects only what the renderer rejects.
         assert!(
-            estimate_text(555, 108, 300, &o).is_ok(),
-            "555px is inside plan_bands' cap and must still produce a cost"
+            estimate_text(1927, 108, 300, &o).is_ok(),
+            "1927px is inside plan_bands' cap and must still produce a cost"
         );
     }
 

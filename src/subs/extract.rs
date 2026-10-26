@@ -141,7 +141,7 @@ pub fn is_bitmap_codec(codec: &str) -> bool {
 /// silently swallowed into an empty track instead.
 fn bitmap_error(codec: &str, track: usize) -> String {
     format!(
-        "subtitle track {track} is {codec}, an image-based (bitmap) subtitle format -- there is \
+        "subtitle track {track} is {codec}, an image-based (bitmap) subtitle format; there is \
          no text in it to extract without OCR, which is out of scope. Supply a text subtitle \
          file directly with --subtitles <file> (.srt or .ass) instead."
     )

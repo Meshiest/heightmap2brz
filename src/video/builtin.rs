@@ -118,7 +118,7 @@ impl BuiltinVideoSource {
             EntropyCoding::Unknown => {
                 return Err(format!(
                     "{label}: this H.264 stream's entropy coding mode could not be determined, so \
-                     it is refused the same as CAVLC -- guessing CABAC on a stream that turns \
+                     it is refused the same as CAVLC: guessing CABAC on a stream that turns \
                      out to be CAVLC would silently decode to wrong pixels; use --backend \
                      ffmpeg instead"
                 ));
@@ -1001,7 +1001,7 @@ mod tests {
         assert_eq!(
             src.info().frame_count_hint,
             None,
-            "matroska states no frame count -- if this ever becomes Some, this test is \
+            "matroska states no frame count; if this ever becomes Some, this test is \
              no longer exercising the case it was written for"
         );
         let est = src
@@ -1268,7 +1268,7 @@ mod tests {
                 .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64)
                 .sum();
             let mean = total as f64 / g.as_raw().len() as f64;
-            assert!(mean < 3.0, "frame {i} mean abs channel diff {mean:.2} -- decoder is wrong, not just different");
+            assert!(mean < 3.0, "frame {i} mean abs channel diff {mean:.2}: decoder is wrong, not just different");
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1407,7 +1407,7 @@ mod tests {
         for (i, mean) in oracle_diffs(&path).into_iter().enumerate() {
             assert!(
                 mean < 3.0,
-                "frame {i} mean abs channel diff {mean:.2} on a BT.709-TAGGED clip -- the \
+                "frame {i} mean abs channel diff {mean:.2} on a BT.709-TAGGED clip; the \
                  colour matrix is being assumed rather than read from the SPS VUI"
             );
         }
@@ -1448,7 +1448,7 @@ mod tests {
         for (i, mean) in oracle_diffs(&path).into_iter().enumerate() {
             assert!(
                 mean < 3.0,
-                "frame {i} mean abs channel diff {mean:.2} on an UNTAGGED 720p clip -- \
+                "frame {i} mean abs channel diff {mean:.2} on an UNTAGGED 720p clip; \
                  untagged content must stay BT.601, not switch by resolution"
             );
         }

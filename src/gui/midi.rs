@@ -215,7 +215,7 @@ impl MidiApp {
     /// spatialization/playback controls.
     fn draw_settings(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
         ui.label(
-            "Turn a MIDI file into a cluster of wired, pitched speaker bricks: each instrument \
+            "Turn a MIDI file into a cluster of pitched speaker bricks: each instrument \
              becomes a small bank of speakers that plays its notes back through a chosen synth \
              tone, driven by an in-chip clock.",
         );
@@ -266,6 +266,14 @@ impl MidiApp {
             Some("Pre-generate physical Pause/Restart/Resume buttons on the main grid, wired into the clock so the render is controllable out of the box. Off means you wire the clock's control pins yourself."),
             |ui| {
                 widgets::toggle(ui, &mut self.opts.control_buttons, "Control buttons");
+            },
+        );
+        t.row_hover(
+            ui,
+            "Playheads",
+            Some("Functions: every speaker's playhead is a call of one shared function, about 4 gates a speaker instead of ~16, and a run of notes shorter than a tick is passed in one tick instead of one note per tick."),
+            |ui| {
+                widgets::toggle(ui, &mut self.opts.functions, "Functions");
             },
         );
         t.row_hover(

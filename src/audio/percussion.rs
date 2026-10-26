@@ -224,7 +224,7 @@ pub fn palette_from_kit(kit: &[OneShotSound]) -> World {
 pub fn build_drum_palette(roles: &[PaletteRole]) -> World {
     let mut world = World::new();
     world.meta.bundle.description = format!(
-        "Drum audition palette -- press each button to play its sound. Green = approved, \
+        "Drum audition palette: press each button to play its sound. Green = approved, \
          amber = placeholder to replace. {} sounds.",
         roles.len()
     );

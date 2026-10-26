@@ -2,14 +2,14 @@
 mod wire_integrity;
 
 use brdb::{
-    AsBrdbValue, Brick, BrickSize, BrickType, IntVector, IntoReader, Position, Vector3f, WirePort,
+    AsBrdbValue, Brick, BrickSize, BrickType, IntVector, IntoReader, Position, WirePort,
     World,
     assets::{
         LiteralComponent,
         bricks::{PB_DEFAULT_MICRO_BRICK, PB_DEFAULT_SMOOTH_TILE},
     },
-    schema::WireArrayVariant,
 };
+use heightmap::wire_array::WireArray;
 use heightmap::anim::chip;
 use heightmap::anim::clock::{build_clock, gate};
 use heightmap::anim::layout::{CELL, GATE_HALF, lattice_pos};
@@ -37,7 +37,6 @@ fn a_chip_with_pins_writes_and_reads_back() {
     let mut c = chip::new_chip(
         &mut world,
         Position { x: 0, y: 0, z: 6 },
-        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
         IntVector { x: 14, y: 14, z: 5 },
     );
     let inp = chip::add_input_pin(&mut c, "Pause", Position { x: 5, y: 5, z: 2 });
@@ -58,7 +57,6 @@ fn overlapping_pins_are_rejected() {
     let mut c = chip::new_chip(
         &mut world,
         Position { x: 0, y: 0, z: 6 },
-        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
         IntVector { x: 14, y: 14, z: 5 },
     );
     let p = Position { x: 5, y: 5, z: 2 };
@@ -76,7 +74,6 @@ fn bricks_added_via_add_brick_are_collision_checked() {
     let mut c = chip::new_chip(
         &mut world,
         Position { x: 0, y: 0, z: 6 },
-        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
         IntVector { x: 14, y: 14, z: 5 },
     );
     let p = Position { x: 5, y: 5, z: 2 };
@@ -98,7 +95,6 @@ fn add_brick_bounds_feed_the_plane_extent() {
     let mut c = chip::new_chip(
         &mut world,
         Position { x: 0, y: 0, z: 6 },
-        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
         IntVector { x: 14, y: 14, z: 5 },
     );
     chip::add_input_pin(&mut c, "In", Position { x: 5, y: 5, z: 2 });
@@ -128,7 +124,6 @@ fn clock_emits_four_gates_and_three_pins_without_collision() {
     let mut c = chip::new_chip(
         &mut world,
         Position { x: 0, y: 0, z: 6 },
-        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
         IntVector { x: 60, y: 60, z: 20 },
     );
     // `Chip`'s brick list is private (see `chip.rs`); `placed()` is the
@@ -186,7 +181,7 @@ fn clock_emits_four_gates_and_three_pins_without_collision() {
             .component_chunk(chip_grid_id, chunk.index)
             .expect("component chunk");
         for s in &structs {
-            if s.get_name() == "BrickComponentData_WireGraphPseudo_Timer" {
+            if s.get_name() == "BrickComponentData_Stopwatch" {
                 if let Some(brdb::schema::BrdbValue::F64(v)) = s.get("Limit") {
                     limit = Some(*v);
                 }
@@ -218,7 +213,6 @@ fn written_clock(fps: f32, frames: usize, loop_playback: bool, tag: &str) -> (f6
     let mut c = chip::new_chip(
         &mut world,
         Position { x: 0, y: 0, z: 6 },
-        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
         IntVector { x: 60, y: 60, z: 20 },
     );
     let before = c.placed().len();
@@ -257,7 +251,7 @@ fn written_clock(fps: f32, frames: usize, loop_playback: bool, tag: &str) -> (f6
             .component_chunk(chip_grid_id, chunk.index)
             .expect("component chunk");
         for s in &structs {
-            if s.get_name() == "BrickComponentData_WireGraphPseudo_Timer" {
+            if s.get_name() == "BrickComponentData_Stopwatch" {
                 if let Some(brdb::schema::BrdbValue::F64(v)) = s.get("Limit") {
                     limit = Some(*v);
                 }
@@ -309,7 +303,7 @@ fn a_non_looping_clock_writes_a_limit_landing_on_the_last_frame() {
     assert_eq!(
         ((naive * FPS as f64).floor() as i64).rem_euclid(FRAMES as i64),
         0,
-        "the exact duration really would snap back to frame 0 -- which is why it is not used"
+        "the exact duration really would snap back to frame 0, which is why it is not used"
     );
 }
 
@@ -333,7 +327,7 @@ fn looping_and_non_looping_clocks_differ_only_in_the_limit() {
     assert_ne!(stopping_limit, looping_limit, "the two settings must differ somewhere");
     assert_eq!(
         looping_bricks, stopping_bricks,
-        "same gates and pins either way -- the flag changes one inlined value, not the graph"
+        "same gates and pins either way: the flag changes one inlined value, not the graph"
     );
     assert_eq!(
         looping_bricks, 13,
@@ -359,11 +353,11 @@ fn looping_and_non_looping_clocks_differ_only_in_the_limit() {
 // `examples/spike_anim.rs` if the spike's graph changes before Task 11
 // replaces both with the real generator.
 
-const SUBSTRING: &str = "BrickComponentType_WireGraph_Expr_String_Substring";
-const MAKE_COLOR_HEX: &str = "BrickComponentType_WireGraph_Expr_MakeColorHex";
-const ARRAY_VAR: &str = "BrickComponentType_WireGraphPseudo_ArrayVar";
-const ARRAY_GET: &str = "BrickComponentType_WireGraph_Exec_ArrayVar_Get";
-const CHANGE_DETECTOR: &str = "BrickComponentType_WireGraph_Expr_ChangeDetectorExec";
+const SUBSTRING: &str = "BrickComponentType_Expr_String_Substring";
+const MAKE_COLOR_HEX: &str = "BrickComponentType_Expr_MakeColorHex";
+const ARRAY_VAR: &str = "BrickComponentType_ArrayVar";
+const ARRAY_GET: &str = "BrickComponentType_Exec_ArrayVar_Get";
+const CHANGE_DETECTOR: &str = "BrickComponentType_Expr_ChangeDetectorExec";
 const PROP_CHANGER: &str = "Component_BrickPropertyChanger";
 
 /// Build the exact graph `examples/spike_anim.rs` writes to
@@ -398,7 +392,6 @@ fn build_spike_world() -> (World, usize) {
     let mut c = chip::new_chip(
         &mut world,
         Position { x: -20, y: 0, z: 2 }, // beside the screen, not stacked on it
-        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
         IntVector { x: 60, y: 60, z: 40 },
     );
     let service = |col: i32, row: i32| lattice_pos(col, row, 2, h, GATE_HALF);
@@ -423,7 +416,7 @@ fn build_spike_world() -> (World, usize) {
         service(0, 1),
         vec![(
             "Value",
-            Box::new(WireArrayVariant::StringArray(frames)) as Box<dyn AsBrdbValue>,
+            Box::new(WireArray::Str(frames)) as Box<dyn AsBrdbValue>,
         )],
     );
     let get = gate(&mut c, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, service(1, 1), vec![]);
@@ -446,11 +439,11 @@ fn build_spike_world() -> (World, usize) {
             lattice_pos(col, row, 1, h, GATE_HALF),
             vec![
                 // Substring.Start/.Length are plain `i64` struct fields, not
-                // the `WireVariant` tagged union `Multiply`/`ModuloFloored`
-                // use (`BrickComponentData_WireGraph_Expr_String_Substring`
+                // the `WireValue` tagged union `Multiply`/`ModuloFloored`
+                // use (`BCSComponentVertex_Expr_String_Substring`
                 // in brdb's `component_db.rs` registers bare `0i64`
-                // defaults) -- a `WireVariant::Int` here fails to encode with
-                // `UnimplementedCast("i64", "WireVariant")`. This is the one
+                // defaults) -- a `WireValue::Int` here fails to encode with
+                // `UnimplementedCast("i64", "WireValue")`. This is the one
                 // deviation from the task brief's inline listing, found by
                 // actually running the spike.
                 ("Start", Box::new(i as i64 * 6) as Box<dyn AsBrdbValue>),
@@ -704,7 +697,7 @@ fn glow_sets_the_display_bricks_to_glow_at_intensity_zero() {
     assert_eq!(
         plain.bricks.len(),
         lit.bricks.len(),
-        "glow is a material change only -- it must not add or drop bricks"
+        "glow is a material change only; it must not add or drop bricks"
     );
 }
 
@@ -963,8 +956,8 @@ fn chip_plane_extent_contains_every_brick_in_a_real_render() {
         let half_span = (hi - lo) / 2 + GATE_HALF.x;
         assert!(
             e <= half_span + CELL + 2,
-            "plane {axis} extent {e} is far larger than the content half-span {half_span} \
-             -- the plane is not centred on the content"
+            "plane {axis} extent {e} is far larger than the content half-span {half_span}, \
+             so the plane is not centred on the content"
         );
     }
 
@@ -1068,7 +1061,7 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
             .expect("component chunk");
         for s in &structs {
             match s.get_name() {
-                "BrickComponentData_WireGraph_Expr_String_Substring" => {
+                "BCSComponentVertex_Expr_String_Substring" => {
                     if let Some(brdb::schema::BrdbValue::I64(start)) = s.get("Start") {
                         starts.push(*start);
                     }
@@ -1079,11 +1072,11 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
                         );
                     }
                 }
-                "BrickComponentData_WireGraphPseudo_ArrayVar" => {
+                "BrickComponentData_ArrayVar" => {
                     if let Some(value) = s.get("Value") {
-                        let variant: WireArrayVariant =
+                        let variant: WireArray =
                             value.try_into().expect("ArrayVar Value must decode");
-                        if let WireArrayVariant::StringArray(v) = variant {
+                        if let WireArray::Str(v) = variant {
                             arrays.push(v);
                         }
                     }
@@ -1094,12 +1087,12 @@ fn a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start() {
     }
 
     // The chunk boundary must reset the per-gate `Start` back to 0, not keep
-    // counting the *global* pixel index. Chunk 1 (1666 pixels) alone already
+    // counting the *global* pixel index. Chunk 1 (5461 pixels) alone already
     // produces a Substring with `Start = 3 * HEX_STRIDE = 18` for its own
     // local pixel 3. If chunk 2's gates wrongly computed
     // `(chunk.first_pixel + local) * HEX_STRIDE` instead of
     // `local * HEX_STRIDE`, chunk 2's first ten pixels would start at
-    // `1666 * 6 = 9996` and up -- never producing 18 again -- so `Start == 18`
+    // `5461 * 6 = 32766` and up -- never producing 18 again -- so `Start == 18`
     // would appear once across the whole save, not twice.
     let local3_start = (3 * HEX_STRIDE) as i64;
     let count = starts.iter().filter(|&&s| s == local3_start).count();
@@ -1159,7 +1152,7 @@ fn no_inner_brick_lands_at_a_negative_coordinate() {
             assert!(
                 center.x - half.x >= 0 && center.y - half.y >= 0 && center.z - half.z >= 0,
                 "{w}x{h}: inner brick centred at {center:?} reaches ({},{},{}), which is \
-                 negative -- negative inner-grid coordinates break bricks in-game",
+                 negative; negative inner-grid coordinates break bricks in-game",
                 center.x - half.x,
                 center.y - half.y,
                 center.z - half.z
@@ -1455,11 +1448,9 @@ fn each_banks_array_holds_only_its_own_frames() {
     }
     let chip_grid_id = chip_grid_id.expect("a chip must publish a microchip grid");
 
-    // `ArrayVar.Value` is a `WireGraphPrimMathVariant`-style tagged union, not
-    // a bare `BrdbValue::Array` -- it decodes as `BrdbValue::Struct` wrapping a
-    // `WireGraph*Array` struct (here `WireGraphStringArray`, holding the real
-    // array under its own `Values` field). `WireArrayVariant`'s
-    // `TryFrom<&BrdbValue>` already knows how to unwrap that; matching on the
+    // `ArrayVar.Value` is a `dynamic_array` (element type plus elements), not
+    // a bare `BrdbValue::Array`. `WireArray`'s `TryFrom<&BrdbValue>` unwraps
+    // it; matching on the
     // exact data-struct name (rather than `Get`'s, which also contains
     // "ArrayVar" but carries no `Value` field) is what the sibling
     // multi-chunk test above (`a_pixel_in_the_second_pack_chunk_gets_a_chunk_relative_substring_start`)
@@ -1468,11 +1459,11 @@ fn each_banks_array_holds_only_its_own_frames() {
     for chunk in &db.brick_chunk_index(chip_grid_id).expect("chunk index") {
         let (_soa, structs) = db.component_chunk(chip_grid_id, chunk.index).expect("components");
         for s in &structs {
-            if s.get_name() == "BrickComponentData_WireGraphPseudo_ArrayVar" {
+            if s.get_name() == "BrickComponentData_ArrayVar" {
                 if let Some(value) = s.get("Value") {
-                    let variant: WireArrayVariant =
+                    let variant: WireArray =
                         value.try_into().expect("ArrayVar Value must decode");
-                    if let WireArrayVariant::StringArray(v) = variant {
+                    if let WireArray::Str(v) = variant {
                         lengths.push(v.len());
                     }
                 }
@@ -1511,7 +1502,7 @@ fn boundary_constants_are_the_real_multiples_of_the_bank_size() {
     // `CompareGreaterOrEqual` is the COMPONENT TYPE name, but `s.get_name()`
     // reports the underlying DATA STRUCT, and every `Compare*` comparator
     // (Greater, GreaterOrEqual, Less, LessOrEqual) shares one struct --
-    // `BrickComponentData_WireGraph_Expr_MathCompare` -- per brdb's
+    // `BCSComponentVertex_Expr_MathCompare` -- per brdb's
     // `COMPONENT_TYPE_STRUCT_PAIRS`. This chip only ever emits
     // `CompareGreaterOrEqual` gates (see `bricks.rs`'s boundary cascade), so
     // matching the shared struct name is equivalent here and is what the
@@ -1520,7 +1511,7 @@ fn boundary_constants_are_the_real_multiples_of_the_bank_size() {
     for chunk in &db.brick_chunk_index(chip_grid_id).expect("chunk index") {
         let (_soa, structs) = db.component_chunk(chip_grid_id, chunk.index).expect("components");
         for s in &structs {
-            if s.get_name() == "BrickComponentData_WireGraph_Expr_MathCompare" {
+            if s.get_name() == "BCSComponentVertex_Expr_MathCompare" {
                 // The literal form depends on the field's declared type; accept
                 // whichever the encoder produced and compare numerically.
                 match s.get("InputB") {
@@ -1934,12 +1925,12 @@ fn saved_string_arrays(mut world: brdb::World, tag: &str) -> Vec<Vec<String>> {
         for chunk in db.brick_chunk_index(gid).expect("chunk index") {
             let (_soa, structs) = db.component_chunk(gid, chunk.index).expect("components");
             for s in &structs {
-                if s.get_name() == "BrickComponentData_WireGraphPseudo_ArrayVar"
+                if s.get_name() == "BrickComponentData_ArrayVar"
                     && let Some(value) = s.get("Value")
                 {
-                    let variant: WireArrayVariant =
+                    let variant: WireArray =
                         value.try_into().expect("ArrayVar Value must decode");
-                    if let WireArrayVariant::StringArray(v) = variant {
+                    if let WireArray::Str(v) = variant {
                         arrays.push(v);
                     }
                 }
@@ -2040,7 +2031,7 @@ fn external_clock_replaces_the_whole_timer_chain_with_one_frame_pin() {
             .count()
     };
 
-    for class in ["Pseudo_Timer", "BitwiseOR", "MathModuloFloored"] {
+    for class in ["Stopwatch", "BitwiseOR", "MathModuloFloored"] {
         assert_eq!(count(&internal, class), 1, "the built-in clock has one {class}");
         assert_eq!(count(&external, class), 0, "--external-clock must build no {class}");
     }
@@ -2103,7 +2094,7 @@ fn external_clock_replaces_the_timer_chain_in_colour_array_mode_too() {
 const BUTTON: &str = "Component_Internal_AnimatedButton";
 const TEXT_DISPLAY: &str = "Component_TextDisplay";
 const MICROCHIP_INPUT: &str = "BrickComponentType_Internal_MicrochipInput";
-const TIMER: &str = "BrickComponentType_WireGraphPseudo_Timer";
+const TIMER: &str = "BrickComponentType_Stopwatch";
 
 /// Main-grid bricks carrying `needle`.
 fn count_main_grid(world: &brdb::World, needle: &str) -> usize {

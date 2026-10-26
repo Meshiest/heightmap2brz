@@ -5,15 +5,15 @@ use super::layout::{CELL, GATE_HALF};
 use brdb::{
     Direction, IntVector, Rotation,
     AsBrdbValue, BString, Brick, BrickType, Position, WirePort, World, assets::LiteralComponent,
-    schema::WireVariant,
+    schema::WireValue,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub const TIMER: &str = "BrickComponentType_WireGraphPseudo_Timer";
-pub const MULTIPLY: &str = "BrickComponentType_WireGraph_Expr_MathMultiply";
-pub const BITWISE_OR: &str = "BrickComponentType_WireGraph_Expr_BitwiseOR";
-pub const MODULO: &str = "BrickComponentType_WireGraph_Expr_MathModuloFloored";
+pub const TIMER: &str = "BrickComponentType_Stopwatch";
+pub const MULTIPLY: &str = "BrickComponentType_Expr_MathMultiply";
+pub const BITWISE_OR: &str = "BrickComponentType_Expr_BitwiseOR";
+pub const MODULO: &str = "BrickComponentType_Expr_MathModuloFloored";
 
 pub struct Clock {
     /// Source port carrying the wrapped integer frame index.
@@ -205,18 +205,18 @@ pub fn build_clock(
     } else {
         stop_limit(fps, frame_count)
     };
-    let timer = gate(chip, "B_1x1_Gate_Pseudo_Timer", TIMER, at(0), vec![(
+    let timer = gate(chip, "B_1x1_Gate_Stopwatch", TIMER, at(0), vec![(
         "Limit",
         Box::new(limit) as Box<dyn AsBrdbValue>,
     )]);
     let mul = gate(chip, "B_1x1_Gate_Expr_MathMultiply", MULTIPLY, at(1), vec![(
         "InputB",
-        Box::new(WireVariant::Number(fps as f64)) as Box<dyn AsBrdbValue>,
+        Box::new(WireValue::Number(fps as f64)) as Box<dyn AsBrdbValue>,
     )]);
     // `BitwiseOR`'s data struct declares `InputA`/`InputB` as plain `i64`
-    // fields, not the tagged-union `WireGraphPrimMathVariant` `Multiply`/
+    // fields, not the tagged-union `WireValue` `Multiply`/
     // `ModuloFloored` use -- so this literal must be a bare `i64`, not
-    // `WireVariant::Int`. Also the deliberate float->int truncation: this
+    // `WireValue::Int`. Also the deliberate float->int truncation: this
     // port is typed `int`, so wiring `Multiply`'s float `Output` in coerces it.
     let trunc = gate(chip, "B_1x1_Gate_Expr_BitwiseOR", BITWISE_OR, at(2), vec![(
         "InputB",
@@ -226,7 +226,7 @@ pub fn build_clock(
     // not Number, since the wrap point is an index, not a measurement.
     let wrap = gate(chip, "B_1x1_Gate_Expr_MathModuloFloored", MODULO, at(3), vec![(
         "InputB",
-        Box::new(WireVariant::Int(frame_count as i64)) as Box<dyn AsBrdbValue>,
+        Box::new(WireValue::Int(frame_count as i64)) as Box<dyn AsBrdbValue>,
     )]);
 
     world.add_wire_connection(
@@ -289,8 +289,8 @@ pub fn build_clock(
     // content's length.
     let length_secs = frame_count as f64 / fps as f64;
     let length_gate = gate(chip, "B_1x1_Gate_Expr_MathMultiply", MULTIPLY, at(4), vec![
-        ("InputA", Box::new(WireVariant::Number(length_secs)) as Box<dyn AsBrdbValue>),
-        ("InputB", Box::new(WireVariant::Number(1.0)) as Box<dyn AsBrdbValue>),
+        ("InputA", Box::new(WireValue::Number(length_secs)) as Box<dyn AsBrdbValue>),
+        ("InputB", Box::new(WireValue::Number(1.0)) as Box<dyn AsBrdbValue>),
     ]);
     let length_pin = super::chip::add_output_pin(chip, "Length", pin_at(5));
     world.add_wire_connection(
@@ -307,7 +307,7 @@ pub fn build_clock(
     let progress_scale = 1.0 / frame_count.saturating_sub(1).max(1) as f64;
     let progress_gate = gate(chip, "B_1x1_Gate_Expr_MathMultiply", MULTIPLY, at(5), vec![(
         "InputB",
-        Box::new(WireVariant::Number(progress_scale)) as Box<dyn AsBrdbValue>,
+        Box::new(WireValue::Number(progress_scale)) as Box<dyn AsBrdbValue>,
     )]);
     world.add_wire_connection(
         WirePort::new(wrap, MODULO, "Output"),
@@ -377,7 +377,7 @@ mod tests {
                 assert_eq!(
                     frame_index_at(naive, fps, frames),
                     0,
-                    "frame_count % frame_count is 0 -- this is exactly why stop_limit \
+                    "frame_count % frame_count is 0; this is exactly why stop_limit \
                      subtracts half a frame"
                 );
             }
@@ -431,7 +431,6 @@ mod tests {
         let chip = super::super::chip::new_chip(
             &mut world,
             Position { x: 0, y: 0, z: 2 },
-            brdb::Vector3f { x: 0.0, y: 0.0, z: 40.0 },
             IntVector { x: 5, y: 5, z: 5 },
         );
         (world, chip)
@@ -532,7 +531,7 @@ mod tests {
         assert_eq!(
             clock.frame_index.component_type.to_string(),
             MODULO,
-            "the index must be the wrapped one -- an unwrapped index runs off the end of \
+            "the index must be the wrapped one; an unwrapped index runs off the end of \
              every array in the render"
         );
         // Every pin is a distinct brick, or two of them would be the same

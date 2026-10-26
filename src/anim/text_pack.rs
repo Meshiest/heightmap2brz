@@ -60,6 +60,10 @@ pub struct TextPacker {
     /// `bands[i]` holds band `i`'s strings, one per frame pushed so far.
     bands: Vec<Vec<String>>,
     frames_pushed: usize,
+    /// Per-pixel hold threshold (see [`TextPacker::hold`]); `0` is off.
+    hold: u8,
+    /// What each pixel shows under the hold, before the palette.
+    held: Option<RgbaImage>,
     /// Overrides [`super::pack::MAX_FRAMES`] in tests. Building a real
     /// 1,048,560-frame clip to exercise the limit would cost minutes of CPU
     /// and gigabytes of RAM -- the same reasoning that made
@@ -92,9 +96,22 @@ impl TextPacker {
             height: height as usize,
             bands,
             frames_pushed: 0,
+            hold: 0,
+            held: None,
             #[cfg(test)]
             frame_limit: super::pack::MAX_FRAMES,
         }
+    }
+
+    /// Per-pixel hold: a pixel keeps the colour it shows until the source
+    /// moves more than `threshold` on some channel, or crosses the alpha
+    /// threshold. Consecutive band strings then share long runs that the
+    /// save's zstd finds, which makes a noisy video's save much smaller.
+    /// What is shown never drifts more than `threshold` from the source.
+    /// `0` (the default) encodes every frame as it is.
+    pub fn hold(mut self, threshold: u8) -> Self {
+        self.hold = threshold;
+        self
     }
 
     /// `#[cfg(test)]`-only: see the field doc on `frame_limit`.
@@ -134,10 +151,30 @@ impl TextPacker {
         if frame_w != self.width || frame_h != self.height {
             return Err(format!(
                 "frame {} is {frame_w}x{frame_h}, but the source's SourceInfo reported \
-                 {}x{} -- every frame a FrameStream emits must match info()'s dimensions",
+                 {}x{}; every frame a FrameStream emits must match info()'s dimensions",
                 self.frames_pushed, self.width, self.height
             ));
         }
+
+        if self.hold > 0 {
+            let (t, alpha) = (self.hold, self.opts.alpha_threshold);
+            match &mut self.held {
+                None => self.held = Some(frame.clone()),
+                Some(held) => {
+                    for (shown, source) in held.pixels_mut().zip(frame.pixels()) {
+                        let same_visibility = (shown.0[3] >= alpha) == (source.0[3] >= alpha);
+                        let near = shown.0[..3]
+                            .iter()
+                            .zip(&source.0[..3])
+                            .all(|(a, b)| a.abs_diff(*b) <= t);
+                        if !(same_visibility && near) {
+                            *shown = *source;
+                        }
+                    }
+                }
+            }
+        }
+        let frame: &RgbaImage = self.held.as_ref().unwrap_or(frame);
 
         // Quantize once, up front, so every band crops from the same
         // post-palette pixels. Skipped entirely for an empty palette so the
@@ -205,7 +242,7 @@ fn encode_band(
         let chars: usize = encoded.iter().map(|b| b.chars).sum();
         return Err(format!(
             "band {bi} (row {}): the fixed layout produced {} TextBands (expected \
-             exactly 1) totaling {chars} chars -- the worst-case bound in text_layout \
+             exactly 1) totaling {chars} chars. The worst-case bound in text_layout \
              and the encoder in text.rs disagree, which is a bug in this codebase, not \
              a user error",
             band.start_row,
@@ -216,13 +253,13 @@ fn encode_band(
     debug_assert!(
         text_band.chars <= MAX_COMPONENT_CHARS,
         "band {bi}: {} chars exceeds the {MAX_COMPONENT_CHARS}-char TextDisplay limit \
-         -- the layout bound should have made this impossible",
+         (the layout bound should have made this impossible)",
         text_band.chars
     );
     if text_band.chars > MAX_COMPONENT_CHARS {
         return Err(format!(
             "band {bi} (row {}): {} chars exceeds the {MAX_COMPONENT_CHARS}-char \
-             TextDisplay limit -- the game would truncate this silently; the \
+             TextDisplay limit. The game would truncate this silently; the \
              worst-case layout bound and the real encoder disagree, which is a bug",
             band.start_row, text_band.chars
         ));
@@ -376,6 +413,67 @@ mod tests {
         let mut p = TextPacker::new(1, 1, plan, opts(), Palette::default());
         p.push_frame(&f).unwrap();
         assert!(p.finish()[0][0].contains("123456"), "exact source colour");
+    }
+
+    /// A frame whose every pixel moved by `step`, with pixel 0 transparent
+    /// when `hide` is set.
+    fn noisy(step: i32, hide: bool) -> RgbaImage {
+        RgbaImage::from_fn(8, 4, |x, y| {
+            let v = |base: i32| (base + step).clamp(0, 255) as u8;
+            let a = if hide && x == 0 && y == 0 { 0 } else { 0xFF };
+            Rgba([v(40 * x as i32), v(60 * y as i32), v(100), a])
+        })
+    }
+
+    fn strings(hold: u8, frames: &[RgbaImage]) -> Vec<Vec<String>> {
+        let plan = plan_bands(8, 4, opts().char_repeat).unwrap();
+        let mut p = TextPacker::new(8, 4, plan, opts(), Palette::default()).hold(hold);
+        for f in frames {
+            p.push_frame(f).unwrap();
+        }
+        p.finish()
+    }
+
+    #[test]
+    fn a_hold_keeps_changes_within_its_threshold() {
+        let frames = [noisy(0, false), noisy(3, false), noisy(-4, false)];
+        let held = strings(4, &frames);
+        assert_eq!(held[0][0], held[0][1], "moved 3: held");
+        assert_eq!(held[0][0], held[0][2], "moved 4: held");
+        let plain = strings(0, &frames);
+        assert_ne!(plain[0][0], plain[0][1], "no hold: every change is encoded");
+        let moved = strings(4, &[noisy(0, false), noisy(5, false)]);
+        assert_ne!(moved[0][0], moved[0][1], "moved 5: updated");
+    }
+
+    #[test]
+    fn a_held_pixel_never_drifts_past_the_threshold() {
+        let plan = plan_bands(8, 4, opts().char_repeat).unwrap();
+        let mut p = TextPacker::new(8, 4, plan, opts(), Palette::default()).hold(6);
+        // A slow ramp: each frame moves 2, so a hold that compared against
+        // the previous source frame instead of what is shown would drift.
+        for step in 0..40 {
+            let f = noisy(2 * step, false);
+            p.push_frame(&f).unwrap();
+            let shown = p.held.as_ref().unwrap();
+            for (s, c) in shown.pixels().zip(f.pixels()) {
+                for ch in 0..3 {
+                    assert!(
+                        s.0[ch].abs_diff(c.0[ch]) <= 6,
+                        "frame {step}: {s:?} vs {c:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pixel_that_turns_transparent_is_never_held() {
+        let held = strings(255, &[noisy(0, false), noisy(0, true)]);
+        assert_ne!(
+            held[0][0], held[0][1],
+            "visibility changed, so the frame changed"
+        );
     }
 
     #[test]

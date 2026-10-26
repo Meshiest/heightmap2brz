@@ -590,7 +590,7 @@ pub fn deliver_world_unless_cancelled(
     out_clipboard: bool,
 ) -> Result<(), String> {
     if progress.is_cancelled() {
-        log::info!("Render cancelled -- no save written");
+        log::info!("Render cancelled; no save written");
         return Ok(());
     }
     log::info!("Writing Save to {out_file}");
@@ -1042,7 +1042,7 @@ fn draw_ffmpeg_download_body(ui: &mut egui::Ui, view: DownloadView) {
             ui.colored_label(
                 egui::Color32::from_rgb(255, 180, 80),
                 format!(
-                    "Download appears stalled -- no data for {}s. Check your connection, or \
+                    "Download appears stalled: no data for {}s. Check your connection, or \
                      install ffmpeg manually and restart.",
                     since.as_secs()
                 ),
@@ -1109,7 +1109,7 @@ impl FfmpegModal {
         match promise.try_take() {
             Ok(result) => {
                 match &result {
-                    Ok(()) => log::info!("ffmpeg installed -- click Generate again to continue"),
+                    Ok(()) => log::info!("ffmpeg installed. Click Generate again to continue"),
                     Err(e) => log::error!("{e}"),
                 }
                 match &self.progress {

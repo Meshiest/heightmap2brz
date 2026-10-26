@@ -332,19 +332,19 @@ fn main() {
     if args.first().map(String::as_str) == Some("--synthetic") || args.is_empty() {
         let o = AudioOptions { max_voices: 8, window: 4096, ..base };
         synthetic(
-            "-- clean tone, 1.0 s on, 3.0 s total --",
+            "== clean tone, 1.0 s on, 3.0 s total ==",
             &gated_tone(440.0, 1.0, 3.0),
             1.0,
             &o,
         );
         synthetic(
-            "-- tone in noise (-34 dB bed), 1.0 s on, 3.0 s total --",
+            "== tone in noise (-34 dB bed), 1.0 s on, 3.0 s total ==",
             &gated_tone_in_noise(440.0, 1.0, 3.0, 0.01),
             1.0,
             &o,
         );
         report(
-            "-- tone in noise, full stats --",
+            "== tone in noise, full stats ==",
             &gated_tone_in_noise(440.0, 1.0, 3.0, 0.01),
             &o,
         );

@@ -46,8 +46,9 @@
 use std::path::{Path, PathBuf};
 
 use brdb::{
-    AsBrdbValue, IntVector, Position, Vector3f, WirePort, World, schema::WireArrayVariant,
+    AsBrdbValue, IntVector, Position, WirePort, World,
 };
+use heightmap::wire_array::WireArray;
 use image::RgbaImage;
 
 use heightmap::anim::bricks::{ARRAY_GET, ARRAY_VAR, CHANGE_DETECTOR};
@@ -110,7 +111,7 @@ fn plan_bands(width: usize, height: usize, char_repeat: usize) -> Result<Vec<Ban
         return Err(format!(
             "row 0: a {width}-pixel row encodes to at most {row} chars ({COLOR_TAG_CHARS} for a \
              colour tag + {char_repeat} glyph chars per pixel), over the \
-             {MAX_COMPONENT_CHARS}-char TextDisplay limit -- no band layout can fit it, and \
+             {MAX_COMPONENT_CHARS}-char TextDisplay limit. No band layout can fit it, and \
              every other row of this image costs the same; render narrower or with a smaller \
              char_repeat"
         ));
@@ -146,7 +147,7 @@ fn encode_band(
     let mut encoded = encode_bands(&sub, opts)?;
     if encoded.len() != 1 {
         return Err(format!(
-            "frame {frame}, band at row {}: the fixed layout split into {} bands -- the \
+            "frame {frame}, band at row {}: the fixed layout split into {} bands, so the \
              worst-case bound is wrong",
             band.start_row,
             encoded.len()
@@ -159,7 +160,7 @@ fn encode_band(
     if inner.chars > MAX_COMPONENT_CHARS {
         return Err(format!(
             "frame {frame}, band at row {} ({} rows): {} chars exceeds the \
-             {MAX_COMPONENT_CHARS}-char TextDisplay limit -- the game would truncate this \
+             {MAX_COMPONENT_CHARS}-char TextDisplay limit; the game would truncate this \
              silently",
             band.start_row, band.rows, inner.chars
         ));
@@ -207,7 +208,7 @@ fn build_probe_world(source: &dyn FrameSource, opts: &TextOptions) -> Result<(Wo
         opts.char_repeat.max(1),
     )?;
     if plan.is_empty() {
-        return Err("source has zero height -- nothing to band".to_string());
+        return Err("source has zero height, so there is nothing to band".to_string());
     }
 
     // --- 1. Stream and encode ----------------------------------------------
@@ -243,14 +244,14 @@ fn build_probe_world(source: &dyn FrameSource, opts: &TextOptions) -> Result<(Wo
         }
     }
     if frames == 0 {
-        return Err("clip has 0 frames -- nothing to render (check --start/--duration)".to_string());
+        return Err("clip has 0 frames: nothing to render (check --start/--duration)".to_string());
     }
     // No bank spillover here: that is brick mode's machinery and reproducing
     // it would be building the feature, not probing it. Refuse instead.
     if frames > BANK_FRAMES {
         return Err(format!(
             "{frames} frames exceeds the {BANK_FRAMES}-entry array limit; this probe does not \
-             implement bank spillover -- shorten the clip with --duration"
+             implement bank spillover; shorten the clip with --duration"
         ));
     }
 
@@ -316,11 +317,6 @@ fn build_probe_world(source: &dyn FrameSource, opts: &TextOptions) -> Result<(Wo
     let mut chip = chip::new_chip(
         &mut world,
         Position { x: 20, y: 20, z: 2 },
-        Vector3f {
-            x: 20.0,
-            y: 20.0,
-            z: (lift + 20) as f32,
-        },
         IntVector { x: 5, y: 5, z: 5 },
     );
 
@@ -362,7 +358,7 @@ fn build_probe_world(source: &dyn FrameSource, opts: &TextOptions) -> Result<(Wo
             lattice_pos_staged(0, row, 0, n_bands, GATE_HALF, STAGE_PITCH),
             vec![(
                 "Value",
-                Box::new(WireArrayVariant::StringArray(texts)) as Box<dyn AsBrdbValue>,
+                Box::new(WireArray::Str(texts)) as Box<dyn AsBrdbValue>,
             )],
         );
         let get = gate(
@@ -692,10 +688,10 @@ mod tests {
     /// not a silently truncated render.
     #[test]
     fn a_row_too_wide_for_one_component_names_the_row() {
-        // 600 px * (16 + 2) = 10 800 chars, over the 10 000 limit.
-        let err = plan_bands(600, 4, 2).expect_err("a 600px row cannot fit one component");
+        // 2000 px * (16 + 2) = 36 000 chars, over the 32 767 limit.
+        let err = plan_bands(2000, 4, 2).expect_err("a 2000px row cannot fit one component");
         assert!(err.contains("row 0"), "unexpected error: {err}");
-        assert!(err.contains("10800"), "the error must quote the cost: {err}");
+        assert!(err.contains("36000"), "the error must quote the cost: {err}");
 
         // The boundary itself: the widest row that still fits must plan, and
         // one pixel more must not.

@@ -236,7 +236,7 @@ mod tests {
         assert!(
             hi / lo < 1.05,
             "a steady tone's peak magnitude must not vary across frames \
-             (min {lo}, max {hi}, ratio {}) -- a phase-dependent magnitude such as \
+             (min {lo}, max {hi}, ratio {}); a phase-dependent magnitude such as \
              |re| instead of |X[k]| makes a sustained note flicker",
             hi / lo
         );

@@ -2,7 +2,8 @@
 mod wire_integrity;
 
 use brdb::assets::LiteralComponent;
-use brdb::{AsBrdbValue, Brick, BrickType, Position, World, schema::WireArrayVariant};
+use heightmap::wire_array::WireArray;
+use brdb::{AsBrdbValue, Brick, BrickType, Position, World};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ fn a_full_bank_of_doubles_round_trips() {
     let mut data: HashMap<brdb::BString, Box<dyn AsBrdbValue>> = HashMap::new();
     data.insert(
         "Value".into(),
-        Box::new(WireArrayVariant::DoubleArray(values)) as Box<dyn AsBrdbValue>,
+        Box::new(WireArray::F64(values)) as Box<dyn AsBrdbValue>,
     );
     let brick = Brick {
         asset: BrickType::from("B_1x1_Gate_Variable_Array"),
@@ -27,7 +28,7 @@ fn a_full_bank_of_doubles_round_trips() {
         ..Default::default()
     }
     .with_component(LiteralComponent::new_from_data(
-        "BrickComponentType_WireGraphPseudo_ArrayVar",
+        "BrickComponentType_ArrayVar",
         Arc::new(data),
     ));
     world.add_brick(brick);
@@ -80,7 +81,7 @@ fn inner_components(world: &brdb::World) -> Vec<String> {
 
 #[test]
 fn every_band_gets_one_speaker() {
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
     let speakers = world
@@ -102,7 +103,7 @@ fn every_band_gets_one_speaker() {
 
 #[test]
 fn a_single_bank_track_emits_no_branch_and_only_the_pause_mute_select() {
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
     let comps = inner_components(&world);
@@ -133,7 +134,7 @@ fn a_single_bank_track_emits_no_branch_and_only_the_pause_mute_select() {
 /// The spillover shape, forced with a tiny bank size so the test stays fast.
 #[test]
 fn a_multi_bank_track_emits_the_branch_and_select_cascade() {
-    let mut opts = AudioOptions::default();
+    let mut opts = AudioOptions::wired();
     opts.bank_size = 10;
     let track = tone_track(2.0, &opts); // ~60 frames -> 6 banks
     let banks = track.frame_count.div_ceil(10);
@@ -155,7 +156,7 @@ fn a_multi_bank_track_emits_the_branch_and_select_cascade() {
 
 #[test]
 fn the_world_serialises() {
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
     let bytes = world.to_brz_vec().expect("a built world must serialise");
@@ -167,7 +168,7 @@ fn noise_bands_carry_noise_assets_and_tonal_bands_do_not() {
     // Explicitly opted in: noise bands are off by default now (reported worse
     // on speech, piano and a pop mix alike), but the flag is kept for
     // percussion and the mechanism still has to be right when it is used.
-    let opts = AudioOptions { noise_bands: 2, ..AudioOptions::default() };
+    let opts = AudioOptions { noise_bands: 2, ..AudioOptions::wired() };
     let track = tone_track(1.0, &opts);
     let tonal = track.plan.tonal_count();
     assert_eq!(track.plan.kinds[tonal], BandKind::WhiteNoise);
@@ -179,7 +180,7 @@ fn noise_bands_carry_noise_assets_and_tonal_bands_do_not() {
 
 #[test]
 fn an_empty_track_is_rejected_rather_than_producing_a_broken_save() {
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let mut track = tone_track(1.0, &opts);
     let n = track.plan.len();
     track.frame_count = 0;
@@ -188,7 +189,7 @@ fn an_empty_track_is_rejected_rather_than_producing_a_broken_save() {
 }
 
 use brdb::IntoReader;
-use brdb::schema::{BrdbStruct, BrdbValue, WireVariant};
+use brdb::schema::{BrdbStruct, BrdbValue, WireValue};
 use heightmap::anim::bricks::{ARRAY_GET, ARRAY_VAR, BRANCH, SELECT};
 use heightmap::anim::chip::MICROCHIP_INPUT;
 use heightmap::anim::clock::{MULTIPLY, TIMER};
@@ -206,7 +207,7 @@ fn multi_bank() -> (
     brdb::World,
     usize,
 ) {
-    let mut opts = AudioOptions::default();
+    let mut opts = AudioOptions::wired();
     opts.bank_size = 10;
     let track = tone_track(2.0, &opts);
     let n_banks = track.frame_count.div_ceil(opts.bank_size);
@@ -361,7 +362,7 @@ fn expected_asset(kind: BandKind) -> &'static str {
 /// whistle, and `bEnabled` false mutes the speaker outright.
 #[test]
 fn every_speakers_pitch_asset_and_spatialization_reach_the_save() {
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
 
@@ -394,7 +395,7 @@ fn every_speakers_pitch_asset_and_spatialization_reach_the_save() {
             );
             assert!(
                 !bool_prop(s, "bSpatialization"),
-                "band {b}: spatialization must be OFF -- a cluster of positioned \
+                "band {b}: spatialization must be OFF, because a cluster of positioned \
                  emitters comb-filters against itself"
             );
             assert!(bool_prop(s, "bEnabled"), "band {b} must be enabled");
@@ -407,8 +408,8 @@ fn every_speakers_pitch_asset_and_spatialization_reach_the_save() {
             let BrdbValue::Asset(Some(idx)) = s.prop("AudioDescriptor").expect("AudioDescriptor")
             else {
                 panic!(
-                    "band {b}: AudioDescriptor must decode as Asset(Some(..)), got {:?} -- a \
-                     WireVariant::Object encodes down a different path entirely",
+                    "band {b}: AudioDescriptor must decode as Asset(Some(..)), got {:?}; a \
+                     WireValue::Object encodes down a different path entirely",
                     s.prop("AudioDescriptor")
                 );
             };
@@ -456,11 +457,11 @@ fn the_bank_arrays_partition_every_bands_frames_exactly() {
         let mut lengths = Vec::new();
         let mut values: Vec<f64> = Vec::new();
         for (_, _, s) in all {
-            if s.get_name() != "BrickComponentData_WireGraphPseudo_ArrayVar" {
+            if s.get_name() != "BrickComponentData_ArrayVar" {
                 continue;
             }
             let v = s.prop("Value").expect("an ArrayVar must carry a Value");
-            let WireArrayVariant::DoubleArray(d) = WireArrayVariant::try_from(v)
+            let WireArray::F64(d) = WireArray::try_from(v)
                 .expect("an audio bank must decode as a wire array variant")
             else {
                 panic!("an audio bank must be a DoubleArray, not {v:?}");
@@ -699,20 +700,20 @@ fn every_get_is_clocked_and_indexed_by_its_own_bank() {
     let mut index_sources: HashSet<(usize, String)> = HashSet::new();
     for &get in &gets {
         let idx = by_target.get(&(get, "Index".to_string())).unwrap_or_else(|| {
-            panic!("get {get} has no Index wire -- it would read frame 0 forever")
+            panic!("get {get} has no Index wire, so it would read frame 0 forever")
         });
         assert_eq!(idx.len(), 1, "get {get}: exactly one index source");
         index_sources.insert(idx[0].clone());
 
         let exec = by_target
             .get(&(get, "Exec".to_string()))
-            .unwrap_or_else(|| panic!("get {get} is not in any exec chain -- it never runs"));
+            .unwrap_or_else(|| panic!("get {get} is not in any exec chain, so it never runs"));
         assert_eq!(exec.len(), 1, "get {get}: exactly one exec input");
     }
     assert_eq!(
         index_sources.len(),
         n_banks,
-        "each of the {n_banks} banks needs its OWN index -- bank 0 the raw frame \
+        "each of the {n_banks} banks needs its OWN index: bank 0 the raw frame \
          index, bank k that index minus k*bank_size"
     );
 }
@@ -726,7 +727,7 @@ fn the_save_references_exactly_the_three_synth_assets() {
     // `control_buttons: false`: the button labels register a `BrickFontDescriptor`
     // asset reference, which is real but has nothing to do with the synth assets
     // this test is pinning.
-    let opts = AudioOptions { control_buttons: false, ..AudioOptions::default() };
+    let opts = AudioOptions { control_buttons: false, ..AudioOptions::wired() };
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
 
@@ -804,7 +805,7 @@ fn inner_structs_by_brick_id(world: &brdb::World, tag: &str) -> HashMap<usize, B
         assert_eq!(
             chunks.len(),
             1,
-            "this join assumes the chip is one brick chunk; it is now {} -- the \
+            "this join assumes the chip is one brick chunk; it is now {}, so the \
              brick-index-to-brick-id mapping below is no longer valid and must be \
              rewritten before this test can mean anything",
             chunks.len()
@@ -847,7 +848,7 @@ fn input_pins_by_label(structs: &HashMap<usize, BrdbStruct>) -> HashMap<String, 
         };
         assert!(
             out.insert(label.clone(), *id).is_none(),
-            "two input pins are both labelled {label:?} -- a builder cannot tell them apart"
+            "two input pins are both labelled {label:?}, so a builder cannot tell them apart"
         );
     }
     out
@@ -890,7 +891,7 @@ fn outgoing(world: &brdb::World, brick: usize, port: &str) -> Vec<(String, usize
 fn the_three_attenuation_pins_reach_every_speaker_on_the_port_they_name() {
     // `--bands 32` explicitly, not the derived default -- see
     // `inner_structs_by_brick_id` for why.
-    let opts = AudioOptions { bands: Some(32), ..Default::default() };
+    let opts = AudioOptions { bands: Some(32), ..AudioOptions::wired() };
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
     let speakers: HashSet<usize> = speaker_ids(&world).into_iter().collect();
@@ -908,7 +909,7 @@ fn the_three_attenuation_pins_reach_every_speaker_on_the_port_they_name() {
             let mut have: Vec<&String> = pins.keys().collect();
             have.sort();
             panic!(
-                "no input pin is labelled {label:?} -- a builder cannot drive what \
+                "no input pin is labelled {label:?}; a builder cannot drive what \
                  the chip never exposes. Pins present: {have:?}"
             )
         });
@@ -916,7 +917,7 @@ fn the_three_attenuation_pins_reach_every_speaker_on_the_port_they_name() {
         assert_eq!(
             out.len(),
             speakers.len(),
-            "the {label:?} pin must fan out to all {} speakers, not {} -- a partial \
+            "the {label:?} pin must fan out to all {} speakers, not {}; a partial \
              fan-out splits the bank into driven and undriven halves",
             speakers.len(),
             out.len()
@@ -998,7 +999,7 @@ fn the_volume_pin_scales_every_band_through_its_own_multiply() {
         assert_eq!(
             feeding.len(),
             1,
-            "band {b}: VolumeMultiplier takes exactly one source -- two sources on \
+            "band {b}: VolumeMultiplier takes exactly one source; two sources on \
              one input is what the multiply exists to avoid"
         );
         let (mul, port) = &feeding[0];
@@ -1024,7 +1025,7 @@ fn the_volume_pin_scales_every_band_through_its_own_multiply() {
                 Some(SELECT) | Some(ARRAY_GET)
             ),
             "band {b}: InputA must carry the band's own value (a select or a get), \
-             got {:?} -- InputA and InputB are not interchangeable, the baked \
+             got {:?}; InputA and InputB are not interchangeable, the baked \
              unity gain lives on InputB",
             comp.get(&a[0].0)
         );
@@ -1045,7 +1046,7 @@ fn the_volume_pin_scales_every_band_through_its_own_multiply() {
     assert_eq!(
         pin_sources.len(),
         1,
-        "every band must read the SAME gated master -- {} distinct sources \
+        "every band must read the SAME gated master, but {} distinct sources \
          means the mute (or the volume) reaches only part of the bank",
         pin_sources.len()
     );
@@ -1071,7 +1072,7 @@ fn the_volume_pin_scales_every_band_through_its_own_multiply() {
 /// InnerRadius/MaxDistance) must reach the save.
 #[test]
 fn the_baked_emitter_defaults_that_stand_behind_the_pins_reach_the_save() {
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
 
@@ -1085,7 +1086,7 @@ fn the_baked_emitter_defaults_that_stand_behind_the_pins_reach_the_save() {
         for (b, s) in emitters.iter().enumerate() {
             assert!(
                 !bool_prop(s, "bSpatialization"),
-                "band {b}: the baked bSpatialization must be false -- it is what the \
+                "band {b}: the baked bSpatialization must be false: it is what the \
                  Directional pin overrides, and the game's own default is TRUE"
             );
             assert_eq!(
@@ -1165,7 +1166,7 @@ fn no_two_speakers_are_far_apart() {
     // room to spare while a column fails it by an order of magnitude.
     const BOUND: f64 = 100.0;
 
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
     let ps = speaker_positions(&world);
@@ -1174,8 +1175,8 @@ fn no_two_speakers_are_far_apart() {
     let (worst, i, j) = max_separation(&ps);
     assert!(
         worst < BOUND,
-        "speakers {i} and {j} are {worst:.1} units apart, over the {BOUND}-unit bound \
-         -- the cluster must stay compact so the bank reads as one point source"
+        "speakers {i} and {j} are {worst:.1} units apart, over the {BOUND}-unit bound; \
+         the cluster must stay compact so the bank reads as one point source"
     );
     // The shipped bug was a COLUMN, one speaker stacked on the next. Naming
     // it keeps this test discriminating rather than merely satisfiable: a
@@ -1184,7 +1185,7 @@ fn no_two_speakers_are_far_apart() {
     let column = (ps.len() - 1) as f64 * 12.0;
     assert!(
         column > worst * 5.0,
-        "a column of {} speakers is {column:.0} units and the cluster is {worst:.1} -- \
+        "a column of {} speakers is {column:.0} units and the cluster is {worst:.1}; \
          if those are comparable the cluster is not packing anything",
         ps.len()
     );
@@ -1201,7 +1202,7 @@ fn no_two_speakers_are_far_apart() {
 /// slip through.
 #[test]
 fn no_two_speakers_share_a_position() {
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
     let ps = speaker_positions(&world);
@@ -1210,7 +1211,7 @@ fn no_two_speakers_share_a_position() {
     for (b, p) in ps.iter().enumerate() {
         if let Some(other) = seen.insert((p.x, p.y, p.z), b) {
             panic!(
-                "bands {other} and {b} are both at ({}, {}, {}) -- two bricks in one \
+                "bands {other} and {b} are both at ({}, {}, {}); two bricks in one \
                  slot overlap, and the game silently DELETES one of them",
                 p.x, p.y, p.z
             );
@@ -1244,7 +1245,7 @@ fn every_band_count_packs_without_collisions_or_spread() {
         assert!(
             worst <= allowed,
             "n={n}: speakers {i} and {j} are {worst:.1} units apart, over the \
-             {allowed:.1} a near-cubic packing allows -- the arrangement is not \
+             {allowed:.1} a near-cubic packing allows, so the arrangement is not \
              compact at this band count"
         );
         // Every coordinate stays in the positive octant, which is what lets
@@ -1286,7 +1287,7 @@ fn the_cluster_layout_is_deterministic() {
                 .collect();
             assert_eq!(
                 first, again,
-                "n={n}: the layout changed on attempt {attempt} -- band k must always \
+                "n={n}: the layout changed on attempt {attempt}, but band k must always \
                  take the same slot"
             );
         }
@@ -1332,7 +1333,7 @@ fn the_cluster_layout_is_deterministic() {
         );
     }
 
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let a = build_speaker_world(&track, &opts).expect("build");
     let b = build_speaker_world(&track, &opts).expect("build");
@@ -1391,7 +1392,7 @@ fn the_cluster_dimensions_are_near_cubic_and_sufficient() {
 #[test]
 fn the_chip_clears_the_cluster_at_any_band_count() {
     for bands in [3usize, 8, 32, 64] {
-        let mut opts = AudioOptions::default();
+        let mut opts = AudioOptions::wired();
         opts.bands = Some(bands);
         opts.noise_bands = if bands >= 4 { 2 } else { 0 };
         let track = tone_track(1.0, &opts);
@@ -1412,13 +1413,13 @@ fn the_chip_clears_the_cluster_at_any_band_count() {
 /// is precisely the failure the flags exist to let the owner escape.
 #[test]
 fn the_radius_options_reach_every_emitter_on_the_field_they_name() {
-    let mut opts = AudioOptions::default();
+    let mut opts = AudioOptions::wired();
     // Unequal, neither one a default, and deliberately not a round multiple
     // of the other.
     opts.inner_radius = 123.0;
     opts.max_distance = 4567.0;
-    assert_ne!(opts.inner_radius, AudioOptions::default().inner_radius);
-    assert_ne!(opts.max_distance, AudioOptions::default().max_distance);
+    assert_ne!(opts.inner_radius, AudioOptions::wired().inner_radius);
+    assert_ne!(opts.max_distance, AudioOptions::wired().max_distance);
 
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
@@ -1452,7 +1453,7 @@ fn the_radius_options_reach_every_emitter_on_the_field_they_name() {
 /// perfectly and is silent -- or audible nowhere -- only in game.
 #[test]
 fn an_impossible_radius_is_rejected_rather_than_baked() {
-    let base = AudioOptions::default();
+    let base = AudioOptions::wired();
     let track = tone_track(1.0, &base);
     for (name, inner, max) in [
         ("zero max distance", 0.0f32, 0.0f32),
@@ -1482,12 +1483,12 @@ fn an_impossible_radius_is_rejected_rather_than_baked() {
 /// multiplies are exactly those whose `Output` drives a speaker's
 /// `VolumeMultiplier`. Filtering on the data struct name would not work either
 /// -- `MathMultiply`, `MathSubtract` and `MathModuloFloored` all serialise as
-/// `BrickComponentData_WireGraph_Expr_PrimMathVariantPrimMathVariant_PrimMathVariant`.
+/// `BCSComponentVertex_Expr_PrimMathVariantPrimMathVariant_PrimMathVariant`.
 #[test]
 fn the_volume_multiplies_bake_unity_gain_so_an_unwired_pin_changes_nothing() {
     // `--bands 32` explicitly, not the derived default -- see
     // `inner_structs_by_brick_id` for why.
-    let opts = AudioOptions { bands: Some(32), ..Default::default() };
+    let opts = AudioOptions { bands: Some(32), ..AudioOptions::wired() };
     let track = tone_track(1.0, &opts);
     assert!(
         (track.fps - 1.0).abs() > 0.5,
@@ -1524,14 +1525,14 @@ fn the_volume_multiplies_bake_unity_gain_so_an_unwired_pin_changes_nothing() {
             .get(&mul)
             .unwrap_or_else(|| panic!("multiply {mul} has no component data in the save"));
         let v = s.prop("InputB").expect("a multiply must carry an InputB");
-        let WireVariant::Number(n) =
-            WireVariant::try_from(v).expect("a math port is a wire variant, not a bare f32")
+        let WireValue::Number(n) =
+            WireValue::try_from(v).expect("a math port is a wire variant, not a bare f32")
         else {
             panic!("the baked gain must be a Number, got {v:?}");
         };
         assert_eq!(
             n, 1.0,
-            "multiply {mul} bakes a gain of {n}, not 1.0 -- that is the value the \
+            "multiply {mul} bakes a gain of {n}, not 1.0. That is the value the \
              gate uses while the Volume pin is UNWIRED, so anything else rescales \
              (0.0 mutes) every render nobody has touched"
         );
@@ -1551,8 +1552,8 @@ fn the_volume_multiplies_bake_unity_gain_so_an_unwired_pin_changes_nothing() {
         structs[m]
             .prop("InputB")
             .ok()
-            .and_then(|v| WireVariant::try_from(v).ok())
-            .is_some_and(|wv| matches!(wv, WireVariant::Number(n) if n == track.fps as f64))
+            .and_then(|v| WireValue::try_from(v).ok())
+            .is_some_and(|wv| matches!(wv, WireValue::Number(n) if n == track.fps as f64))
     });
     assert!(carries_fps, "the clock's own fps multiply must survive carrying the fps");
 }
@@ -1561,7 +1562,7 @@ fn the_volume_multiplies_bake_unity_gain_so_an_unwired_pin_changes_nothing() {
 /// crate, not left for brdb's regenerated `STRUCT_DEFAULTS` to fill in.
 #[test]
 fn the_emitter_properties_behind_the_pins_are_written_explicitly() {
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
 
@@ -1635,7 +1636,7 @@ fn voice_opts(voices: usize) -> AudioOptions {
     AudioOptions {
         max_voices: voices,
         window: 4096,
-        ..AudioOptions::default()
+        ..AudioOptions::wired()
     }
 }
 
@@ -1815,7 +1816,7 @@ fn a_voice_render_is_smaller_than_the_equivalent_bank_render() {
         .expect("voice build")
         .to_brz_vec()
         .expect("voice serialise");
-    let bo = AudioOptions { window: 4096, ..AudioOptions::default() };
+    let bo = AudioOptions { window: 4096, ..AudioOptions::wired() };
     let bank = build_speaker_world(&tone_track(2.0, &bo), &bo)
         .expect("bank build")
         .to_brz_vec()
@@ -1842,14 +1843,14 @@ fn a_voice_render_is_smaller_than_the_equivalent_bank_render() {
 #[test]
 fn loop_playback_reaches_the_timer_limit_in_an_audio_render() {
     fn written_limit(loop_playback: bool, tag: &str) -> (f64, f32, usize) {
-        let opts = AudioOptions { loop_playback, ..AudioOptions::default() };
+        let opts = AudioOptions { loop_playback, ..AudioOptions::wired() };
         let track = tone_track(1.0, &opts);
         let (fps, frames) = (track.fps, track.frame_count);
         let world = build_speaker_world(&track, &opts).expect("build");
         let limit = with_decoded_components(&world, tag, |all, _| {
             let mut found = None;
             for (_, _, s) in all {
-                if s.get_name() == "BrickComponentData_WireGraphPseudo_Timer" {
+                if s.get_name() == "BrickComponentData_Stopwatch" {
                     match s.get("Limit") {
                         Some(BrdbValue::F64(v)) => found = Some(*v),
                         other => panic!("Timer.Limit decoded as {other:?}, expected an f64"),
@@ -1952,7 +1953,7 @@ fn the_pause_mute_gate_silences_every_speaker_when_the_clock_stops() {
     // Select.InputA is baked (unwired 0.0); Select.InputB is the Volume pin.
     assert!(
         by_target.get(&(select, "InputA".to_string())).is_none(),
-        "InputA is the baked 0.0 -- it must be UNWIRED, or a source overrides the mute"
+        "InputA is the baked 0.0; it must be UNWIRED, or a source overrides the mute"
     );
     let sel_b = &by_target[&(select, "InputB".to_string())];
     assert_eq!(comp.get(&sel_b[0].0).map(String::as_str), Some(MICROCHIP_INPUT));
@@ -1984,14 +1985,14 @@ fn the_pause_mute_gate_silences_every_speaker_when_the_clock_stops() {
 /// pause-mute one and the read-back cannot pick the wrong gate.
 #[test]
 fn the_pause_mute_selects_baked_literals_keep_a_playing_render_unchanged() {
-    let opts = AudioOptions { bands: Some(6), ..Default::default() };
+    let opts = AudioOptions { bands: Some(6), ..AudioOptions::wired() };
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
 
     with_decoded_components(&world, "pause_mute_select", |all, _| {
         let selects: Vec<&BrdbStruct> = all
             .iter()
-            .filter(|(_, _, s)| s.get_name() == "BrickComponentData_WireGraph_Expr_Select")
+            .filter(|(_, _, s)| s.get_name() == "BCSComponentVertex_Expr_Select")
             .map(|(_, _, s)| s)
             .collect();
         assert_eq!(
@@ -2003,8 +2004,8 @@ fn the_pause_mute_selects_baked_literals_keep_a_playing_render_unchanged() {
 
         let number = |prop: &str| -> f64 {
             let v = s.prop(prop).unwrap_or_else(|e| panic!("{prop}: {e}"));
-            let WireVariant::Number(n) =
-                WireVariant::try_from(v).expect("a Select input is a wire variant")
+            let WireValue::Number(n) =
+                WireValue::try_from(v).expect("a Select input is a wire variant")
             else {
                 panic!("{prop} did not decode as a Number");
             };
@@ -2026,7 +2027,7 @@ fn the_pause_mute_selects_baked_literals_keep_a_playing_render_unchanged() {
 /// dangle silently in game. This is the loader's own port resolution.
 #[test]
 fn a_bank_render_passes_wire_integrity() {
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
     let path =
@@ -2078,7 +2079,7 @@ fn inner_speaker_ids(world: &brdb::World) -> Vec<usize> {
 /// [`speaker_position`] slot, and nothing extra on the inner grid.
 #[test]
 fn speakers_in_chip_moves_the_cluster_onto_the_inner_grid_and_off_leaves_it() {
-    let base = AudioOptions { bands: Some(16), ..Default::default() };
+    let base = AudioOptions { bands: Some(16), ..AudioOptions::wired() };
     let track = tone_track(1.0, &base);
     let n = track.plan.len();
 
@@ -2149,7 +2150,7 @@ fn the_saved_file_puts_in_chip_speakers_in_the_chip_grid_not_the_main_grid() {
         })
     };
 
-    let on = AudioOptions { speakers_in_chip: true, bands: Some(16), ..Default::default() };
+    let on = AudioOptions { speakers_in_chip: true, bands: Some(16), ..AudioOptions::wired() };
     let track = tone_track(1.0, &on);
     let world = build_speaker_world(&track, &on).expect("build on");
     assert_eq!(
@@ -2158,7 +2159,7 @@ fn the_saved_file_puts_in_chip_speakers_in_the_chip_grid_not_the_main_grid() {
         "every in-chip emitter must decode on the chip's inner grid ({CHIP_GRID})"
     );
 
-    let off = AudioOptions { bands: Some(16), ..Default::default() };
+    let off = AudioOptions { bands: Some(16), ..AudioOptions::wired() };
     let track = tone_track(1.0, &off);
     let world = build_speaker_world(&track, &off).expect("build off");
     assert_eq!(
@@ -2177,7 +2178,7 @@ fn the_saved_file_puts_in_chip_speakers_in_the_chip_grid_not_the_main_grid() {
 #[test]
 fn in_chip_speakers_clear_the_gate_lattice_at_any_band_count() {
     for bands in [3usize, 8, 32, 64, 79] {
-        let mut opts = AudioOptions { speakers_in_chip: true, ..Default::default() };
+        let mut opts = AudioOptions { speakers_in_chip: true, ..AudioOptions::wired() };
         opts.bands = Some(bands);
         opts.noise_bands = if bands >= 4 { 2 } else { 0 };
         let track = tone_track(1.0, &opts);
@@ -2213,7 +2214,7 @@ fn in_chip_speaker_positions_are_nonnegative_and_clear_of_the_gate_layer() {
             let p = speaker_inner_position(k, n);
             assert!(
                 p.x >= 0 && p.y >= 0 && p.z >= 0,
-                "n={n} speaker {k} at ({}, {}, {}) has a negative coordinate -- \
+                "n={n} speaker {k} at ({}, {}, {}) has a negative coordinate; \
                  negative inner-grid coordinates delete bricks in-game",
                 p.x, p.y, p.z
             );
@@ -2233,7 +2234,7 @@ fn in_chip_speaker_positions_are_nonnegative_and_clear_of_the_gate_layer() {
 /// exercises exactly the resolution path the move changed.
 #[test]
 fn an_in_chip_bank_render_passes_wire_integrity() {
-    let opts = AudioOptions { speakers_in_chip: true, ..AudioOptions::default() };
+    let opts = AudioOptions { speakers_in_chip: true, ..AudioOptions::wired() };
     let track = tone_track(1.0, &opts);
     let world = build_speaker_world(&track, &opts).expect("build");
     let path = std::env::temp_dir()
@@ -2297,12 +2298,12 @@ fn the_control_buttons_appear_on_an_audio_render_and_vanish_when_disabled() {
     const BUTTON: &str = "Component_Internal_AnimatedButton";
     const TEXT_DISPLAY: &str = "Component_TextDisplay";
 
-    let opts = AudioOptions::default();
+    let opts = AudioOptions::wired();
     let track = tone_track(1.0, &opts);
     let on = build_speaker_world(&track, &opts).expect("build");
     let off = build_speaker_world(
         &track,
-        &AudioOptions { control_buttons: false, ..AudioOptions::default() },
+        &AudioOptions { control_buttons: false, ..AudioOptions::wired() },
     )
     .expect("build");
 

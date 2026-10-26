@@ -58,9 +58,9 @@ use crate::progress::{FrameTotal, Progress};
 use crate::text::{TextBand, TextOptions, TextTile, add_text_tiles};
 use crate::video::stream::FrameSource;
 use brdb::{
-    AsBrdbValue, IntVector, Position, Vector3f, WirePort, World,
-    schema::WireArrayVariant,
+    AsBrdbValue, IntVector, Position, WirePort, World,
 };
+use crate::wire_array::WireArray;
 use image::RgbaImage;
 
 /// The text component this mode drives, and the input port carrying its
@@ -133,7 +133,7 @@ pub fn build_text_world(
     let plan = plan_bands(info.width as usize, info.height as usize, char_repeat)?;
     if plan.is_empty() {
         return Err(format!(
-            "source is {}x{} -- a zero-height clip has no rows to band",
+            "source is {}x{}, and a zero-height clip has no rows to band",
             info.width, info.height
         ));
     }
@@ -188,7 +188,8 @@ pub fn build_text_world(
         plan.clone(),
         opts.text.clone(),
         palette,
-    );
+    )
+    .hold(opts.hold);
     let seen: Result<u64, String> = (|| {
         let mut stream = source.open()?;
         let mut seen: u64 = 0;
@@ -222,7 +223,7 @@ pub fn build_text_world(
     // frame-0 string to bake into each component.
     if frame_count == 0 {
         return Err(
-            "clip has 0 frames -- nothing to render (check --start/--duration, or the GUI's \
+            "clip has 0 frames: nothing to render (check --start/--duration, or the GUI's \
              Start/Duration, against the source's length)"
                 .to_string(),
         );
@@ -273,7 +274,7 @@ pub fn build_text_world(
     let text_ids = add_text_tiles(&mut world, tiles, &place_opts);
     if text_ids.len() != plan.len() {
         return Err(format!(
-            "add_text_tiles returned {} anchors for {} bands -- every band must get exactly one \
+            "add_text_tiles returned {} anchors for {} bands; every band must get exactly one \
              TextDisplay, or the wiring below would drive the wrong rows",
             text_ids.len(),
             plan.len()
@@ -342,16 +343,7 @@ pub fn build_text_world(
         y: CHIP_SHELL_POS.y + centre_shift,
         ..CHIP_SHELL_POS
     };
-    let mut chip = chip::new_chip(
-        &mut world,
-        shell_pos,
-        Vector3f {
-            x: shell_pos.x as f32,
-            y: shell_pos.y as f32,
-            z: (band_lift + 20) as f32,
-        },
-        IntVector { x: 5, y: 5, z: 5 },
-    );
+    let mut chip = chip::new_chip(&mut world, shell_pos, IntVector { x: 5, y: 5, z: 5 });
 
     let bank_size = opts.bank_size.max(1);
     let n_banks = frame_count.div_ceil(bank_size).max(1);
@@ -424,111 +416,162 @@ pub fn build_text_world(
         &service,
     );
 
-    // --- 10. Two gates per band, per bank -----------------------------------
+    // --- 9. Refs driver: one loop over the bands -----------------------------
     //
-    // Walked in band order, which is image-row order -- never by iterating a
-    // map, so two runs of the same clip mint the same brick ids.
-    //
-    // A bank boundary costs one extra ArrayVar + Get + Select per band, which
-    // at 54 bands is cheap in absolute terms (three orders of magnitude under
-    // colour-array mode's per-pixel seam) -- and it only bites past
-    // `BANK_FRAMES` (65 535) frames, about 90 minutes at 12 fps.
-    for (bi, texts) in band_texts.into_iter().enumerate() {
-        // Polled per band, the same way both brick modes poll per pixel. There
-        // are only tens of bands rather than thousands of pixels, but a band
-        // carries one string per frame and copies the lot into its `ArrayVar`,
-        // so an iteration here is far from free on a long clip.
-        if progress.is_cancelled() {
-            return Ok(World::new());
-        }
-        debug_assert_eq!(
-            texts.len(),
-            frame_count,
-            "every band must hold one string per frame"
+    // Every band's frame strings are one member of an array of arrays on the
+    // main grid; a second array holds refs to the bands' `TextDisplay`s. The
+    // refs are written after `register_used_components` (`refs_fill`).
+    let mut refs_fill = None;
+    if opts.driver == super::bricks::Driver::Refs && n_banks > 1 {
+        log::info!("{frame_count} frames do not fit one array per band; using wires");
+    }
+    if opts.driver == super::bricks::Driver::Refs && n_banks == 1 {
+        let at = |k: usize| Position {
+            y: shell_pos.y + (k as i32 + 1) * super::layout::CELL,
+            ..shell_pos
+        };
+        let n = band_texts.len();
+        // One band's strings can pass a gigabyte, so bands spread over chunks
+        // (a chunk is one `.brz` blob, capped at 2 GiB).
+        let texts = crate::graph::ArrayOfArrays::add_spread(
+            &mut world,
+            band_texts.into_iter().map(WireArray::Str).collect(),
+            at,
+            opts.chunk_bytes,
         );
-        let row = bi as i32;
-        let banks = pack::bank_frames(&texts, bank_size);
-        debug_assert_eq!(
-            banks.len(),
-            n_banks,
-            "every band's string list must bank identically -- they are all frame_count long"
+        let targets = text_ids
+            .iter()
+            .map(|id| {
+                let i = world.bricks.iter().position(|b| b.id == Some(*id)).expect("band anchor");
+                (i, TEXT_DISPLAY)
+            })
+            .collect();
+        let displays = crate::graph::RefArray::add(&mut world, at(n + 1), targets);
+        let g = super::text_refs::text_loop_graph(
+            n,
+            super::text_refs::TextLoopPorts {
+                frame_index: crate::graph::End::ext(&frame_index),
+                on_change: crate::graph::End::ext(&entry_of_bank[0]),
+                texts: texts.port(),
+                displays: displays.port(),
+            },
         );
+        g.emit(
+            &mut world,
+            &mut chip,
+            &crate::graph::EmitPlacement {
+                root_origin: service(0, -6),
+                root_columns: 8,
+            },
+        )?;
+        refs_fill = Some((texts, displays));
+    } else {
+        // --- 10. Two gates per band, per bank -----------------------------------
+        //
+        // Walked in band order, which is image-row order -- never by iterating a
+        // map, so two runs of the same clip mint the same brick ids.
+        //
+        // A bank boundary costs one extra ArrayVar + Get + Select per band, which
+        // at 54 bands is cheap in absolute terms (three orders of magnitude under
+        // colour-array mode's per-pixel seam) -- and it only bites past
+        // `BANK_FRAMES` (65 535) frames, about 90 minutes at 12 fps.
+        for (bi, texts) in band_texts.into_iter().enumerate() {
+            // Polled per band, the same way both brick modes poll per pixel. There
+            // are only tens of bands rather than thousands of pixels, but a band
+            // carries one string per frame and copies the lot into its `ArrayVar`,
+            // so an iteration here is far from free on a long clip.
+            if progress.is_cancelled() {
+                return Ok(World::new());
+            }
+            debug_assert_eq!(
+                texts.len(),
+                frame_count,
+                "every band must hold one string per frame"
+            );
+            let row = bi as i32;
+            let banks = pack::bank_frames(&texts, bank_size);
+            debug_assert_eq!(
+                banks.len(),
+                n_banks,
+                "every band's string list must bank identically, since they are all frame_count long"
+            );
 
-        // One (ArrayVar, Get) pair per bank, each pair on its own two stages.
-        let mut get_of_bank = Vec::with_capacity(n_banks);
-        for (k, frames) in banks.iter().enumerate() {
-            let array_stage = STAGES_PER_BANK * k as i32;
-            let array = gate(
-                &mut chip,
-                "B_1x1_Gate_Variable_Array",
-                ARRAY_VAR,
-                lattice_pos_staged(0, row, array_stage, n_bands, GATE_HALF, STAGE_PITCH),
-                vec![(
-                    "Value",
-                    Box::new(WireArrayVariant::StringArray(frames.to_vec()))
-                        as Box<dyn AsBrdbValue>,
-                )],
-            );
-            let get = gate(
-                &mut chip,
-                "B_1x1_Gate_Exec_ArrayVar_Get",
-                ARRAY_GET,
-                lattice_pos_staged(0, row, array_stage + 1, n_bands, GATE_HALF, STAGE_PITCH),
-                vec![],
-            );
+            // One (ArrayVar, Get) pair per bank, each pair on its own two stages.
+            let mut get_of_bank = Vec::with_capacity(n_banks);
+            for (k, frames) in banks.iter().enumerate() {
+                let array_stage = STAGES_PER_BANK * k as i32;
+                let array = gate(
+                    &mut chip,
+                    "B_1x1_Gate_Variable_Array",
+                    ARRAY_VAR,
+                    lattice_pos_staged(0, row, array_stage, n_bands, GATE_HALF, STAGE_PITCH),
+                    vec![(
+                        "Value",
+                        Box::new(WireArray::Str(frames.to_vec()))
+                            as Box<dyn AsBrdbValue>,
+                    )],
+                );
+                let get = gate(
+                    &mut chip,
+                    "B_1x1_Gate_Exec_ArrayVar_Get",
+                    ARRAY_GET,
+                    lattice_pos_staged(0, row, array_stage + 1, n_bands, GATE_HALF, STAGE_PITCH),
+                    vec![],
+                );
+                world.add_wire_connection(
+                    WirePort::new(array, ARRAY_VAR, "ArrayVarRef"),
+                    WirePort::new(get, ARRAY_GET, "ArrayVarRef"),
+                );
+                world.add_wire_connection(
+                    index_of_bank[k].clone(),
+                    WirePort::new(get, ARRAY_GET, "Index"),
+                );
+                // The fan-out: one exec source drives every band's Get for this
+                // bank; no chaining, and no exec input ever gains a second source.
+                world.add_wire_connection(
+                    entry_of_bank[k].clone(),
+                    WirePort::new(get, ARRAY_GET, "Exec"),
+                );
+                get_of_bank.push(get);
+            }
+
+            // Value: one select per boundary, cascading. For a frame in bank j,
+            // ge[0..j] are true so select j picks bank j and every later select
+            // passes it through unchanged.
+            let mut value = WirePort::new(get_of_bank[0], ARRAY_GET, "Value");
+            for k in 1..n_banks {
+                let sel = gate(
+                    &mut chip,
+                    "B_1x1_Gate_Expr_Select",
+                    SELECT,
+                    lattice_pos_staged(
+                        0,
+                        row,
+                        STAGES_PER_BANK * n_banks as i32 + k as i32 - 1,
+                        n_bands,
+                        GATE_HALF,
+                        STAGE_PITCH,
+                    ),
+                    vec![],
+                );
+                world.add_wire_connection(ge[k - 1].clone(), WirePort::new(sel, SELECT, "bSelectB"));
+                world.add_wire_connection(value, WirePort::new(sel, SELECT, "InputA"));
+                world.add_wire_connection(
+                    WirePort::new(get_of_bank[k], ARRAY_GET, "Value"),
+                    WirePort::new(sel, SELECT, "InputB"),
+                );
+                value = WirePort::new(sel, SELECT, "Output");
+            }
+
+            // Chip -> main grid. The two endpoints live in different grids and
+            // `World::add_wire_connection` emits the `RemoteWirePortSource` itself;
+            // nothing extra is needed for a TextDisplay -- it is an ordinary
+            // component with an ordinary input port.
             world.add_wire_connection(
-                WirePort::new(array, ARRAY_VAR, "ArrayVarRef"),
-                WirePort::new(get, ARRAY_GET, "ArrayVarRef"),
+                value,
+                WirePort::new(text_ids[bi], TEXT_DISPLAY, TEXT_PORT),
             );
-            world.add_wire_connection(
-                index_of_bank[k].clone(),
-                WirePort::new(get, ARRAY_GET, "Index"),
-            );
-            // The fan-out: one exec source drives every band's Get for this
-            // bank; no chaining, and no exec input ever gains a second source.
-            world.add_wire_connection(
-                entry_of_bank[k].clone(),
-                WirePort::new(get, ARRAY_GET, "Exec"),
-            );
-            get_of_bank.push(get);
         }
-
-        // Value: one select per boundary, cascading. For a frame in bank j,
-        // ge[0..j] are true so select j picks bank j and every later select
-        // passes it through unchanged.
-        let mut value = WirePort::new(get_of_bank[0], ARRAY_GET, "Value");
-        for k in 1..n_banks {
-            let sel = gate(
-                &mut chip,
-                "B_1x1_Gate_Expr_Select",
-                SELECT,
-                lattice_pos_staged(
-                    0,
-                    row,
-                    STAGES_PER_BANK * n_banks as i32 + k as i32 - 1,
-                    n_bands,
-                    GATE_HALF,
-                    STAGE_PITCH,
-                ),
-                vec![],
-            );
-            world.add_wire_connection(ge[k - 1].clone(), WirePort::new(sel, SELECT, "bSelectB"));
-            world.add_wire_connection(value, WirePort::new(sel, SELECT, "InputA"));
-            world.add_wire_connection(
-                WirePort::new(get_of_bank[k], ARRAY_GET, "Value"),
-                WirePort::new(sel, SELECT, "InputB"),
-            );
-            value = WirePort::new(sel, SELECT, "Output");
-        }
-
-        // Chip -> main grid. The two endpoints live in different grids and
-        // `World::add_wire_connection` emits the `RemoteWirePortSource` itself;
-        // nothing extra is needed for a TextDisplay -- it is an ordinary
-        // component with an ordinary input port.
-        world.add_wire_connection(
-            value,
-            WirePort::new(text_ids[bi], TEXT_DISPLAY, TEXT_PORT),
-        );
     }
 
     // --- 10b. Subtitles, if any ---------------------------------------------
@@ -622,12 +665,22 @@ pub fn build_text_world(
     //
     // Same as both brick modes: default-on physical buttons on the main grid,
     // wired into the clock's control pins, skipped under `--external-clock` and
-    // when off. Placed beyond the picture's own x extent by `control_anchor`, so
-    // it clears the glyph wall and the subtitle anchor just added. Before
-    // `chip::finish` (its overlap check must see them) and before the final
-    // `register_used_components`.
+    // when off. Before `chip::finish` (its overlap check must see them) and
+    // before the final `register_used_components`.
+    //
+    // Not at `control_anchor`, which is past the greatest x of every main-grid
+    // brick: here that is the chip and the record arrays, so the row stood
+    // well out in front of the picture. The buttons stand on the ground
+    // against the glyph wall instead, just past its left edge, running away
+    // from the picture along +y. The chip and arrays sit further out in x
+    // (`CHIP_SHELL_POS`), and the subtitle anchor sits right of the left
+    // edge, so neither shares this spot.
     if let (true, Some((pause, restart, resume))) = (opts.control_buttons, control_pins) {
-        let anchor = controls::control_anchor(&world);
+        let anchor = Position {
+            x: picture_front_x + crate::text::ANCHOR_CUBE_HALF + 1,
+            y: picture_left_y + crate::text::ANCHOR_CUBE_HALF + 1,
+            z: 0,
+        };
         controls::add_control_buttons(&mut world, pause, restart, resume, anchor);
     }
 
@@ -648,6 +701,10 @@ pub fn build_text_world(
     // grids and wires first. `add_text_tiles` already called it once, before
     // the chip existed -- this re-registration is the one that counts.
     world.register_used_components();
+    if let Some((texts, displays)) = refs_fill {
+        texts.fill(&mut world)?;
+        displays.fill(&mut world)?;
+    }
     Ok(world)
 }
 
@@ -805,7 +862,7 @@ mod tests {
     use crate::anim::text_layout::plan_bands;
     use crate::progress::NoProgress;
     use crate::video::Clip;
-    use brdb::{IntoReader, Position, schema::WireArrayVariant};
+    use brdb::{IntoReader, Position};
     use image::{Rgba, RgbaImage};
 
     /// An in-memory [`crate::video::stream::FrameSource`] whose every
@@ -912,12 +969,12 @@ mod tests {
         let c = clip(32, 16, TOTAL_FRAMES);
 
         let mut cancelled = CancelAfter { cancel_after: 4, ..Default::default() };
-        let stopped = build_text_world(&c, &AnimOptions::default(), &mut cancelled)
+        let stopped = build_text_world(&c, &AnimOptions::wired(), &mut cancelled)
             .expect("a cancelled render must be Ok, not an error");
 
         let mut ran =
             CancelAfter { cancel_after: TOTAL_FRAMES as u64 + 1, ..Default::default() };
-        let full = build_text_world(&c, &AnimOptions::default(), &mut ran).expect("build");
+        let full = build_text_world(&c, &AnimOptions::wired(), &mut ran).expect("build");
         assert!(
             !full.bricks.is_empty() && !full.grids.is_empty(),
             "the uncancelled control must actually build a graph"
@@ -943,7 +1000,7 @@ mod tests {
     #[test]
     fn a_cancel_while_sampling_the_palette_skips_the_encode_pass_entirely() {
         let c = clip(32, 16, 60);
-        let opts = AnimOptions { colors: 16, ..AnimOptions::default() };
+        let opts = AnimOptions { colors: 16, ..AnimOptions::wired() };
 
         let mut cancelled = CancelAfter { cancel_after: 3, ..Default::default() };
         let stopped = build_text_world(&c, &opts, &mut cancelled)
@@ -953,7 +1010,7 @@ mod tests {
         assert_eq!(
             cancelled.phases,
             ["sampling colours"],
-            "the render must stop after the palette pass -- a 'packing frames' phase here \
+            "the render must stop after the palette pass; a 'packing frames' phase here \
              means the encode traversal ran anyway"
         );
         assert!(stopped.bricks.is_empty(), "a cancelled render must place no text bricks");
@@ -1021,12 +1078,12 @@ mod tests {
         for chunk in &db.brick_chunk_index(gid).expect("chunk index") {
             let (_soa, structs) = db.component_chunk(gid, chunk.index).expect("components");
             for s in &structs {
-                if s.get_name() == "BrickComponentData_WireGraphPseudo_ArrayVar"
+                if s.get_name() == "BrickComponentData_ArrayVar"
                     && let Some(value) = s.get("Value")
                 {
-                    let variant: WireArrayVariant =
+                    let variant: WireArray =
                         value.try_into().expect("ArrayVar Value must decode");
-                    if let WireArrayVariant::StringArray(v) = variant {
+                    if let WireArray::Str(v) = variant {
                         tags += v.iter().map(|s| s.matches("<color=\"").count()).sum::<usize>();
                     }
                 }
@@ -1038,7 +1095,7 @@ mod tests {
 
     #[test]
     fn every_band_gets_one_array_and_one_get() {
-        let opts = AnimOptions { colors: 0, ..AnimOptions::default() };
+        let opts = AnimOptions { colors: 0, ..AnimOptions::wired() };
         let w = build_text_world(&clip(8, 8, 4), &opts, &mut NoProgress).unwrap();
         let bands = plan_bands(8, 8, opts.text.char_repeat).unwrap().len();
         assert_eq!(count_components(&w, ARRAY_VAR), bands);
@@ -1047,7 +1104,7 @@ mod tests {
 
     #[test]
     fn no_inner_grid_coordinate_is_negative() {
-        let opts = AnimOptions::default();
+        let opts = AnimOptions::wired();
         let w = build_text_world(&clip(8, 8, 4), &opts, &mut NoProgress).unwrap();
         for pos in inner_grid_positions(&w) {
             assert!(
@@ -1057,11 +1114,42 @@ mod tests {
         }
     }
 
+    /// The buttons stand against the glyph wall, beside its left edge: not
+    /// past the chip and the record arrays, which put them well out in front.
+    #[test]
+    fn control_buttons_stand_against_the_wall_beside_its_left_edge() {
+        for opts in [AnimOptions::default(), AnimOptions::wired()] {
+            let w = build_text_world(&clip(64, 36, 2), &opts, &mut NoProgress).unwrap();
+            // The button labels are TextDisplays too, so take the wall from
+            // the cubes alone.
+            let cubes: Vec<Position> = w
+                .bricks
+                .iter()
+                .filter(|b| !b.collision.player)
+                .map(|b| b.position)
+                .collect();
+            let wall_x = cubes.iter().map(|p| p.x).max().unwrap();
+            let left_y = cubes.iter().map(|p| p.y).max().unwrap();
+            let buttons: Vec<Position> = w
+                .bricks
+                .iter()
+                .filter(|b| b.asset == brdb::BrickType::from("B_Button"))
+                .map(|b| b.position)
+                .collect();
+            assert_eq!(buttons.len(), 3, "{:?}", opts.driver);
+            for b in buttons {
+                assert!(b.x - wall_x <= 10, "button {b:?} stands off the wall at x {wall_x}");
+                assert!(b.y > left_y && b.y - left_y <= 30, "button {b:?} not beside y {left_y}");
+                assert!(b.z <= 5, "button {b:?} is off the ground");
+            }
+        }
+    }
+
     #[test]
     fn each_band_anchor_sits_at_its_own_image_row_with_no_depth_stack() {
         // Buttons off: their labels are TextDisplays too, and this counts and
         // positions the picture's band anchors, not the control labels.
-        let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+        let opts = AnimOptions { control_buttons: false, ..AnimOptions::wired() };
         let w = build_text_world(&clip(192, 8, 2), &opts, &mut NoProgress).unwrap();
         let anchors = text_anchor_positions(&w);
         assert_eq!(anchors.len(), plan_bands(192, 8, opts.text.char_repeat).unwrap().len());
@@ -1090,7 +1178,7 @@ mod tests {
             (192, 108, 2, usize::MAX, "wide"),
             (64, 16, 5, 2, "banked"),
         ] {
-            let opts = AnimOptions { bank_size, ..AnimOptions::default() };
+            let opts = AnimOptions { bank_size, ..AnimOptions::wired() };
             let world = build_text_world(&clip(w, h, frames), &opts, &mut NoProgress)
                 .unwrap_or_else(|e| panic!("{w}x{h}x{frames} bank {bank_size} must build: {e}"));
             let path = std::env::temp_dir().join(format!(
@@ -1112,8 +1200,8 @@ mod tests {
     fn quantizing_reduces_the_tag_count_on_a_gradient() {
         // Same clip, same layout, palette on vs off: the palette must produce
         // strictly fewer colour tags, which is the entire reason it exists.
-        let off = AnimOptions { colors: 0, ..AnimOptions::default() };
-        let on = AnimOptions { colors: 8, ..AnimOptions::default() };
+        let off = AnimOptions { colors: 0, ..AnimOptions::wired() };
+        let on = AnimOptions { colors: 8, ..AnimOptions::wired() };
         let tags = |o: &AnimOptions| {
             total_color_tags(&build_text_world(&gradient_clip(), o, &mut NoProgress).unwrap())
         };
@@ -1125,7 +1213,7 @@ mod tests {
         let opts = AnimOptions {
             // parameterised so the seam is testable cheaply
             bank_size: 2,
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         let w = build_text_world(&clip(8, 8, 5), &opts, &mut NoProgress).unwrap();
         let bands = plan_bands(8, 8, opts.text.char_repeat).unwrap().len();
@@ -1223,7 +1311,7 @@ mod tests {
     fn a_zero_frame_clip_is_rejected() {
         let c = Clip { width: 8, height: 8, fps: 10.0, frames: Vec::new() };
         assert!(
-            build_text_world(&c, &AnimOptions::default(), &mut NoProgress)
+            build_text_world(&c, &AnimOptions::wired(), &mut NoProgress)
                 .map(|_| ())
                 .is_err(),
             "an empty clip must not produce a \"successful\" save"
@@ -1234,7 +1322,7 @@ mod tests {
     /// common case is wired exactly as the in-game-verified probe wired it.
     #[test]
     fn a_single_bank_render_emits_no_spillover_gates() {
-        let w = build_text_world(&clip(8, 8, 5), &AnimOptions::default(), &mut NoProgress).unwrap();
+        let w = build_text_world(&clip(8, 8, 5), &AnimOptions::wired(), &mut NoProgress).unwrap();
         for class in [COMPARE_GE, BRANCH, SELECT, SUBTRACT] {
             assert_eq!(
                 count_components(&w, class),
@@ -1249,7 +1337,7 @@ mod tests {
     #[test]
     fn no_exec_input_ever_has_two_sources() {
         for bank_size in [usize::MAX, 3, 2, 1] {
-            let opts = AnimOptions { bank_size, ..AnimOptions::default() };
+            let opts = AnimOptions { bank_size, ..AnimOptions::wired() };
             let w = build_text_world(&clip(64, 24, 7), &opts, &mut NoProgress).expect("build");
             let mut seen = std::collections::HashSet::new();
             for wire in &w.wires {
@@ -1270,7 +1358,7 @@ mod tests {
     /// `Text` port -- one band, one string, no crossing over.
     #[test]
     fn every_text_display_is_driven_exactly_once() {
-        let opts = AnimOptions::default();
+        let opts = AnimOptions::wired();
         let w = build_text_world(&clip(64, 16, 3), &opts, &mut NoProgress).expect("build");
         let bands = plan_bands(64, 16, opts.text.char_repeat).unwrap().len();
         let mut fed = std::collections::HashMap::new();
@@ -1287,12 +1375,11 @@ mod tests {
         );
     }
 
-    /// The headline number: a 192x108 screen is 36 bands at the default one
-    /// glyph per pixel, so a single-bank render must cost exactly `2 * 36 + 7`
+    /// The headline number: a 192x108 screen is 11 bands at the default one
+    /// glyph per pixel, so a single-bank render must cost exactly `2 * 11 + 7`
     /// gates -- two per band plus the shared clock chain and change detector
-    /// -- against brick mode's 2 per pixel. (It was 54 bands while a square
-    /// pixel took two characters; the `width_scale` ~2 presets buy a third of
-    /// the bands back.) Gates are every inner-grid brick that is not one of
+    /// -- against brick mode's 2 per pixel. (It was 36 bands under the old
+    /// 10,000-character string limit.) Gates are every inner-grid brick that is not one of
     /// the chip's five I/O pins (Pause, Restart, Resume, Rate, Done), counted
     /// the same way `tests/anim_color.rs` counts them.
     #[test]
@@ -1300,10 +1387,10 @@ mod tests {
         // Buttons off: `w.bricks.len()` below counts the band anchor cubes and
         // the shell, not the default-on control buttons (3 more main-grid
         // bricks). The inner-grid gate count is unaffected by them either way.
-        let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+        let opts = AnimOptions { control_buttons: false, ..AnimOptions::wired() };
         let w = build_text_world(&clip(192, 108, 2), &opts, &mut NoProgress).expect("build");
         let bands = plan_bands(192, 108, opts.text.char_repeat).unwrap().len();
-        assert_eq!(bands, 36, "192 wide at char_repeat 1 bands 3 rows at a time");
+        assert_eq!(bands, 11, "192 wide at char_repeat 1 bands 10 rows at a time");
         assert_eq!(
             w.grids[0].1.len() - 7,
             2 * bands + 7,

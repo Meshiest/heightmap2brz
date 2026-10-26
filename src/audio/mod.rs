@@ -4,10 +4,12 @@ pub mod cost;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ffmpeg_src;
 pub mod oneshot_sounds;
+pub mod midi_functions;
 pub mod percussion;
 pub mod presets;
 pub mod source;
 pub mod speakers;
+pub mod stream_refs;
 pub mod stft;
 pub mod symphonia_src;
 pub mod track;

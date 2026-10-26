@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(
             err, symphonias_own,
             "Auto must hand back symphonia's error unchanged when ffmpeg was never a genuine \
-             option -- the user's real problem is the file"
+             option; the user's real problem is the file"
         );
         let _ = std::fs::remove_file(&path);
     }

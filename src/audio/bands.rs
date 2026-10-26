@@ -341,7 +341,7 @@ mod tests {
                     assert!(
                         off_cents.abs() < 0.02,
                         "subdiv {subdiv}, {tonal} bands: band {k} pitch {pitch} is \
-                         {off_cents:.4} cents off grid step {} -- not an exact interval",
+                         {off_cents:.4} cents off grid step {}, not an exact interval",
                         steps.round()
                     );
                     // ...and it must be the step the plan claims it is.

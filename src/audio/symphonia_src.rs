@@ -318,7 +318,7 @@ impl AudioStream for SymphoniaStream {
                 self.done = true;
                 return Err(format!(
                     "{} decoded a non-finite sample ({value}) at source sample {at} \
-                     ({:.3}s in) -- the file is corrupt or truncated",
+                     ({:.3}s in); the file is corrupt or truncated",
                     self.label,
                     at as f64 / spec.rate as f64,
                 ));
@@ -608,7 +608,7 @@ mod tests {
             .fold((0, 0.0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
         assert!(
             err < 1e-3,
-            "sample {at} is {err} away from the offline resample -- the streaming resampler's \
+            "sample {at} is {err} away from the offline resample: the streaming resampler's \
              position or previous-sample state is not surviving the packet boundary"
         );
         let _ = std::fs::remove_file(&path);

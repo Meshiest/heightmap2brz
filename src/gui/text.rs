@@ -229,7 +229,7 @@ impl TextApp {
     }
 
     fn draw_settings(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
-        ui.label("Render an image as TextDisplay component bricks -- one colored glyph per pixel.");
+        ui.label("Render an image as TextDisplay component bricks, one colored glyph per pixel.");
 
         widgets::settings_table(ui, |ui, t| {
             save_destination_row(t, ui, shared);
@@ -460,7 +460,7 @@ impl TextApp {
                             ui.label("Font Size");
                             ui.add(egui::DragValue::new(&mut self.line_height).speed(0.01))
                                 .on_hover_text(
-                                    "The TextDisplay LineHeight field -- the game's font size.                                  Scales the glyphs; presets derive it from Pixel Size",
+                                    "The TextDisplay LineHeight field: the game's font size. Scales the glyphs; presets derive it from Pixel Size",
                                 );
                             ui.label("LineOffset");
                             ui.add(egui::DragValue::new(&mut self.line_offset).speed(0.05));
@@ -506,7 +506,7 @@ impl TextApp {
                                 .on_hover_text(
                                     "Writes calibrate.brz: a 128px checkerboard rendered like a \
                                      normal export (current mode included), with labeled number \
-                                     Variable gates wired into EVERY text component -- edit a \
+                                     Variable gates wired into EVERY text component; edit a \
                                      variable in-game and the whole grid updates live.",
                                 )
                                 .clicked()
@@ -639,7 +639,7 @@ mod tests {
         assert!(
             brdb_bytes.starts_with(b"SQLite format 3"),
             "a .brdb destination must hold a brdb (SQLite) database, not BRZ bytes under a \
-             .brdb name -- got {:02x?}",
+             .brdb name (got {:02x?})",
             &brdb_bytes[..brdb_bytes.len().min(16)]
         );
 

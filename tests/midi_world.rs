@@ -187,3 +187,26 @@ fn a_uniform_tone_gives_every_speaker_the_same_wave() {
     assert!(score.voices.iter().all(|s| s.synth == SynthWave::Triangle));
     build_midi_event_world(&score, &opts).expect("build");
 }
+
+#[test]
+fn function_playheads_build_and_every_wire_resolves() {
+    let bytes = two_instrument_smf();
+    let gates = |functions: bool, in_chip: bool| {
+        let opts = MidiOptions { functions, speakers_in_chip: in_chip, ..MidiOptions::default() };
+        let score = analyze_midi(&bytes, &opts).expect("analyze");
+        let world = build_midi_event_world(&score, &opts).expect("build");
+        let path = std::env::temp_dir().join(format!("h2b_midi_fn_{functions}_{in_chip}_{}.brz", std::process::id()));
+        std::fs::write(&path, world.to_brz_vec().expect("encode")).expect("write");
+        let result = std::panic::catch_unwind(|| wire_integrity::assert_wires_valid(&path));
+        let _ = std::fs::remove_file(&path);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+        world.grids.iter().map(|(_, b)| b.len()).sum::<usize>()
+    };
+    // The per-speaker saving (3 gates against ~16) is pinned in
+    // tests/midi_functions.rs; here, both layouts must write cleanly.
+    for in_chip in [false, true] {
+        assert!(gates(true, in_chip) > 0);
+    }
+}

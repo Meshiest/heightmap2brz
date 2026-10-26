@@ -19,13 +19,14 @@ use crate::anim::chip::{Chip, add_input_pin, finish, new_chip, pin_source};
 use crate::anim::clock::{MULTIPLY, build_clock, gate};
 use crate::anim::layout::{GATE_HALF, STAGE_BASE_Z, STAGE_PITCH, lattice_pos_staged};
 use brdb::{
-    AsBrdbValue, Brick, BrickType, IntVector, Position, Vector3f, WirePort, World,
+    AsBrdbValue, Brick, BrickType, IntVector, Position, WirePort, World,
     assets::{
         LiteralComponent,
         external::{ASSET_TYPES, BA_SYNTH_NOISE_PINK, BA_SYNTH_NOISE_WHITE},
     },
-    schema::{BrdbValue, WireArrayVariant, WireVariant},
+    schema::{BrdbValue, WireValue},
 };
+use crate::wire_array::WireArray;
 
 /// The emitter component's type name: a plain `Component_*` (no
 /// `BrickComponentType_` prefix), resolved by unvalidated string lookup, so a
@@ -36,11 +37,11 @@ pub const SPEAKER_BRICK: &str = "B_1x1F_Speaker";
 /// One-tick delay gate: its `Output` is whatever reached its `Input` one game
 /// tick ago. Used by [`scaffold`] to compare the clock's `Time` against its own
 /// previous value and so detect whether the clock is advancing.
-pub const BUFFER_TICKS: &str = "BrickComponentType_WireGraphPseudo_BufferTicks";
+pub const BUFFER_TICKS: &str = "BrickComponentType_BufferTicks";
 /// `!=` comparator: its `bOutput` is true while `InputA` differs from `InputB`.
 /// [`scaffold`] feeds it `Time` and last tick's `Time`, so `bOutput` is "the
 /// clock is moving".
-pub const COMPARE_NE: &str = "BrickComponentType_WireGraph_Expr_CompareNotEqual";
+pub const COMPARE_NE: &str = "BrickComponentType_Expr_CompareNotEqual";
 /// The external asset type every synth descriptor lives under.
 pub const AUDIO_ASSET_TYPE: &str = "BrickAudioDescriptor";
 /// `B_1x1F_Speaker`'s true half-extents, from the game's brick catalog. Not
@@ -219,10 +220,10 @@ fn add_emitter(
 ) -> Result<usize, String> {
     let mut data: std::collections::HashMap<brdb::BString, Box<dyn AsBrdbValue>> =
         std::collections::HashMap::new();
-    // Bare `f32`, not a `WireVariant`: the schema declares PitchMultiplier and
+    // Bare `f32`, not a `WireValue`: the schema declares PitchMultiplier and
     // VolumeMultiplier as plain f32 fields, not the tagged wire-graph union
-    // gate ports use, so a WireVariant here compiles and fails at encode with
-    // UnimplementedCast("f32", WireVariant).
+    // gate ports use, so a WireValue here compiles and fails at encode with
+    // UnimplementedCast("f32", WireValue).
     data.insert(
         "PitchMultiplier".into(),
         Box::new(pitch) as Box<dyn AsBrdbValue>,
@@ -322,11 +323,6 @@ fn scaffold(
             y: 0,
             z: 2,
         },
-        Vector3f {
-            x: chip_x as f32,
-            y: 0.0,
-            z: 40.0,
-        },
         IntVector {
             x: 10,
             y: 10,
@@ -384,11 +380,11 @@ fn scaffold(
     // clicks instead of just silencing on pause. Fallback: key off the Pause
     // exec with an `Exec_Toggle` latch instead of Time-change detection.
     //
-    // `TicksToWait` is a bare `i32` (not a `WireVariant`); the `Select`'s
-    // `InputA`/`InputB` are `WireVariant::Number`.
+    // `TicksToWait` is a bare `i32` (not a `WireValue`); the `Select`'s
+    // `InputA`/`InputB` are `WireValue::Number`.
     let buffer = gate(
         &mut chip,
-        "B_1x1_Gate_Pseudo_BufferTicks",
+        "B_1x1_Gate_BufferTicks",
         BUFFER_TICKS,
         service(0, -3),
         vec![("TicksToWait", Box::new(1i32) as Box<dyn AsBrdbValue>)],
@@ -419,11 +415,11 @@ fn scaffold(
         vec![
             (
                 "InputA",
-                Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
+                Box::new(WireValue::Number(0.0)) as Box<dyn AsBrdbValue>,
             ),
             (
                 "InputB",
-                Box::new(WireVariant::Number(VOLUME_SCALE)) as Box<dyn AsBrdbValue>,
+                Box::new(WireValue::Number(VOLUME_SCALE)) as Box<dyn AsBrdbValue>,
             ),
         ],
     );
@@ -450,7 +446,7 @@ fn scaffold(
 /// InputB inlines VOLUME_SCALE (1.0) so an untouched chip renders identically.
 /// The unwired-Volume-pin unity default lives on the Select's own InputB (see
 /// [`scaffold`]); this literal is a fallback if that wire were ever absent.
-/// TYPE TRAP: MathMultiply ports are WireVariant::Number, unlike the emitter's
+/// TYPE TRAP: MathMultiply ports are WireValue::Number, unlike the emitter's
 /// bare-f32 PitchMultiplier/VolumeMultiplier. Not interchangeable.
 fn volume_multiply(
     world: &mut World,
@@ -467,7 +463,7 @@ fn volume_multiply(
         service(slot as i32, row),
         vec![(
             "InputB",
-            Box::new(WireVariant::Number(VOLUME_SCALE)) as Box<dyn AsBrdbValue>,
+            Box::new(WireValue::Number(VOLUME_SCALE)) as Box<dyn AsBrdbValue>,
         )],
     );
     world.add_wire_connection(
@@ -539,7 +535,7 @@ fn build_stream_cascade(
             service(k as i32, -6),
             vec![(
                 "InputB",
-                Box::new(WireVariant::Number((k * bank_size) as f64)) as Box<dyn AsBrdbValue>,
+                Box::new(WireValue::Number((k * bank_size) as f64)) as Box<dyn AsBrdbValue>,
             )],
         );
         world.add_wire_connection(frame_index.clone(), WirePort::new(sub, SUBTRACT, "InputA"));
@@ -555,7 +551,7 @@ fn build_stream_cascade(
             service(k as i32, -7),
             vec![(
                 "InputB",
-                Box::new(WireVariant::Int((k * bank_size) as i64)) as Box<dyn AsBrdbValue>,
+                Box::new(WireValue::Int((k * bank_size) as i64)) as Box<dyn AsBrdbValue>,
             )],
         );
         world.add_wire_connection(frame_index.clone(), WirePort::new(cmp, COMPARE_GE, "InputA"));
@@ -582,7 +578,7 @@ fn build_stream_cascade(
                 service(col, -5),
                 vec![(
                     "Value",
-                    Box::new(WireArrayVariant::DoubleArray(slice)) as Box<dyn AsBrdbValue>,
+                    Box::new(WireArray::F64(slice)) as Box<dyn AsBrdbValue>,
                 )],
             );
             let get = gate(
@@ -654,10 +650,76 @@ fn build_stream_cascade(
     }
 }
 
+/// The main-grid arrays the refs driver writes component refs into after
+/// `register_used_components`.
+struct RefStreams {
+    volumes: crate::graph::ArrayOfArrays,
+    pitches: Option<crate::graph::ArrayOfArrays>,
+    emitters: crate::graph::RefArray,
+}
+
+impl RefStreams {
+    fn fill(&self, world: &mut World) -> Result<(), String> {
+        self.volumes.fill(world)?;
+        if let Some(p) = &self.pitches {
+            p.fill(world)?;
+        }
+        self.emitters.fill(world)
+    }
+}
+
+/// The refs driver's speaker loop ([`super::stream_refs`]): per-speaker value
+/// arrays and the emitter refs on the main grid beside the chip, and one loop
+/// in the chip.
+fn ref_streams(
+    world: &mut World,
+    sc: &mut Scaffold,
+    speaker_ids: &[usize],
+    volumes: Vec<Vec<f64>>,
+    pitches: Option<Vec<Vec<f64>>>,
+    frame_count: usize,
+    opts: &AudioOptions,
+) -> Result<RefStreams, String> {
+    use crate::graph::{ArrayOfArrays, EmitPlacement, End, RefArray};
+    use super::stream_refs::{StreamPorts, stream_loop_graph};
+    if opts.speakers_in_chip {
+        return Err("--driver refs reaches the speakers through main-grid refs; drop --speakers-in-chip".into());
+    }
+    if frame_count > opts.bank_size {
+        return Err(format!(
+            "--driver refs keeps each speaker's frames in one array of at most {} entries, and this track has {frame_count} frames; shorten it or use --driver wires",
+            opts.bank_size
+        ));
+    }
+    let n = speaker_ids.len();
+    let x = -(speaker_half().x * 4) - 4 * crate::anim::layout::CELL;
+    let at = move |k: usize| Position { x, y: k as i32 * crate::anim::layout::CELL, z: 2 };
+    let volumes = ArrayOfArrays::add(world, volumes.into_iter().map(WireArray::F64).collect(), at);
+    let pitches = pitches.map(|p| ArrayOfArrays::add(world, p.into_iter().map(WireArray::F64).collect(), move |k| at(n + 1 + k)));
+    let base = if pitches.is_some() { 2 * (n + 1) } else { n + 1 };
+    let targets = speaker_ids
+        .iter()
+        .map(|id| (world.bricks.iter().position(|b| b.id == Some(*id)).expect("speaker brick"), AUDIO_EMITTER))
+        .collect();
+    let emitters = RefArray::add(world, at(base), targets);
+    let g = stream_loop_graph(n, StreamPorts {
+        frame_index: End::ext(&sc.frame_index),
+        master: End::ext(&sc.master_volume),
+        volumes: volumes.port(),
+        pitches: pitches.as_ref().map(|p| p.port()),
+        emitters: emitters.port(),
+    });
+    g.emit(world, &mut sc.chip, &EmitPlacement {
+        root_origin: service(0, -10),
+        root_columns: 8,
+    })?;
+    Ok(RefStreams { volumes, pitches, emitters })
+}
+
 /// Build a world whose speaker cluster plays `track` back as a fixed band bank.
 pub fn build_speaker_world(track: &VoiceTrack, opts: &AudioOptions) -> Result<World, String> {
     if track.frame_count == 0 {
-        return Err("audio track has 0 frames -- nothing to render".to_string());
+        return Err("audio track has 0 frames: nothing to render".to_string());
     }
     if track.volumes.len() != track.plan.len() {
         return Err(format!(
@@ -721,37 +783,43 @@ pub fn build_speaker_world(track: &VoiceTrack, opts: &AudioOptions) -> Result<Wo
     }
 
     // --- 3. One master-volume multiply per band -----------------------------
-    let targets: Vec<WirePort> = speaker_ids
-        .iter()
-        .enumerate()
-        .map(|(b, &speaker)| {
-            // Below the audio select cascade (rows -4..-9), per the service doc.
-            volume_multiply(&mut world, &mut sc.chip, b, speaker, &sc.master_volume, -10)
-        })
-        .collect();
+    let refs = if opts.uses_refs(track.frame_count) {
+        Some(ref_streams(&mut world, &mut sc, &speaker_ids, track.volumes.clone(), None, track.frame_count, opts)?)
+    } else {
+        let targets: Vec<WirePort> = speaker_ids
+            .iter()
+            .enumerate()
+            .map(|(b, &speaker)| {
+                // Below the audio select cascade (rows -4..-9), per the service doc.
+                volume_multiply(&mut world, &mut sc.chip, b, speaker, &sc.master_volume, -10)
+            })
+            .collect();
 
-    // --- 4. One stream per band: its volume ---------------------------------
-    // Pitch is build-time data here, never rewritten, so a band fading in and
-    // out carries no retrigger risk -- the property voice mode gives up.
-    let streams: Vec<FrameStream<'_>> = track
-        .volumes
-        .iter()
-        .zip(targets)
-        .map(|(values, target)| FrameStream { values, target })
-        .collect();
-    build_stream_cascade(
-        &mut world,
-        &mut sc.chip,
-        &sc.frame_index,
-        track.frame_count,
-        opts.bank_size,
-        &streams,
-    );
+        // --- 4. One stream per band: its volume ---------------------------------
+        // Pitch is build-time data here, never rewritten, so a band fading in and
+        // out carries no retrigger risk -- the property voice mode gives up.
+        let streams: Vec<FrameStream<'_>> = track
+            .volumes
+            .iter()
+            .zip(targets)
+            .map(|(values, target)| FrameStream { values, target })
+            .collect();
+        build_stream_cascade(
+            &mut world,
+            &mut sc.chip,
+            &sc.frame_index,
+            track.frame_count,
+            opts.bank_size,
+            &streams,
+        );
 
-    // --- 5. Control buttons -------------------------------------------------
-    // Default-on: three labelled buttons wired into the clock's control pins,
-    // placed beyond the cluster by `control_anchor`. Before `finish` so its
-    // overlap check sees them.
+        // --- 5. Control buttons -------------------------------------------------
+        // Default-on: three labelled buttons wired into the clock's control pins,
+        // placed beyond the cluster by `control_anchor`. Before `finish` so its
+        // overlap check sees them.
+        None
+    };
+
     if opts.control_buttons {
         let (pause, restart, resume) = sc.control_pins;
         let anchor = crate::anim::controls::control_anchor(&world);
@@ -763,6 +831,9 @@ pub fn build_speaker_world(track: &VoiceTrack, opts: &AudioOptions) -> Result<Wo
     // finish publishes the chip's inner grid, else to_brz_vec fails with
     // UnregisteredComponentType.
     world.register_used_components();
+    if let Some(refs) = refs {
+        refs.fill(&mut world)?;
+    }
     Ok(world)
 }
 
@@ -818,18 +889,18 @@ pub fn build_midi_event_world(
     score: &crate::midi::MidiScore,
     opts: &crate::midi::MidiOptions,
 ) -> Result<World, String> {
-    const VAR: &str = "BrickComponentType_WireGraphPseudo_Var";
-    const VAR_INCREMENT: &str = "BrickComponentType_WireGraph_Exec_Var_Increment";
-    const VAR_SET: &str = "BrickComponentType_WireGraph_Exec_Var_Set";
-    const SPLIT_QUAT: &str = "BrickComponentType_WireGraph_Expr_SplitQuaternion";
-    const COMPARE_GREATER: &str = "BrickComponentType_WireGraph_Expr_CompareGreater";
-    const COMPARE_LE: &str = "BrickComponentType_WireGraph_Expr_CompareLessOrEqual";
-    const COMPARE_LESS: &str = "BrickComponentType_WireGraph_Expr_CompareLess";
+    const VAR: &str = "BrickComponentType_Var";
+    const VAR_INCREMENT: &str = "BrickComponentType_Exec_Var_Increment";
+    const VAR_SET: &str = "BrickComponentType_Exec_Var_Set";
+    const SPLIT_QUAT: &str = "BrickComponentType_Expr_SplitQuaternion";
+    const COMPARE_GREATER: &str = "BrickComponentType_Expr_CompareGreater";
+    const COMPARE_LE: &str = "BrickComponentType_Expr_CompareLessOrEqual";
+    const COMPARE_LESS: &str = "BrickComponentType_Expr_CompareLess";
     use crate::anim::clock::MODULO;
 
     if score.voices.is_empty() && score.percussion_lanes.is_empty() {
         return Err(
-            "this MIDI produced no speakers -- every note was outside the playable range"
+            "this MIDI produced no speakers: every note was outside the playable range"
                 .to_string(),
         );
     }
@@ -920,7 +991,7 @@ pub fn build_midi_event_world(
     } else {
         let m = gate(&mut sc.chip, "B_1x1_Gate_Expr_MathMultiply", MULTIPLY, shared_pos(), vec![(
             "InputB",
-            Box::new(WireVariant::Number(rate)) as Box<dyn AsBrdbValue>,
+            Box::new(WireValue::Number(rate)) as Box<dyn AsBrdbValue>,
         )]);
         world.add_wire_connection(sc.time.clone(), WirePort::new(m, MULTIPLY, "InputA"));
         WirePort::new(m, MULTIPLY, "Output")
@@ -928,7 +999,7 @@ pub fn build_midi_event_world(
     let play_time = if opts.loop_playback {
         let m = gate(&mut sc.chip, "B_1x1_Gate_Expr_MathModuloFloored", MODULO, shared_pos(), vec![(
             "InputB",
-            Box::new(WireVariant::Number(score.duration_s)) as Box<dyn AsBrdbValue>,
+            Box::new(WireValue::Number(score.duration_s)) as Box<dyn AsBrdbValue>,
         )]);
         world.add_wire_connection(scaled_time.clone(), WirePort::new(m, MODULO, "InputA"));
         WirePort::new(m, MODULO, "Output")
@@ -938,7 +1009,7 @@ pub fn build_midi_event_world(
 
     // Shared reset signal: last tick's playback time, and whether it jumped
     // backward (a restart or a loop wrap). Fanned out to every speaker's reset.
-    let prev = gate(&mut sc.chip, "B_1x1_Gate_Pseudo_BufferTicks", BUFFER_TICKS, shared_pos(), vec![(
+    let prev = gate(&mut sc.chip, "B_1x1_Gate_BufferTicks", BUFFER_TICKS, shared_pos(), vec![(
         "TicksToWait",
         Box::new(1i32) as Box<dyn AsBrdbValue>,
     )]);
@@ -947,190 +1018,194 @@ pub fn build_midi_event_world(
     world.add_wire_connection(play_time.clone(), WirePort::new(decreased, COMPARE_LESS, "InputA"));
     world.add_wire_connection(WirePort::new(prev, BUFFER_TICKS, "Output"), WirePort::new(decreased, COMPARE_LESS, "InputB"));
 
-    // --- 3. Per-speaker playhead ---------------------------------------------
-    for (v, voice) in score.voices.iter().enumerate() {
-        // This voice's whole playhead lives on its OWN row, in a fixed
-        // left-to-right column order -- the repeating strip. Voice 0 sits just
-        // below the shared row; each next voice is one row further along, so the
-        // voices stack instead of running end-to-end.
-        let row = SHARED_ROW - 1 - v as i32;
-        let mut col = 0i32;
-        let mut vpos = || {
-            let p = service(col, row);
-            col += 1;
-            p
-        };
-        // The events, packed one quat each: (start, end, pitch, vol) = (X,Y,Z,W).
-        let events: Vec<(f64, f64, f64, f64)> = voice
-            .notes
-            .iter()
-            .map(|n| (n.start_s, n.end_s, n.pitch, n.volume))
-            .collect();
-        let events_arr = gate(&mut sc.chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, vpos(), vec![(
-            "Value",
-            Box::new(WireArrayVariant::QuatArray(events)) as Box<dyn AsBrdbValue>,
-        )]);
-        // The playhead index register (starts 0).
-        let idx_var = gate(&mut sc.chip, "B_1x1_Gate_Variable", VAR, vpos(), vec![(
-            "Value",
-            Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
-        )]);
-        // This speaker's per-tick exec pulse (own detector, no cross-speaker
-        // chaining -- the reset/advance branches would break a shared chain).
-        let detector = gate(&mut sc.chip, "B_1x1_Gate_Expr_ChangeDetectorExec", CHANGE_DETECTOR, vpos(), vec![]);
-        world.add_wire_connection(play_time.clone(), WirePort::new(detector, CHANGE_DETECTOR, "Input"));
+    if opts.functions {
+        midi_function_playheads(&mut world, &mut sc, score, &speaker_ids, &play_time, decreased, n_speakers)?;
+    } else {
+        // --- 3. Per-speaker playhead ---------------------------------------------
+        for (v, voice) in score.voices.iter().enumerate() {
+            // This voice's whole playhead lives on its OWN row, in a fixed
+            // left-to-right column order -- the repeating strip. Voice 0 sits just
+            // below the shared row; each next voice is one row further along, so the
+            // voices stack instead of running end-to-end.
+            let row = SHARED_ROW - 1 - v as i32;
+            let mut col = 0i32;
+            let mut vpos = || {
+                let p = service(col, row);
+                col += 1;
+                p
+            };
+            // The events, packed one quat each: (start, end, pitch, vol) = (X,Y,Z,W).
+            let events: Vec<(f64, f64, f64, f64)> = voice
+                .notes
+                .iter()
+                .map(|n| (n.start_s, n.end_s, n.pitch, n.volume))
+                .collect();
+            let events_arr = gate(&mut sc.chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, vpos(), vec![(
+                "Value",
+                Box::new(WireArray::Quat(events)) as Box<dyn AsBrdbValue>,
+            )]);
+            // The playhead index register (starts 0).
+            let idx_var = gate(&mut sc.chip, "B_1x1_Gate_Variable", VAR, vpos(), vec![(
+                "Value",
+                Box::new(WireValue::Int(0)) as Box<dyn AsBrdbValue>,
+            )]);
+            // This speaker's per-tick exec pulse (own detector, no cross-speaker
+            // chaining -- the reset/advance branches would break a shared chain).
+            let detector = gate(&mut sc.chip, "B_1x1_Gate_Expr_ChangeDetectorExec", CHANGE_DETECTOR, vpos(), vec![]);
+            world.add_wire_connection(play_time.clone(), WirePort::new(detector, CHANGE_DETECTOR, "Input"));
 
-        // Read the current event and break it into its four floats.
-        let get = gate(&mut sc.chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, vpos(), vec![]);
-        world.add_wire_connection(WirePort::new(events_arr, ARRAY_VAR, "ArrayVarRef"), WirePort::new(get, ARRAY_GET, "ArrayVarRef"));
-        world.add_wire_connection(WirePort::new(idx_var, VAR, "Value"), WirePort::new(get, ARRAY_GET, "Index"));
-        world.add_wire_connection(WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"), WirePort::new(get, ARRAY_GET, "Exec"));
-        let split = gate(&mut sc.chip, "B_1x1_Gate_Expr_SplitQuaternion", SPLIT_QUAT, vpos(), vec![]);
-        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "Value"), WirePort::new(split, SPLIT_QUAT, "Input"));
-        let start = WirePort::new(split, SPLIT_QUAT, "X");
-        let end = WirePort::new(split, SPLIT_QUAT, "Y");
-        let pitch = WirePort::new(split, SPLIT_QUAT, "Z");
-        let vol = WirePort::new(split, SPLIT_QUAT, "W");
+            // Read the current event and break it into its four floats.
+            let get = gate(&mut sc.chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, vpos(), vec![]);
+            world.add_wire_connection(WirePort::new(events_arr, ARRAY_VAR, "ArrayVarRef"), WirePort::new(get, ARRAY_GET, "ArrayVarRef"));
+            world.add_wire_connection(WirePort::new(idx_var, VAR, "Value"), WirePort::new(get, ARRAY_GET, "Index"));
+            world.add_wire_connection(WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"), WirePort::new(get, ARRAY_GET, "Exec"));
+            let split = gate(&mut sc.chip, "B_1x1_Gate_Expr_SplitQuaternion", SPLIT_QUAT, vpos(), vec![]);
+            world.add_wire_connection(WirePort::new(get, ARRAY_GET, "Value"), WirePort::new(split, SPLIT_QUAT, "Input"));
+            let start = WirePort::new(split, SPLIT_QUAT, "X");
+            let end = WirePort::new(split, SPLIT_QUAT, "Y");
+            let pitch = WirePort::new(split, SPLIT_QUAT, "Z");
+            let vol = WirePort::new(split, SPLIT_QUAT, "W");
 
-        // Reset first: if playback time jumped backward, set the index to 0.
-        let br_reset = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
-        world.add_wire_connection(WirePort::new(decreased, COMPARE_LESS, "bOutput"), WirePort::new(br_reset, BRANCH, "bCond"));
-        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "ExecOut"), WirePort::new(br_reset, BRANCH, "Exec"));
-        let var_set = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, vpos(), vec![(
-            "Value",
-            Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
-        )]);
-        world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(var_set, VAR_SET, "VarRef"));
-        world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutA"), WirePort::new(var_set, VAR_SET, "Exec"));
+            // Reset first: if playback time jumped backward, set the index to 0.
+            let br_reset = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
+            world.add_wire_connection(WirePort::new(decreased, COMPARE_LESS, "bOutput"), WirePort::new(br_reset, BRANCH, "bCond"));
+            world.add_wire_connection(WirePort::new(get, ARRAY_GET, "ExecOut"), WirePort::new(br_reset, BRANCH, "Exec"));
+            let var_set = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, vpos(), vec![(
+                "Value",
+                Box::new(WireValue::Int(0)) as Box<dyn AsBrdbValue>,
+            )]);
+            world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(var_set, VAR_SET, "VarRef"));
+            world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutA"), WirePort::new(var_set, VAR_SET, "Exec"));
 
-        // Advance: on the no-reset exec, if Time > end and in bounds, idx += 1.
-        let gt_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreater", COMPARE_GREATER, vpos(), vec![]);
-        world.add_wire_connection(play_time.clone(), WirePort::new(gt_end, COMPARE_GREATER, "InputA"));
-        world.add_wire_connection(end.clone(), WirePort::new(gt_end, COMPARE_GREATER, "InputB"));
-        let br_time = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
-        world.add_wire_connection(WirePort::new(gt_end, COMPARE_GREATER, "bOutput"), WirePort::new(br_time, BRANCH, "bCond"));
-        world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutB"), WirePort::new(br_time, BRANCH, "Exec"));
-        let br_oob = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
-        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "bOutOfBounds"), WirePort::new(br_oob, BRANCH, "bCond"));
-        world.add_wire_connection(WirePort::new(br_time, BRANCH, "ExecOutA"), WirePort::new(br_oob, BRANCH, "Exec"));
-        let inc = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, vpos(), vec![(
-            "Value",
-            Box::new(WireVariant::Int(1)) as Box<dyn AsBrdbValue>,
-        )]);
-        world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(inc, VAR_INCREMENT, "VarRef"));
-        world.add_wire_connection(WirePort::new(br_oob, BRANCH, "ExecOutB"), WirePort::new(inc, VAR_INCREMENT, "Exec"));
+            // Advance: on the no-reset exec, if Time > end and in bounds, idx += 1.
+            let gt_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreater", COMPARE_GREATER, vpos(), vec![]);
+            world.add_wire_connection(play_time.clone(), WirePort::new(gt_end, COMPARE_GREATER, "InputA"));
+            world.add_wire_connection(end.clone(), WirePort::new(gt_end, COMPARE_GREATER, "InputB"));
+            let br_time = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
+            world.add_wire_connection(WirePort::new(gt_end, COMPARE_GREATER, "bOutput"), WirePort::new(br_time, BRANCH, "bCond"));
+            world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutB"), WirePort::new(br_time, BRANCH, "Exec"));
+            let br_oob = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
+            world.add_wire_connection(WirePort::new(get, ARRAY_GET, "bOutOfBounds"), WirePort::new(br_oob, BRANCH, "bCond"));
+            world.add_wire_connection(WirePort::new(br_time, BRANCH, "ExecOutA"), WirePort::new(br_oob, BRANCH, "Exec"));
+            let inc = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, vpos(), vec![(
+                "Value",
+                Box::new(WireValue::Int(1)) as Box<dyn AsBrdbValue>,
+            )]);
+            world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(inc, VAR_INCREMENT, "VarRef"));
+            world.add_wire_connection(WirePort::new(br_oob, BRANCH, "ExecOutB"), WirePort::new(inc, VAR_INCREMENT, "Exec"));
 
-        // volume = (t >= start) ? ((t <= end) ? vol : 0) : 0
-        let ge_start = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE, vpos(), vec![]);
-        world.add_wire_connection(play_time.clone(), WirePort::new(ge_start, COMPARE_GE, "InputA"));
-        world.add_wire_connection(start, WirePort::new(ge_start, COMPARE_GE, "InputB"));
-        let le_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareLessOrEqual", COMPARE_LE, vpos(), vec![]);
-        world.add_wire_connection(play_time.clone(), WirePort::new(le_end, COMPARE_LE, "InputA"));
-        world.add_wire_connection(end, WirePort::new(le_end, COMPARE_LE, "InputB"));
+            // volume = (t >= start) ? ((t <= end) ? vol : 0) : 0
+            let ge_start = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE, vpos(), vec![]);
+            world.add_wire_connection(play_time.clone(), WirePort::new(ge_start, COMPARE_GE, "InputA"));
+            world.add_wire_connection(start, WirePort::new(ge_start, COMPARE_GE, "InputB"));
+            let le_end = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareLessOrEqual", COMPARE_LE, vpos(), vec![]);
+            world.add_wire_connection(play_time.clone(), WirePort::new(le_end, COMPARE_LE, "InputA"));
+            world.add_wire_connection(end, WirePort::new(le_end, COMPARE_LE, "InputB"));
 
-        let vol_inner = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, vpos(), vec![(
-            "InputA",
-            Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
-        )]);
-        world.add_wire_connection(WirePort::new(le_end, COMPARE_LE, "bOutput"), WirePort::new(vol_inner, SELECT, "bSelectB"));
-        world.add_wire_connection(vol, WirePort::new(vol_inner, SELECT, "InputB"));
-        let vol_gated = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, vpos(), vec![(
-            "InputA",
-            Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
-        )]);
-        world.add_wire_connection(WirePort::new(ge_start, COMPARE_GE, "bOutput"), WirePort::new(vol_gated, SELECT, "bSelectB"));
-        world.add_wire_connection(WirePort::new(vol_inner, SELECT, "Output"), WirePort::new(vol_gated, SELECT, "InputB"));
+            let vol_inner = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, vpos(), vec![(
+                "InputA",
+                Box::new(WireValue::Number(0.0)) as Box<dyn AsBrdbValue>,
+            )]);
+            world.add_wire_connection(WirePort::new(le_end, COMPARE_LE, "bOutput"), WirePort::new(vol_inner, SELECT, "bSelectB"));
+            world.add_wire_connection(vol, WirePort::new(vol_inner, SELECT, "InputB"));
+            let vol_gated = gate(&mut sc.chip, "B_1x1_Gate_Expr_Select", SELECT, vpos(), vec![(
+                "InputA",
+                Box::new(WireValue::Number(0.0)) as Box<dyn AsBrdbValue>,
+            )]);
+            world.add_wire_connection(WirePort::new(ge_start, COMPARE_GE, "bOutput"), WirePort::new(vol_gated, SELECT, "bSelectB"));
+            world.add_wire_connection(WirePort::new(vol_inner, SELECT, "Output"), WirePort::new(vol_gated, SELECT, "InputB"));
 
-        // Pitch straight into the emitter; volume through the master-volume
-        // multiply (pause-mute) so a frozen clock silences it.
-        world.add_wire_connection(pitch, WirePort::new(speaker_ids[v], AUDIO_EMITTER, "PitchMultiplier"));
-        let vol_target = volume_multiply(&mut world, &mut sc.chip, v, speaker_ids[v], &sc.master_volume, -4);
-        world.add_wire_connection(WirePort::new(vol_gated, SELECT, "Output"), vol_target);
-    }
+            // Pitch straight into the emitter; volume through the master-volume
+            // multiply (pause-mute) so a frozen clock silences it.
+            world.add_wire_connection(pitch, WirePort::new(speaker_ids[v], AUDIO_EMITTER, "PitchMultiplier"));
+            let vol_target = volume_multiply(&mut world, &mut sc.chip, v, speaker_ids[v], &sc.master_volume, -4);
+            world.add_wire_connection(WirePort::new(vol_gated, SELECT, "Output"), vol_target);
+        }
 
-    // --- 3b. Percussion lanes ------------------------------------------------
-    // Each lane is one oneshot emitter driven by its own playhead: a `Var`
-    // index steps through the strike times, and on each advance its incrementing
-    // value fires the emitter's `Play` exec (any increment triggers the sample).
-    // Same reset/advance shape as the melodic playhead, but the compare is
-    // "time reached the strike" and the trigger is the index itself, not a
-    // pitch/volume gate. Rows continue below the last voice's.
-    let perc_base_row = SHARED_ROW - 1 - n_speakers as i32;
-    // Emitters sit in a compact near-square block just past the speaker
-    // cluster's far +y edge, sharing its x range -- beside the array, not a row.
-    let (_, sp_ny, _) = cluster_dims(n_speakers.max(1));
-    let ph = speaker_half();
-    let perc_cols = ((score.percussion_lanes.len() as f64).sqrt().ceil() as i32).max(1);
-    let perc_y0 = sp_ny as i32 * ph.y * 2 + ph.y * 2;
-    for (l, lane) in score.percussion_lanes.iter().enumerate() {
-        let (ix, iy) = (l as i32 % perc_cols, l as i32 / perc_cols);
-        let emitter = crate::audio::percussion::add_oneshot_emitter(
-            &mut world,
-            &lane.sound,
-            Position { x: ph.x + ix * ph.x * 2, y: perc_y0 + ph.y + iy * ph.y * 2, z: 6 },
-        );
+        // --- 3b. Percussion lanes ------------------------------------------------
+        // Each lane is one oneshot emitter driven by its own playhead: a `Var`
+        // index steps through the strike times, and on each advance its incrementing
+        // value fires the emitter's `Play` exec (any increment triggers the sample).
+        // Same reset/advance shape as the melodic playhead, but the compare is
+        // "time reached the strike" and the trigger is the index itself, not a
+        // pitch/volume gate. Rows continue below the last voice's.
+        let perc_base_row = SHARED_ROW - 1 - n_speakers as i32;
+        // Emitters sit in a compact near-square block just past the speaker
+        // cluster's far +y edge, sharing its x range -- beside the array, not a row.
+        let (_, sp_ny, _) = cluster_dims(n_speakers.max(1));
+        let ph = speaker_half();
+        let perc_cols = ((score.percussion_lanes.len() as f64).sqrt().ceil() as i32).max(1);
+        let perc_y0 = sp_ny as i32 * ph.y * 2 + ph.y * 2;
+        for (l, lane) in score.percussion_lanes.iter().enumerate() {
+            let (ix, iy) = (l as i32 % perc_cols, l as i32 / perc_cols);
+            let emitter = crate::audio::percussion::add_oneshot_emitter(
+                &mut world,
+                &lane.sound,
+                Position { x: ph.x + ix * ph.x * 2, y: perc_y0 + ph.y + iy * ph.y * 2, z: 6 },
+            );
 
-        let row = perc_base_row - l as i32;
-        let mut col = 0i32;
-        let mut vpos = || {
-            let p = service(col, row);
-            col += 1;
-            p
-        };
+            let row = perc_base_row - l as i32;
+            let mut col = 0i32;
+            let mut vpos = || {
+                let p = service(col, row);
+                col += 1;
+                p
+            };
 
-        // Strike times, and the playhead index into them (starts 0).
-        let hits_arr = gate(&mut sc.chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, vpos(), vec![(
-            "Value",
-            Box::new(WireArrayVariant::DoubleArray(lane.hits.clone())) as Box<dyn AsBrdbValue>,
-        )]);
-        let idx_var = gate(&mut sc.chip, "B_1x1_Gate_Variable", VAR, vpos(), vec![(
-            "Value",
-            Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
-        )]);
-        let detector = gate(&mut sc.chip, "B_1x1_Gate_Expr_ChangeDetectorExec", CHANGE_DETECTOR, vpos(), vec![]);
-        world.add_wire_connection(play_time.clone(), WirePort::new(detector, CHANGE_DETECTOR, "Input"));
+            // Strike times, and the playhead index into them (starts 0).
+            let hits_arr = gate(&mut sc.chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, vpos(), vec![(
+                "Value",
+                Box::new(WireArray::F64(lane.hits.clone())) as Box<dyn AsBrdbValue>,
+            )]);
+            let idx_var = gate(&mut sc.chip, "B_1x1_Gate_Variable", VAR, vpos(), vec![(
+                "Value",
+                Box::new(WireValue::Int(0)) as Box<dyn AsBrdbValue>,
+            )]);
+            let detector = gate(&mut sc.chip, "B_1x1_Gate_Expr_ChangeDetectorExec", CHANGE_DETECTOR, vpos(), vec![]);
+            world.add_wire_connection(play_time.clone(), WirePort::new(detector, CHANGE_DETECTOR, "Input"));
 
-        // Read the current strike time (bOutOfBounds once the index passes the end).
-        let get = gate(&mut sc.chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, vpos(), vec![]);
-        world.add_wire_connection(WirePort::new(hits_arr, ARRAY_VAR, "ArrayVarRef"), WirePort::new(get, ARRAY_GET, "ArrayVarRef"));
-        world.add_wire_connection(WirePort::new(idx_var, VAR, "Value"), WirePort::new(get, ARRAY_GET, "Index"));
-        world.add_wire_connection(WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"), WirePort::new(get, ARRAY_GET, "Exec"));
+            // Read the current strike time (bOutOfBounds once the index passes the end).
+            let get = gate(&mut sc.chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET, vpos(), vec![]);
+            world.add_wire_connection(WirePort::new(hits_arr, ARRAY_VAR, "ArrayVarRef"), WirePort::new(get, ARRAY_GET, "ArrayVarRef"));
+            world.add_wire_connection(WirePort::new(idx_var, VAR, "Value"), WirePort::new(get, ARRAY_GET, "Index"));
+            world.add_wire_connection(WirePort::new(detector, CHANGE_DETECTOR, "OnChanged"), WirePort::new(get, ARRAY_GET, "Exec"));
 
-        // Reset first: if playback time jumped backward (a loop wrap), index = 0.
-        // Setting it to 0 does not fire Play (0 is not non-zero).
-        let br_reset = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
-        world.add_wire_connection(WirePort::new(decreased, COMPARE_LESS, "bOutput"), WirePort::new(br_reset, BRANCH, "bCond"));
-        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "ExecOut"), WirePort::new(br_reset, BRANCH, "Exec"));
-        let var_set = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, vpos(), vec![(
-            "Value",
-            Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
-        )]);
-        world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(var_set, VAR_SET, "VarRef"));
-        world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutA"), WirePort::new(var_set, VAR_SET, "Exec"));
+            // Reset first: if playback time jumped backward (a loop wrap), index = 0.
+            // Setting it to 0 does not fire Play (0 is not non-zero).
+            let br_reset = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
+            world.add_wire_connection(WirePort::new(decreased, COMPARE_LESS, "bOutput"), WirePort::new(br_reset, BRANCH, "bCond"));
+            world.add_wire_connection(WirePort::new(get, ARRAY_GET, "ExecOut"), WirePort::new(br_reset, BRANCH, "Exec"));
+            let var_set = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, vpos(), vec![(
+                "Value",
+                Box::new(WireValue::Int(0)) as Box<dyn AsBrdbValue>,
+            )]);
+            world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(var_set, VAR_SET, "VarRef"));
+            world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutA"), WirePort::new(var_set, VAR_SET, "Exec"));
 
-        // Advance: on the no-reset exec, if playback time has reached the strike
-        // and the index is in bounds, increment it -- which fires the oneshot.
-        let reached = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE, vpos(), vec![]);
-        world.add_wire_connection(play_time.clone(), WirePort::new(reached, COMPARE_GE, "InputA"));
-        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "Value"), WirePort::new(reached, COMPARE_GE, "InputB"));
-        let br_reached = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
-        world.add_wire_connection(WirePort::new(reached, COMPARE_GE, "bOutput"), WirePort::new(br_reached, BRANCH, "bCond"));
-        world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutB"), WirePort::new(br_reached, BRANCH, "Exec"));
-        let br_oob = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
-        world.add_wire_connection(WirePort::new(get, ARRAY_GET, "bOutOfBounds"), WirePort::new(br_oob, BRANCH, "bCond"));
-        world.add_wire_connection(WirePort::new(br_reached, BRANCH, "ExecOutA"), WirePort::new(br_oob, BRANCH, "Exec"));
-        let inc = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, vpos(), vec![(
-            "Value",
-            Box::new(WireVariant::Int(1)) as Box<dyn AsBrdbValue>,
-        )]);
-        world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(inc, VAR_INCREMENT, "VarRef"));
-        world.add_wire_connection(WirePort::new(br_oob, BRANCH, "ExecOutB"), WirePort::new(inc, VAR_INCREMENT, "Exec"));
+            // Advance: on the no-reset exec, if playback time has reached the strike
+            // and the index is in bounds, increment it -- which fires the oneshot.
+            let reached = gate(&mut sc.chip, "B_1x1_Gate_Expr_CompareGreaterOrEqual", COMPARE_GE, vpos(), vec![]);
+            world.add_wire_connection(play_time.clone(), WirePort::new(reached, COMPARE_GE, "InputA"));
+            world.add_wire_connection(WirePort::new(get, ARRAY_GET, "Value"), WirePort::new(reached, COMPARE_GE, "InputB"));
+            let br_reached = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
+            world.add_wire_connection(WirePort::new(reached, COMPARE_GE, "bOutput"), WirePort::new(br_reached, BRANCH, "bCond"));
+            world.add_wire_connection(WirePort::new(br_reset, BRANCH, "ExecOutB"), WirePort::new(br_reached, BRANCH, "Exec"));
+            let br_oob = gate(&mut sc.chip, "B_1x1_Gate_Exec_Branch", BRANCH, vpos(), vec![]);
+            world.add_wire_connection(WirePort::new(get, ARRAY_GET, "bOutOfBounds"), WirePort::new(br_oob, BRANCH, "bCond"));
+            world.add_wire_connection(WirePort::new(br_reached, BRANCH, "ExecOutA"), WirePort::new(br_oob, BRANCH, "Exec"));
+            let inc = gate(&mut sc.chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, vpos(), vec![(
+                "Value",
+                Box::new(WireValue::Int(1)) as Box<dyn AsBrdbValue>,
+            )]);
+            world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(inc, VAR_INCREMENT, "VarRef"));
+            world.add_wire_connection(WirePort::new(br_oob, BRANCH, "ExecOutB"), WirePort::new(inc, VAR_INCREMENT, "Exec"));
 
-        // The incrementing index fires the oneshot: one strike per advance.
-        world.add_wire_connection(
-            WirePort::new(idx_var, VAR, "Value"),
-            WirePort::new(emitter, crate::audio::percussion::ONESHOT_EMITTER, crate::audio::percussion::PLAY_PORT),
-        );
+            // The incrementing index fires the oneshot: one strike per advance.
+            world.add_wire_connection(
+                WirePort::new(idx_var, VAR, "Value"),
+                WirePort::new(emitter, crate::audio::percussion::ONESHOT_EMITTER, crate::audio::percussion::PLAY_PORT),
+            );
+        }
     }
 
     // --- 4. Control buttons --------------------------------------------------
@@ -1143,6 +1218,72 @@ pub fn build_midi_event_world(
     finish(&mut world, sc.chip)?;
     world.register_used_components();
     Ok(world)
+}
+
+/// Where percussion lane `l`'s oneshot emitter sits: a compact near-square
+/// block just past the speaker cluster's far +y edge, sharing its x range.
+fn lane_emitter_position(l: usize, lanes: usize, n_speakers: usize) -> Position {
+    let (_, sp_ny, _) = cluster_dims(n_speakers.max(1));
+    let ph = speaker_half();
+    let perc_cols = ((lanes as f64).sqrt().ceil() as i32).max(1);
+    let perc_y0 = sp_ny as i32 * ph.y * 2 + ph.y * 2;
+    let (ix, iy) = (l as i32 % perc_cols, l as i32 / perc_cols);
+    Position { x: ph.x + ix * ph.x * 2, y: perc_y0 + ph.y + iy * ph.y * 2, z: 6 }
+}
+
+/// [`build_midi_event_world`]'s playheads under `MidiOptions::functions`:
+/// see [`super::midi_functions`].
+fn midi_function_playheads(
+    world: &mut World,
+    sc: &mut Scaffold,
+    score: &crate::midi::MidiScore,
+    speaker_ids: &[usize],
+    play_time: &WirePort,
+    decreased: usize,
+    n_speakers: usize,
+) -> Result<(), String> {
+    use super::midi_functions::{Lane, Ports, Voice, playheads};
+    use crate::graph::{EmitPlacement, End};
+    const COMPARE_LESS: &str = "BrickComponentType_Expr_CompareLess";
+    let voices = score
+        .voices
+        .iter()
+        .enumerate()
+        .map(|(v, voice)| {
+            let volume = volume_multiply(world, &mut sc.chip, v, speaker_ids[v], &sc.master_volume, -4);
+            Voice {
+                notes: voice.notes.iter().map(|n| (n.start_s, n.end_s, n.pitch, n.volume)).collect(),
+                pitch_to: End::ext(&WirePort::new(speaker_ids[v], AUDIO_EMITTER, "PitchMultiplier")),
+                volume_to: End::ext(&volume),
+            }
+        })
+        .collect();
+    let lanes = score
+        .percussion_lanes
+        .iter()
+        .enumerate()
+        .map(|(l, lane)| {
+            let at = lane_emitter_position(l, score.percussion_lanes.len(), n_speakers);
+            let emitter = crate::audio::percussion::add_oneshot_emitter(world, &lane.sound, at);
+            Lane {
+                hits: lane.hits.clone(),
+                play_to: End::ext(&WirePort::new(
+                    emitter,
+                    crate::audio::percussion::ONESHOT_EMITTER,
+                    crate::audio::percussion::PLAY_PORT,
+                )),
+            }
+        })
+        .collect();
+    let built = playheads(voices, lanes, Ports {
+        time: End::ext(play_time),
+        back: End::ext(&WirePort::new(decreased, COMPARE_LESS, "bOutput")),
+    });
+    built.graph.emit(world, &mut sc.chip, &EmitPlacement {
+        root_origin: service(0, -6),
+        root_columns: 12,
+    })?;
+    Ok(())
 }
 
 /// A minimal one-speaker EVENT-BASED playback circuit, for in-game
@@ -1166,13 +1307,13 @@ pub fn build_midi_event_world(
 /// works and the real builder can be rebuilt on it. Writes a `.brz` via
 /// `examples/midi_playhead_probe.rs`.
 pub fn build_playhead_probe_world() -> Result<World, String> {
-    const VAR: &str = "BrickComponentType_WireGraphPseudo_Var";
-    const VAR_INCREMENT: &str = "BrickComponentType_WireGraph_Exec_Var_Increment";
-    const VAR_SET: &str = "BrickComponentType_WireGraph_Exec_Var_Set";
-    const SPLIT_QUAT: &str = "BrickComponentType_WireGraph_Expr_SplitQuaternion";
-    const COMPARE_GREATER: &str = "BrickComponentType_WireGraph_Expr_CompareGreater";
-    const COMPARE_LE: &str = "BrickComponentType_WireGraph_Expr_CompareLessOrEqual";
-    const COMPARE_LESS: &str = "BrickComponentType_WireGraph_Expr_CompareLess";
+    const VAR: &str = "BrickComponentType_Var";
+    const VAR_INCREMENT: &str = "BrickComponentType_Exec_Var_Increment";
+    const VAR_SET: &str = "BrickComponentType_Exec_Var_Set";
+    const SPLIT_QUAT: &str = "BrickComponentType_Expr_SplitQuaternion";
+    const COMPARE_GREATER: &str = "BrickComponentType_Expr_CompareGreater";
+    const COMPARE_LE: &str = "BrickComponentType_Expr_CompareLessOrEqual";
+    const COMPARE_LESS: &str = "BrickComponentType_Expr_CompareLess";
 
     // The score: eight one-second events (0.9 s sounding, 0.1 s gap), C-major.
     // Packed as quats (start, end, pitch, vol) = (X, Y, Z, W).
@@ -1189,12 +1330,7 @@ pub fn build_playhead_probe_world() -> Result<World, String> {
         "MIDI event-playback playhead probe: a Var-indexed quat-event circuit playing a scale"
             .to_string();
 
-    let mut chip = new_chip(
-        &mut world,
-        Position { x: 0, y: 0, z: 2 },
-        Vector3f { x: 0.0, y: 0.0, z: 40.0 },
-        IntVector { x: 5, y: 5, z: 5 },
-    );
+    let mut chip = new_chip(&mut world, Position { x: 0, y: 0, z: 2 }, IntVector { x: 5, y: 5, z: 5 });
 
     // Gate positions: a tight grid, 8 per row, gates touching, on the plane.
     let pos = |slot: i32| Position {
@@ -1218,12 +1354,12 @@ pub fn build_playhead_probe_world() -> Result<World, String> {
     // The event array (one quat per event) and the index register (starts 0).
     let events_arr = gate(&mut chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR, pos(n), vec![(
         "Value",
-        Box::new(WireArrayVariant::QuatArray(events)) as Box<dyn AsBrdbValue>,
+        Box::new(WireArray::Quat(events)) as Box<dyn AsBrdbValue>,
     )]);
     n += 1;
     let idx_var = gate(&mut chip, "B_1x1_Gate_Variable", VAR, pos(n), vec![(
         "Value",
-        Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
+        Box::new(WireValue::Int(0)) as Box<dyn AsBrdbValue>,
     )]);
     n += 1;
 
@@ -1233,7 +1369,7 @@ pub fn build_playhead_probe_world() -> Result<World, String> {
     world.add_wire_connection(time(), WirePort::new(detector, CHANGE_DETECTOR, "Input"));
 
     // Last tick's Time, for the restart/loop reset and the pause-mute.
-    let prev = gate(&mut chip, "B_1x1_Gate_Pseudo_BufferTicks", BUFFER_TICKS, pos(n), vec![(
+    let prev = gate(&mut chip, "B_1x1_Gate_BufferTicks", BUFFER_TICKS, pos(n), vec![(
         "TicksToWait",
         Box::new(1i32) as Box<dyn AsBrdbValue>,
     )]);
@@ -1281,7 +1417,7 @@ pub fn build_playhead_probe_world() -> Result<World, String> {
     world.add_wire_connection(WirePort::new(get, ARRAY_GET, "ExecOut"), WirePort::new(br_reset, BRANCH, "Exec"));
     let var_set = gate(&mut chip, "B_1x1_Gate_Exec_Var_Set", VAR_SET, pos(n), vec![(
         "Value",
-        Box::new(WireVariant::Int(0)) as Box<dyn AsBrdbValue>,
+        Box::new(WireValue::Int(0)) as Box<dyn AsBrdbValue>,
     )]);
     n += 1;
     world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(var_set, VAR_SET, "VarRef"));
@@ -1305,7 +1441,7 @@ pub fn build_playhead_probe_world() -> Result<World, String> {
     world.add_wire_connection(WirePort::new(br_time, BRANCH, "ExecOutA"), WirePort::new(br_oob, BRANCH, "Exec"));
     let inc = gate(&mut chip, "B_1x1_Gate_Exec_Var_Increment", VAR_INCREMENT, pos(n), vec![(
         "Value",
-        Box::new(WireVariant::Int(1)) as Box<dyn AsBrdbValue>,
+        Box::new(WireValue::Int(1)) as Box<dyn AsBrdbValue>,
     )]);
     n += 1;
     world.add_wire_connection(WirePort::new(idx_var, VAR, "VarRef"), WirePort::new(inc, VAR_INCREMENT, "VarRef"));
@@ -1323,14 +1459,14 @@ pub fn build_playhead_probe_world() -> Result<World, String> {
 
     let vol_inner = gate(&mut chip, "B_1x1_Gate_Expr_Select", SELECT, pos(n), vec![(
         "InputA",
-        Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
+        Box::new(WireValue::Number(0.0)) as Box<dyn AsBrdbValue>,
     )]);
     n += 1;
     world.add_wire_connection(WirePort::new(le_end, COMPARE_LE, "bOutput"), WirePort::new(vol_inner, SELECT, "bSelectB"));
     world.add_wire_connection(vol, WirePort::new(vol_inner, SELECT, "InputB"));
     let vol_out = gate(&mut chip, "B_1x1_Gate_Expr_Select", SELECT, pos(n), vec![(
         "InputA",
-        Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
+        Box::new(WireValue::Number(0.0)) as Box<dyn AsBrdbValue>,
     )]);
     world.add_wire_connection(WirePort::new(ge_start, COMPARE_GE, "bOutput"), WirePort::new(vol_out, SELECT, "bSelectB"));
     world.add_wire_connection(WirePort::new(vol_inner, SELECT, "Output"), WirePort::new(vol_out, SELECT, "InputB"));
@@ -1349,7 +1485,7 @@ pub fn build_playhead_probe_world() -> Result<World, String> {
     n += 1;
     let pause_mute = gate(&mut chip, "B_1x1_Gate_Expr_Select", SELECT, pos(n), vec![(
         "InputA",
-        Box::new(WireVariant::Number(0.0)) as Box<dyn AsBrdbValue>,
+        Box::new(WireValue::Number(0.0)) as Box<dyn AsBrdbValue>,
     )]);
     world.add_wire_connection(WirePort::new(moving, COMPARE_NE, "bOutput"), WirePort::new(pause_mute, SELECT, "bSelectB"));
     world.add_wire_connection(WirePort::new(vol_out, SELECT, "Output"), WirePort::new(pause_mute, SELECT, "InputB"));
@@ -1392,7 +1528,7 @@ fn build_pitch_volume_world(
     description: &str,
 ) -> Result<World, String> {
     if frame_count == 0 {
-        return Err("audio track has 0 frames -- nothing to render".to_string());
+        return Err("audio track has 0 frames: nothing to render".to_string());
     }
     let n = pitches.len();
     if n == 0 {
@@ -1425,7 +1561,7 @@ fn build_pitch_volume_world(
             if !p.is_finite() || p < PITCH_MIN as f64 || p > PITCH_MAX as f64 {
                 return Err(format!(
                     "speaker {v} frame {f} has PitchMultiplier {p}, outside the emitter's \
-                     legal {PITCH_MIN}..{PITCH_MAX} range -- the game would clamp it \
+                     legal {PITCH_MIN}..{PITCH_MAX} range; the game would clamp it \
                      and play a wrong note"
                 ));
             }
@@ -1468,37 +1604,43 @@ fn build_pitch_volume_world(
     }
 
     // --- 3. One master-volume multiply per speaker --------------------------
-    let volume_targets: Vec<WirePort> = speaker_ids
-        .iter()
-        .enumerate()
-        .map(|(v, &speaker)| {
-            volume_multiply(&mut world, &mut sc.chip, v, speaker, &sc.master_volume, -10)
-        })
-        .collect();
+    let refs = if opts.uses_refs(frame_count) {
+        let own = |rows: &[&[f64]]| rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+        Some(ref_streams(&mut world, &mut sc, &speaker_ids, own(volumes), Some(own(pitches)), frame_count, opts)?)
+    } else {
+        let volume_targets: Vec<WirePort> = speaker_ids
+            .iter()
+            .enumerate()
+            .map(|(v, &speaker)| {
+                volume_multiply(&mut world, &mut sc.chip, v, speaker, &sc.master_volume, -10)
+            })
+            .collect();
 
-    // --- 4. Two streams per speaker: its pitch and its volume ---------------
-    // Interleaved per speaker so the two arrays sit next to each other in the
-    // chip. Pitch goes straight into the emitter with no multiply in between:
-    // scaling it by Volume would transpose the render whenever volume changed.
-    let mut frame_streams: Vec<FrameStream<'_>> = Vec::with_capacity(n * 2);
-    for v in 0..n {
-        frame_streams.push(FrameStream {
-            values: pitches[v],
-            target: WirePort::new(speaker_ids[v], AUDIO_EMITTER, "PitchMultiplier"),
-        });
-        frame_streams.push(FrameStream {
-            values: volumes[v],
-            target: volume_targets[v].clone(),
-        });
-    }
-    build_stream_cascade(
-        &mut world,
-        &mut sc.chip,
-        &sc.frame_index,
-        frame_count,
-        opts.bank_size,
-        &frame_streams,
-    );
+        // --- 4. Two streams per speaker: its pitch and its volume ---------------
+        // Interleaved per speaker so the two arrays sit next to each other in the
+        // chip. Pitch goes straight into the emitter with no multiply in between:
+        // scaling it by Volume would transpose the render whenever volume changed.
+        let mut frame_streams: Vec<FrameStream<'_>> = Vec::with_capacity(n * 2);
+        for v in 0..n {
+            frame_streams.push(FrameStream {
+                values: pitches[v],
+                target: WirePort::new(speaker_ids[v], AUDIO_EMITTER, "PitchMultiplier"),
+            });
+            frame_streams.push(FrameStream {
+                values: volumes[v],
+                target: volume_targets[v].clone(),
+            });
+        }
+        build_stream_cascade(
+            &mut world,
+            &mut sc.chip,
+            &sc.frame_index,
+            frame_count,
+            opts.bank_size,
+            &frame_streams,
+        );
+        None
+    };
 
     // --- 5. Control buttons -------------------------------------------------
     // Same as build_speaker_world: default-on buttons wired into the clock's
@@ -1513,13 +1655,16 @@ fn build_pitch_volume_world(
     // Must be last, after finish publishes the chip's inner grid -- see
     // [`build_speaker_world`].
     world.register_used_components();
+    if let Some(refs) = refs {
+        refs.fill(&mut world)?;
+    }
     Ok(world)
 }
 
 /// Resolve a synth asset name to the value `AudioDescriptor` expects.
 ///
 /// The schema type is a bare `object`, so the value is a [`BrdbValue::Asset`]
-/// carrying the reference's index -- not `WireVariant::Object` (the wire-graph
+/// carrying the reference's index -- not `WireValue::Object` (the wire-graph
 /// union, a different encoding path; both compile).
 ///
 /// The `(type, name)` pair is checked against brdb's `ASSET_TYPES` catalog

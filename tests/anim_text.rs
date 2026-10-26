@@ -27,7 +27,8 @@ use heightmap::progress::NoProgress;
 /// already at the top of `tests/anim_color.rs` and in `src/anim/text_bricks.rs`'s
 /// own test module.
 mod support {
-    use brdb::{IntoReader, schema::WireArrayVariant};
+    use brdb::{IntoReader};
+    use heightmap::wire_array::WireArray;
     use heightmap::video::Clip;
     use image::{Rgba, RgbaImage};
     use std::path::Path;
@@ -145,12 +146,12 @@ mod support {
             for chunk in &db.brick_chunk_index(gid).expect("chunk index") {
                 let (_soa, structs) = db.component_chunk(gid, chunk.index).expect("components");
                 for s in &structs {
-                    if s.get_name() == "BrickComponentData_WireGraphPseudo_ArrayVar"
+                    if s.get_name() == "BrickComponentData_ArrayVar"
                         && let Some(value) = s.get("Value")
                     {
-                        let variant: WireArrayVariant =
+                        let variant: WireArray =
                             value.try_into().expect("ArrayVar Value must decode");
-                        if let WireArrayVariant::StringArray(v) = variant {
+                        if let WireArray::Str(v) = variant {
                             bands.push(v);
                         }
                     }
@@ -175,7 +176,7 @@ mod support {
 fn a_real_render_passes_wire_integrity_at_two_sizes() {
     for (w, h) in [(64u32, 36u32), (192, 108)] {
         let world = AnimMode::Text
-            .build(&support::clip(w, h, 8), &AnimOptions::default(), &mut NoProgress)
+            .build(&support::clip(w, h, 8), &AnimOptions::wired(), &mut NoProgress)
             .unwrap_or_else(|e| panic!("{w}x{h} must render: {e}"));
         support::with_written_save(&world, "wires", |path| {
             wire_integrity::assert_wires_valid(path);
@@ -205,7 +206,7 @@ fn a_subtitled_render_passes_wire_integrity_at_both_bank_counts() {
         let opts = AnimOptions {
             bank_size,
             subtitles: Some(track.clone()),
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         let world = AnimMode::Text
             .build(&support::clip(64, 36, 5), &opts, &mut NoProgress)
@@ -243,7 +244,7 @@ fn a_subtitled_render_passes_wire_integrity_at_both_bank_counts() {
 fn band_row_ranges_are_identical_for_every_frame() {
     // The core invariant: text components are fixed bricks, so the rows a
     // given component draws must not move frame to frame.
-    let opts = AnimOptions::default();
+    let opts = AnimOptions::wired();
     let plan = plan_bands(192, 108, opts.text.char_repeat).unwrap();
     let world = AnimMode::Text
         .build(&support::clip(192, 108, 12), &opts, &mut NoProgress)
@@ -275,7 +276,7 @@ fn no_frame_of_a_real_render_exceeds_the_component_limit() {
     // opens its own colour tag, which is the content the layout's closed-form
     // bound is sized against and the only content that can actually trip this.
     let world = AnimMode::Text
-        .build(&support::noisy_clip(192, 108, 12), &AnimOptions::default(), &mut NoProgress)
+        .build(&support::noisy_clip(192, 108, 12), &AnimOptions::wired(), &mut NoProgress)
         .unwrap();
     let mut worst = 0usize;
     for band in support::band_strings(&world) {
@@ -298,7 +299,7 @@ fn no_frame_of_a_real_render_exceeds_the_component_limit() {
 #[test]
 fn array_length_equals_frame_count_per_band() {
     let world = AnimMode::Text
-        .build(&support::clip(64, 36, 7), &AnimOptions::default(), &mut NoProgress)
+        .build(&support::clip(64, 36, 7), &AnimOptions::wired(), &mut NoProgress)
         .unwrap();
     let bands = support::band_strings(&world);
     assert!(!bands.is_empty(), "a 64x36 render must produce bands");
@@ -309,9 +310,9 @@ fn array_length_equals_frame_count_per_band() {
 
 #[test]
 fn quantizing_shortens_the_render_without_changing_its_shape() {
-    let q = AnimOptions { colors: 16, ..AnimOptions::default() };
+    let q = AnimOptions { colors: 16, ..AnimOptions::wired() };
     let plain = AnimMode::Text
-        .build(&support::gradient_clip(96, 54, 6), &AnimOptions::default(), &mut NoProgress)
+        .build(&support::gradient_clip(96, 54, 6), &AnimOptions::wired(), &mut NoProgress)
         .unwrap();
     let quant = AnimMode::Text
         .build(&support::gradient_clip(96, 54, 6), &q, &mut NoProgress)
@@ -348,7 +349,7 @@ fn the_text_cost_estimate_matches_a_real_render() {
         (32, 16, 7, 2),
         (48, 24, 9, 3),
     ] {
-        let opts = AnimOptions { bank_size: bank, ..AnimOptions::default() };
+        let opts = AnimOptions { bank_size: bank, ..AnimOptions::wired() };
         let world = AnimMode::Text
             .build(&support::clip(w, h, n), &opts, &mut NoProgress)
             .expect("build");
@@ -390,7 +391,7 @@ fn the_text_cost_estimate_matches_a_subtitled_render() {
                 end_s: 1.0,
                 text: "hi".to_string(),
             }]))),
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         let world = AnimMode::Text
             .build(&support::clip(64, 36, 6), &opts, &mut NoProgress)

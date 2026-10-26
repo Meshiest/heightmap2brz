@@ -15,6 +15,10 @@ test:
 gui:
     cargo run --bin heightmap_gui --features gui
 
+# The GUI as an optimized release build: slower to rebuild, much faster renders
+gui-release:
+    cargo run --release --bin heightmap_gui --features gui
+
 # Live gallery of the Brickadia egui theme (palette, buttons, Font Awesome icons)
 sandbox:
     cargo run --example theme_sandbox --features gui

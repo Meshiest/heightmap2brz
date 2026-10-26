@@ -243,7 +243,7 @@ impl<R: Read> SampleReader<R> {
             self.done = true;
             let whole = filled / 4;
             return Err(format!(
-                "ffmpeg's output ended with {} leftover byte(s) after sample {} -- a partial \
+                "ffmpeg's output ended with {} leftover byte(s) after sample {}: a partial \
                  trailing f32, not a clean end of stream",
                 filled % 4,
                 self.frames_seen + whole as u64
@@ -254,7 +254,7 @@ impl<R: Read> SampleReader<R> {
         if let Some((at, value)) = first_non_finite(&samples, self.frames_seen) {
             self.done = true;
             return Err(format!(
-                "ffmpeg decoded a non-finite sample ({value}) at sample {at} -- the file is \
+                "ffmpeg decoded a non-finite sample ({value}) at sample {at}; the file is \
                  corrupt or truncated"
             ));
         }

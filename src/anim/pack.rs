@@ -285,7 +285,7 @@ impl Packer {
         if frame_w != self.width || frame_h != self.height {
             return Err(format!(
                 "frame {} is {frame_w}x{frame_h}, but the source's SourceInfo reported \
-                 {}x{} -- every frame a FrameStream emits must match info()'s dimensions",
+                 {}x{}; every frame a FrameStream emits must match info()'s dimensions",
                 self.frames_pushed, self.width, self.height
             ));
         }

@@ -53,7 +53,7 @@ pub fn parse(input: &str) -> Result<Subtitles, String> {
         };
         let fields = fields.as_ref().ok_or_else(|| {
             "ASS [Events] section has a Dialogue: line before its Format: line \
-             (or is missing one) -- field order cannot be determined"
+             (or is missing one), so field order cannot be determined"
                 .to_string()
         })?;
 
@@ -101,7 +101,7 @@ pub fn parse(input: &str) -> Result<Subtitles, String> {
     if !seen_events {
         return Err(
             "ASS/SSA file has no [Events] section, so it carries no dialogue this parser \
-             can read -- an empty subtitle track would render as a video where nobody \
+             can read. An empty subtitle track would render as a video where nobody \
              speaks, which is indistinguishable from a correct render of a quiet scene"
                 .to_string(),
         );

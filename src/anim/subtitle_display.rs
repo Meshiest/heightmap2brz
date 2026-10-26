@@ -34,7 +34,8 @@ use crate::text::{
     ANCHOR_BOTTOM_CENTRE, MAX_COMPONENT_CHARS, OUTLINE_OUTLINED, TextOptions, Vector2f,
     add_text_block_styled,
 };
-use brdb::{AsBrdbValue, Position, Vector3f, WirePort, World, schema::WireArrayVariant};
+use brdb::{AsBrdbValue, Position, Vector3f, WirePort, World};
+use crate::wire_array::WireArray;
 
 /// The text component and its input port, reused verbatim from
 /// [`super::text_bricks`] -- the subtitle is the same component the text
@@ -196,7 +197,7 @@ pub fn check_char_limit(per_frame: &[String], fps: f32) -> Result<(), String> {
             };
             return Err(format!(
                 "the subtitle showing at {at} (frame {i}) is {chars} characters, over the \
-                 {MAX_COMPONENT_CHARS}-character TextDisplay limit -- the game truncates past \
+                 {MAX_COMPONENT_CHARS}-character TextDisplay limit. The game truncates past \
                  that silently, so this is rejected rather than cut short; shorten the cue or \
                  split it"
             ));
@@ -238,7 +239,7 @@ pub fn add_subtitle_display(
     {
         return Err(format!(
             "{} subtitle frames at bank size {bank_size} bank {n_banks} ways, but the renderer \
-             supplied {} per-bank indices, {} exec entries and {} boundary comparators -- the \
+             supplied {} per-bank indices, {} exec entries and {} boundary comparators. The \
              subtitle array has to bank exactly as the screen's arrays do or it would read the \
              wrong frame past a seam",
             per_frame.len(),
@@ -324,7 +325,7 @@ pub fn add_subtitle_display(
             at(slot),
             vec![(
                 "Value",
-                Box::new(WireArrayVariant::StringArray(frames.to_vec())) as Box<dyn AsBrdbValue>,
+                Box::new(WireArray::Str(frames.to_vec())) as Box<dyn AsBrdbValue>,
             )],
         );
         slot += 1;
@@ -417,7 +418,7 @@ mod tests {
     use crate::video::Clip;
     use brdb::{
         IntVector, IntoReader,
-        schema::{BrdbValue, WireVariant},
+        schema::{BrdbValue, WireValue},
     };
     use image::{Rgba, RgbaImage};
     use std::sync::Arc;
@@ -471,7 +472,7 @@ mod tests {
     ) -> Result<World, String> {
         let opts = AnimOptions {
             bank_size,
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         let frames: Vec<String> = per_frame.iter().map(|s| s.as_ref().to_string()).collect();
         let bank_size = bank_size.max(1);
@@ -481,7 +482,6 @@ mod tests {
         let mut chip = chip::new_chip(
             &mut world,
             Position { x: 20, y: 20, z: 2 },
-            Vector3f { x: 20.0, y: 20.0, z: 20.0 },
             IntVector { x: 5, y: 5, z: 5 },
         );
         let at = |slot: i32| Position {
@@ -517,7 +517,7 @@ mod tests {
                 at(slot),
                 vec![(
                     "InputB",
-                    Box::new(WireVariant::Number((k * bank_size) as f64)) as Box<dyn AsBrdbValue>,
+                    Box::new(WireValue::Number((k * bank_size) as f64)) as Box<dyn AsBrdbValue>,
                 )],
             );
             slot += 1;
@@ -531,7 +531,7 @@ mod tests {
                 at(slot),
                 vec![(
                     "InputB",
-                    Box::new(WireVariant::Int((k * bank_size) as i64)) as Box<dyn AsBrdbValue>,
+                    Box::new(WireValue::Int((k * bank_size) as i64)) as Box<dyn AsBrdbValue>,
                 )],
             );
             slot += 1;
@@ -599,7 +599,7 @@ mod tests {
         // `control_buttons: false`: this test asserts a subtitle-free render adds
         // no `Component_TextDisplay`, and the default-on control-button labels
         // are TextDisplays that have nothing to do with subtitles.
-        let opts = AnimOptions { control_buttons: false, ..AnimOptions::default() };
+        let opts = AnimOptions { control_buttons: false, ..AnimOptions::wired() };
         build_brick_world(&clip(2, 2, frames), &opts, &mut NoProgress)
             .expect("a subtitle-free render must build")
     }
@@ -645,12 +645,12 @@ mod tests {
         for chunk in &db.brick_chunk_index(gid).expect("chunk index") {
             let (_soa, structs) = db.component_chunk(gid, chunk.index).expect("components");
             for s in &structs {
-                if s.get_name() == "BrickComponentData_WireGraphPseudo_ArrayVar"
+                if s.get_name() == "BrickComponentData_ArrayVar"
                     && let Some(value) = s.get("Value")
                 {
-                    let variant: WireArrayVariant =
+                    let variant: WireArray =
                         value.try_into().expect("ArrayVar Value must decode");
-                    if let WireArrayVariant::StringArray(v) = variant {
+                    if let WireArray::Str(v) = variant {
                         out.extend(v);
                     }
                 }
@@ -834,13 +834,13 @@ mod tests {
         ];
         for (name, build) in renderers {
             let c = clip(16, 8, 4);
-            let without = build(&c, &AnimOptions::default(), &mut NoProgress)
+            let without = build(&c, &AnimOptions::wired(), &mut NoProgress)
                 .unwrap_or_else(|e| panic!("{name} without subtitles: {e}"));
             let with = build(
                 &c,
                 &AnimOptions {
                     subtitles: Some(track()),
-                    ..AnimOptions::default()
+                    ..AnimOptions::wired()
                 },
                 &mut NoProgress,
             )
@@ -881,7 +881,7 @@ mod tests {
             let opts = AnimOptions {
                 bank_size,
                 subtitles: Some(track()),
-                ..AnimOptions::default()
+                ..AnimOptions::wired()
             };
             let world = build_text_world(&clip(32, 8, 5), &opts, &mut NoProgress).expect("build");
             let mut seen = std::collections::HashSet::new();
@@ -903,7 +903,7 @@ mod tests {
                 .count();
             // One per band, plus the subtitle's.
             let bands =
-                crate::anim::text_layout::plan_bands(32, 8, AnimOptions::default().text.char_repeat)
+                crate::anim::text_layout::plan_bands(32, 8, AnimOptions::wired().text.char_repeat)
                     .unwrap()
                     .len();
             assert_eq!(driven, bands + 1, "bank_size {bank_size}");
@@ -918,7 +918,7 @@ mod tests {
     fn a_subtitled_text_render_keeps_every_main_grid_brick_non_negative() {
         let opts = AnimOptions {
             subtitles: Some(track()),
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         let world = build_text_world(&clip(64, 16, 3), &opts, &mut NoProgress).expect("build");
         for b in &world.bricks {
@@ -934,7 +934,7 @@ mod tests {
     /// yields a bigger `LineHeight` on a screen whose rows are bigger.
     #[test]
     fn the_glyph_scale_tracks_the_screen_row_height() {
-        let opts = AnimOptions::default();
+        let opts = AnimOptions::wired();
         let one_row = opts.text.line_world_height * opts.text.pitch_y;
         assert!(
             (glyph_scale(&opts, one_row) - opts.subtitle_scale).abs() < 1e-6,
@@ -979,7 +979,7 @@ mod tests {
             // partitions the world's TextDisplays into the subtitle and the
             // glyph bands.
             control_buttons: false,
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         let world = build_text_world(&clip(32, 8, 3), &opts, &mut NoProgress).expect("build");
         let styles = text_display_styles(&world);
@@ -1041,7 +1041,7 @@ mod tests {
                     // Buttons off: their labels are TextDisplays, and this test
                     // asserts a brick screen's only TextDisplay is the subtitle.
                     control_buttons: false,
-                    ..AnimOptions::default()
+                    ..AnimOptions::wired()
                 };
                 let world = build(&clip(w, h, 3), &opts, &mut NoProgress)
                     .unwrap_or_else(|e| panic!("{name} at {w}x{h}: {e}"));
@@ -1138,8 +1138,8 @@ mod tests {
                 assert_eq!(
                     Position::from_relative(index, relative),
                     p,
-                    "{p:?} did not survive the chunk split -- chunk {index:?}, relative \
-                     {relative:?}"
+                    "{p:?} did not survive the chunk split (chunk {index:?}, relative \
+                     {relative:?})"
                 );
             }
         }
@@ -1177,7 +1177,7 @@ mod tests {
         // build.
         let opts = AnimOptions {
             subtitles: Some(track()),
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         let world = crate::anim::bricks::build_brick_world(
             &clip(4, 3, 2),
@@ -1200,11 +1200,11 @@ mod tests {
     #[test]
     fn the_picture_only_moves_sideways_when_there_are_subtitles() {
         use crate::anim::text_bricks::subtitle_centre_shift;
-        let off = AnimOptions::default();
+        let off = AnimOptions::wired();
         assert_eq!(subtitle_centre_shift(&off, 192), 0, "no track, no shift");
         let on = AnimOptions {
             subtitles: Some(track()),
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         let half = 192.0 * on.text.line_world_height * on.text.pitch_x / 2.0;
         assert_eq!(subtitle_centre_shift(&on, 192), half.ceil() as i32);
@@ -1216,7 +1216,7 @@ mod tests {
                 line_world_height: f32::NAN,
                 ..on.text.clone()
             },
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         assert_eq!(subtitle_centre_shift(&broken, 192), 0);
     }
@@ -1233,7 +1233,7 @@ mod tests {
                 // greatest main-grid x, which would be picked as "the frontmost
                 // text cube" instead of the subtitle by the isolation below.
                 control_buttons: false,
-                ..AnimOptions::default()
+                ..AnimOptions::wired()
             };
             let world = build_text_world(&clip(w, 8, 2), &opts, &mut NoProgress)
                 .unwrap_or_else(|e| panic!("{w}px: {e}"));
@@ -1319,7 +1319,7 @@ mod tests {
                 subtitles: Some(track()),
                 subtitle_lift: 0.0,
                 control_buttons: false,
-                ..AnimOptions::default()
+                ..AnimOptions::wired()
             },
             32,
             8,
@@ -1330,7 +1330,7 @@ mod tests {
                 subtitles: Some(track()),
                 subtitle_lift: 20.0,
                 control_buttons: false,
-                ..AnimOptions::default()
+                ..AnimOptions::wired()
             },
             32,
             8,
@@ -1355,7 +1355,7 @@ mod tests {
             // Buttons off so `text_subtitle_anchor`'s frontmost-x isolation
             // finds the subtitle, not a control-button label.
             control_buttons: false,
-            ..AnimOptions::default()
+            ..AnimOptions::wired()
         };
         assert_eq!(
             opts.subtitle_lift, DEFAULT_SUBTITLE_LIFT,

@@ -7,6 +7,39 @@ release body, so **the heading is the release title**: write it as
 version this file does not mention.
 
 
+## 0.21.0 - Loops and Brick Refs
+
+Saves now use the current game's format (brdb 1.0), so they load only on the
+updated game.
+
+- **Loop Gates (default on, `--driver refs`):** video, text-mode video and
+  audio are driven by a small looping player instead of gates per pixel,
+  band or speaker. A 192x108 screen is 61 gates instead of 41,487. Frames
+  are stored as keyframes plus deltas (`--keyframe-interval`,
+  `--delta-threshold`, `--dense-keyframes`). Turn it off (`--driver wires`)
+  for the previous wired builds.
+- The cost readout shows the gates run in the tick a frame changes and
+  warns past ~20,000. A looped keyframe runs more gates per pixel than a
+  wired one, so large looped screens can hit the server's limit.
+- When the server cuts a loop short, the video's microchip shows a warning
+  with how to fix it. It clears once a keyframe plays in full.
+- Text mode `--hold N` keeps a pixel's colour until the source moves more
+  than N, which makes noisy video saves much smaller.
+- MIDI playheads share one function: about 4 gates a speaker instead of ~16.
+  `--no-midi-functions` restores the old chain.
+- Text components hold up to 32,767 characters (was 10,000), so text-mode
+  video needs far fewer bands.
+- Fixed: loop and function boards failed to paste (a gate laid out at the
+  wrong size overlapped its neighbours).
+- Fixed: an opened microchip board floated over the screen instead of
+  sitting on its chip.
+- Fixed: `--prefab` heightmaps lost their lowest bricks when placed on flat
+  ground.
+- Text-mode video's control buttons sit next to the text instead of several
+  studs in front of it.
+- Variable-frame-rate video gets a progress bar instead of a "total
+  unknown" spinner.
+
 ## 0.20.0 - Optimized the quad optimizer
 
 - The quadtree optimizer uses about 6x less memory and runs about 10x faster. Output is unchanged.

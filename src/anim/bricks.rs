@@ -13,29 +13,29 @@ use crate::progress::{FrameTotal, Progress};
 use crate::video::stream::FrameSource;
 use brdb::{
     Direction, Rotation,
-    AsBrdbValue, Brick, BrickSize, BrickType, IntVector, Position, Vector3f, WirePort, World,
+    AsBrdbValue, Brick, BrickSize, BrickType, IntVector, Position, WirePort, World,
     assets::{
         LiteralComponent,
         bricks::{B_MICROCHIP, PB_DEFAULT_MICRO_BRICK, PB_DEFAULT_SMOOTH_TILE},
         materials::{GLOW, PLASTIC},
     },
-    schema::WireArrayVariant,
 };
+use crate::wire_array::WireArray;
 use std::collections::HashMap;
 
-pub const SUBSTRING: &str = "BrickComponentType_WireGraph_Expr_String_Substring";
-pub const MAKE_COLOR_HEX: &str = "BrickComponentType_WireGraph_Expr_MakeColorHex";
-pub const ARRAY_VAR: &str = "BrickComponentType_WireGraphPseudo_ArrayVar";
-pub const ARRAY_GET: &str = "BrickComponentType_WireGraph_Exec_ArrayVar_Get";
-pub const CHANGE_DETECTOR: &str = "BrickComponentType_WireGraph_Expr_ChangeDetectorExec";
+pub const SUBSTRING: &str = "BrickComponentType_Expr_String_Substring";
+pub const MAKE_COLOR_HEX: &str = "BrickComponentType_Expr_MakeColorHex";
+pub const ARRAY_VAR: &str = "BrickComponentType_ArrayVar";
+pub const ARRAY_GET: &str = "BrickComponentType_Exec_ArrayVar_Get";
+pub const CHANGE_DETECTOR: &str = "BrickComponentType_Expr_ChangeDetectorExec";
 pub const PROP_CHANGER: &str = "Component_BrickPropertyChanger";
-pub const COMPARE_GE: &str = "BrickComponentType_WireGraph_Expr_CompareGreaterOrEqual";
-pub const BRANCH: &str = "BrickComponentType_WireGraph_Exec_Branch";
-pub const SELECT: &str = "BrickComponentType_WireGraph_Expr_Select";
-pub const SUBTRACT: &str = "BrickComponentType_WireGraph_Expr_MathSubtract";
+pub const COMPARE_GE: &str = "BrickComponentType_Expr_CompareGreaterOrEqual";
+pub const BRANCH: &str = "BrickComponentType_Exec_Branch";
+pub const SELECT: &str = "BrickComponentType_Expr_Select";
+pub const SUBTRACT: &str = "BrickComponentType_Expr_MathSubtract";
 
 /// Lattice stage holding clock, array and detector gates.
-const SERVICE_STAGE: i32 = 2;
+pub const SERVICE_STAGE: i32 = 2;
 
 /// Facing for the per-pixel `Substring`/`MakeColorHex` gates: stood on end,
 /// point down, rather than facing +Z at the viewer like the clock's gates.
@@ -53,11 +53,6 @@ const PIXEL_GATE_ROLL: Rotation = Rotation::Deg90;
 /// not y), which `layout::assert_no_overlap`, `chip`'s non-negativity checks,
 /// and [`super::layout::lattice_pos_staged`]'s position offset all rely on.
 const PIXEL_GATE_HALF: IntVector = rotated_half(GATE_HALF, PIXEL_GATE_FACING, PIXEL_GATE_ROLL);
-
-/// World units the interaction plane's start floats above the screen top face.
-/// Only a starting anchor: `chip::recompute_plane_extent` moves
-/// `entity.location` again, so this is not where the plane's middle ends up.
-const PLANE_HEIGHT_ABOVE_SCREEN: i32 = 15;
 
 /// Which brick asset a display pixel renders as.
 ///
@@ -104,8 +99,37 @@ impl DisplayBrickStyle {
     }
 }
 
+/// How a render's frames reach the screen (or the speakers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Driver {
+    /// Gates per pixel, band or speaker, each wired to its target:
+    /// [`build_brick_world`], [`super::color_bricks`], wired text mode, the
+    /// wired audio streams.
+    Wires,
+    /// Loops that set their targets through brick or component refs:
+    /// [`super::ref_player`], [`super::text_refs`],
+    /// [`crate::audio::stream_refs`]. A render whose one-array tables would
+    /// not fit falls back to wires.
+    #[default]
+    Refs,
+}
+
+/// Whether a brick-mode render of this size takes the ref driver: asked
+/// for, and its pixel list and per-frame tables each fit one array. A frame
+/// count the source cannot give up front is assumed to fit.
+pub fn uses_refs(opts: &AnimOptions, width: u32, height: u32, frames: Option<usize>) -> bool {
+    let cap = opts.bank_size.max(1);
+    opts.driver == Driver::Refs
+        && width as usize * height as usize <= cap
+        && frames.is_none_or(|f| f <= cap)
+}
+
 pub struct AnimOptions {
     pub alpha_threshold: u8,
+    /// Wires or refs; see [`Driver`].
+    pub driver: Driver,
+    /// Keyframe and delta settings for [`Driver::Refs`].
+    pub records: super::ref_player::RecordOptions,
     /// Half-extent of a display pixel, in game units, before the style's own
     /// scale is applied (unscaled for Micro, 5x for SmoothTile). `1` is the
     /// smallest legal value: a 2-unit-wide micro brick or 10-unit smooth tile.
@@ -141,11 +165,20 @@ pub struct AnimOptions {
     /// Defaults to `BANK_FRAMES`. Lowering it is how the multi-bank graph is
     /// tested without building a 65 536-frame clip.
     pub bank_size: usize,
+    /// Refs driver: most array data per main-grid chunk before record banks
+    /// or band arrays move to the next chunk. Defaults to
+    /// [`crate::graph::CHUNK_DATA_BYTES`]; lowering it is how the spread is
+    /// tested without a gigabyte clip.
+    pub chunk_bytes: usize,
     /// Text mode only: quantize every frame to at most this many colours with
     /// a median-cut palette ([`super::palette::Palette`]) before encoding.
     /// `0` (default) means no quantization; both brick encodings ignore this
     /// field, since they spend a fixed cost per pixel no palette can change.
     pub colors: usize,
+    /// Text mode only: per-pixel hold threshold, `0` (default) for off. See
+    /// [`super::text_pack::TextPacker::hold`]. Brick mode's equivalent is
+    /// [`super::ref_player::RecordOptions::delta_threshold`].
+    pub hold: u8,
     /// Text mode only: the font, glyph and component geometry a text render
     /// uses. Lives on `AnimOptions` rather than as an extra parameter because
     /// all three renderers share one signature. Both brick encodings ignore
@@ -188,10 +221,19 @@ pub struct AnimOptions {
     pub source_start_s: f64,
 }
 
+impl AnimOptions {
+    /// The defaults with [`Driver::Wires`].
+    pub fn wired() -> Self {
+        AnimOptions { driver: Driver::Wires, ..AnimOptions::default() }
+    }
+}
+
 impl Default for AnimOptions {
     fn default() -> Self {
         Self {
             alpha_threshold: 128,
+            driver: Driver::Refs,
+            records: super::ref_player::RecordOptions::default(),
             pixel_extent: 1,
             brick_style: DisplayBrickStyle::Micro,
             external_clock: false,
@@ -205,7 +247,9 @@ impl Default for AnimOptions {
             glow: false,
             srgb_to_linear: false,
             bank_size: BANK_FRAMES,
+            chunk_bytes: crate::graph::CHUNK_DATA_BYTES,
             colors: 0,
+            hold: 0,
             text: crate::text::FontPreset::MonaspaceArgon.options(1.0),
             subtitles: None,
             subtitle_scale: super::subtitle_display::DEFAULT_SUBTITLE_SCALE,
@@ -348,38 +392,18 @@ pub fn add_display_bricks(
 /// SmoothTile's real x half-extent is `5*extent`, and using the unscaled
 /// value would leave the shell overlapping the screen.
 ///
-/// The entity location computed here aims the interaction plane at the
-/// screen's middle but does not land there: `chip::finish` does not centre
-/// the chip's contents on the grid origin, and `chip::recompute_plane_extent`
-/// shifts `entity.location` again afterward. This is only the plane's
-/// starting point.
-///
-/// The `plane_extent` passed to `chip::new_chip` is a placeholder, not a real
-/// bound -- no caller can know the true extent before every gate/pin exists.
-/// `chip::finish` recomputes and grows it to fit every placed brick.
-pub fn new_screen_chip(
-    world: &mut World,
-    w: i32,
-    h: i32,
-    geometry: &ScreenGeometry,
-) -> chip::Chip {
+/// The chip beside the screen. `chip::finish` sets the plane's size and puts
+/// it on the shell once every gate is placed, so the `plane_extent` passed to
+/// `chip::new_chip` here is only a placeholder.
+pub fn new_screen_chip(world: &mut World, geometry: &ScreenGeometry) -> chip::Chip {
     let shell_half_x = {
         let (min, max) = Brick { asset: B_MICROCHIP, ..Default::default() }.local_bounds();
         (max.x - min.x) / 2
     };
     let shell_x = -(shell_half_x + geometry.footprint);
-    let screen_span = |n: i32| (n - 1).max(0) * geometry.pitch;
-    let plane_anchor = Vector3f {
-        x: screen_span(w) as f32 / 2.0,
-        y: screen_span(h) as f32 / 2.0,
-        // Screen's top face is at 2*half_height (bricks rest their underside
-        // on z=0); rise clear of it from there.
-        z: (2 * geometry.half_height + PLANE_HEIGHT_ABOVE_SCREEN) as f32,
-    };
     chip::new_chip(
         world,
         Position { x: shell_x, y: 0, z: 2 },
-        plane_anchor,
         IntVector { x: 5, y: 5, z: 5 },
     )
 }
@@ -452,7 +476,7 @@ pub fn build_brick_world(
     // every tick.
     if frame_count == 0 {
         return Err(
-            "clip has 0 frames -- nothing to render (check --start/--duration, or the GUI's \
+            "clip has 0 frames: nothing to render (check --start/--duration, or the GUI's \
              Start/Duration, against the source's length)"
                 .to_string(),
         );
@@ -465,7 +489,7 @@ pub fn build_brick_world(
     let (brick_of, geometry) = add_display_bricks(&mut world, opts, w, h, &visible);
 
     // --- 2. The chip --------------------------------------------------------
-    let mut chip = new_screen_chip(&mut world, w, h, &geometry);
+    let mut chip = new_screen_chip(&mut world, &geometry);
 
     // Service gates sit behind both pixel stages, so they must use the same
     // stage pitch the (upright, 10-deep) pixel gates do -- with the flat
@@ -534,7 +558,7 @@ pub fn build_brick_world(
             let array = gate(&mut chip, "B_1x1_Gate_Variable_Array", ARRAY_VAR,
                 service(col, -5), vec![(
                     "Value",
-                    Box::new(WireArrayVariant::StringArray(frames.to_vec()))
+                    Box::new(WireArray::Str(frames.to_vec()))
                         as Box<dyn AsBrdbValue>,
                 )]);
             let get = gate(&mut chip, "B_1x1_Gate_Exec_ArrayVar_Get", ARRAY_GET,
@@ -610,8 +634,8 @@ pub fn build_brick_world(
                 SUBSTRING,
                 lattice_pos_staged(col, row, 1, h, PIXEL_GATE_HALF, STAGE_PITCH),
                 vec![
-                    // bare i64, not WireVariant::Int -- this gate's schema
-                    // fields are plain scalars; a WireVariant fails at encode
+                    // bare i64, not WireValue::Int -- this gate's schema
+                    // fields are plain scalars; a WireValue fails at encode
                     // time with UnimplementedCast.
                     (
                         "Start",
@@ -782,7 +806,7 @@ mod tests {
                 assert!(
                     min.0 >= 0 && min.1 >= 0 && min.2 >= 0,
                     "h={h} stage={stage}: a column-0 pixel gate centred at \
-                     ({}, {}, {}) with real half ({}, {}, {}) reaches {min:?} -- negative \
+                     ({}, {}, {}) with real half ({}, {}, {}) reaches {min:?}; negative \
                      inner-grid coordinates are what this crate says delete bricks in game",
                     pos.x,
                     pos.y,
@@ -999,7 +1023,7 @@ mod tests {
         assert_eq!(
             progress.polls.get(),
             before_the_pixels + 1,
-            "the pixel loop must bail on its first poll -- {} polls means it walked all \
+            "the pixel loop must bail on its first poll, but {} polls means it walked all \
              {} pixels instead",
             before_the_pixels + (SIDE * SIDE) as usize,
             SIDE * SIDE

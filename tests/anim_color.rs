@@ -9,7 +9,8 @@
 #[path = "wire_integrity.rs"]
 mod wire_integrity;
 
-use brdb::{IntVector, IntoReader, Position, schema::WireArrayVariant};
+use brdb::{IntVector, IntoReader, Position};
+use heightmap::wire_array::WireArray;
 use heightmap::anim::bricks::{
     ARRAY_GET, ARRAY_VAR, AnimOptions, BRANCH, CHANGE_DETECTOR, COMPARE_GE, DisplayBrickStyle,
     PROP_CHANGER, SELECT, build_brick_world,
@@ -70,12 +71,12 @@ fn saved_color_arrays(db: &brdb::BrReader<impl brdb::BrFsReader>, gid: usize) ->
     for chunk in &db.brick_chunk_index(gid).expect("chunk index") {
         let (_soa, structs) = db.component_chunk(gid, chunk.index).expect("components");
         for s in &structs {
-            if s.get_name() == "BrickComponentData_WireGraphPseudo_ArrayVar"
+            if s.get_name() == "BrickComponentData_ArrayVar"
                 && let Some(value) = s.get("Value")
             {
-                let variant: WireArrayVariant =
+                let variant: WireArray =
                     value.try_into().expect("ArrayVar Value must decode");
-                if let WireArrayVariant::LinearColorArray(v) = variant {
+                if let WireArray::LinearColor(v) = variant {
                     arrays.push(v);
                 }
             }
@@ -118,8 +119,8 @@ fn colour_array_mode_is_two_gates_per_pixel_and_emits_no_string_gates() {
     assert_eq!(count_component(&world, ARRAY_VAR), 12, "one array per pixel");
     assert_eq!(count_component(&world, ARRAY_GET), 12, "one Get per pixel");
     for gone in [
-        "BrickComponentType_WireGraph_Expr_String_Substring",
-        "BrickComponentType_WireGraph_Expr_MakeColorHex",
+        "BrickComponentType_Expr_String_Substring",
+        "BrickComponentType_Expr_MakeColorHex",
     ] {
         assert_eq!(count_component(&world, gone), 0, "{gone} must not appear at all");
     }
@@ -230,7 +231,7 @@ fn every_pixels_get_exec_is_fed_directly_by_the_detector() {
         assert_eq!(
             s.component_type.to_string(),
             CHANGE_DETECTOR,
-            "Get {get}'s Exec must come from the change detector, not from {:?} -- a chain \
+            "Get {get}'s Exec must come from the change detector, not from {:?}; a chain \
              through another Get's ExecOut is the design this mode rejects",
             s.component_type
         );
@@ -245,7 +246,7 @@ fn every_pixels_get_exec_is_fed_directly_by_the_detector() {
             .iter()
             .any(|w| w.source.component_type.to_string() == ARRAY_GET
                 && w.source.port_name.to_string() == "ExecOut"),
-        "no Get's ExecOut may drive anything -- the gets fan out from one source, never chain"
+        "no Get's ExecOut may drive anything: the gets fan out from one source, never chain"
     );
 }
 
@@ -420,7 +421,7 @@ fn no_inner_brick_lands_at_a_negative_coordinate() {
             let center = b.position + Position::CHUNK_HALF;
             assert!(
                 center.x >= 0 && center.y >= 0 && center.z >= 0,
-                "{w}x{h}x{frames} bank {bank}: inner brick centred at {center:?} is negative -- \
+                "{w}x{h}x{frames} bank {bank}: inner brick centred at {center:?} is negative; \
                  negative inner-grid coordinates break bricks in-game"
             );
         }
@@ -516,7 +517,7 @@ fn the_chip_plane_contains_every_brick_of_a_multi_bank_render() {
 fn a_single_bank_render_emits_no_spillover_gates() {
     let clip = distinct_clip(4, 3, 5);
     let world = build_color_array_world(&clip, &AnimOptions::default(), &mut NoProgress).unwrap();
-    for class in [COMPARE_GE, BRANCH, SELECT, "BrickComponentType_WireGraph_Expr_MathSubtract"] {
+    for class in [COMPARE_GE, BRANCH, SELECT, "BrickComponentType_Expr_MathSubtract"] {
         assert_eq!(count_component(&world, class), 0, "a single-bank render must emit no {class}");
     }
 }
@@ -578,7 +579,7 @@ fn a_boundary_costs_shared_gates_plus_one_select_per_pixel() {
     assert_eq!(count_component(&world, COMPARE_GE), 3, "one comparator per boundary");
     assert_eq!(count_component(&world, BRANCH), 3, "one branch per boundary");
     assert_eq!(
-        count_component(&world, "BrickComponentType_WireGraph_Expr_MathSubtract"),
+        count_component(&world, "BrickComponentType_Expr_MathSubtract"),
         3,
         "one index subtract per extra bank"
     );
@@ -705,7 +706,7 @@ fn boundary_constants_are_the_real_multiples_of_the_bank_size() {
     for chunk in &db.brick_chunk_index(gid).expect("chunk index") {
         let (_soa, structs) = db.component_chunk(gid, chunk.index).expect("components");
         for s in &structs {
-            if s.get_name() == "BrickComponentData_WireGraph_Expr_MathCompare" {
+            if s.get_name() == "BCSComponentVertex_Expr_MathCompare" {
                 match s.get("InputB") {
                     Some(brdb::schema::BrdbValue::I64(v)) => bounds.push(*v),
                     Some(brdb::schema::BrdbValue::F64(v)) => bounds.push(*v as i64),
@@ -794,7 +795,7 @@ fn a_failing_stream_aborts_the_render() {
 /// `anim::cost`'s module doc -- so costing "the same screen" means costing it
 /// against the same options.
 fn bank_opts(bank_size: usize) -> AnimOptions {
-    AnimOptions { bank_size, ..AnimOptions::default() }
+    AnimOptions { bank_size, ..AnimOptions::wired() }
 }
 
 /// The estimate must match a real render's gates, wires and bricks exactly for
@@ -837,14 +838,14 @@ fn the_encoding_enum_dispatches_to_the_right_renderer() {
     assert_eq!(AnimEncoding::parse("nonsense"), None);
 
     let clip = distinct_clip(3, 2, 3);
-    let opts = AnimOptions::default();
+    let opts = AnimOptions::wired();
     let hex = AnimEncoding::Hex.build(&clip, &opts, &mut NoProgress).expect("hex");
     let color = AnimEncoding::ColorArray.build(&clip, &opts, &mut NoProgress).expect("colour");
 
     let has = |w: &brdb::World, class: &str| count_component(w, class) > 0;
-    assert!(has(&hex, "BrickComponentType_WireGraph_Expr_MakeColorHex"), "hex must build hex");
+    assert!(has(&hex, "BrickComponentType_Expr_MakeColorHex"), "hex must build hex");
     assert!(
-        !has(&color, "BrickComponentType_WireGraph_Expr_MakeColorHex"),
+        !has(&color, "BrickComponentType_Expr_MakeColorHex"),
         "colour-array mode must not build hex gates"
     );
 

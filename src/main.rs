@@ -29,7 +29,8 @@ use env_logger::Builder;
 use heightmap::{
     anim::{
         AnimEncoding, AnimMode,
-        bricks::{AnimOptions, DisplayBrickStyle},
+        bricks::{AnimOptions, Driver, DisplayBrickStyle},
+        ref_player::RecordOptions,
         color_bricks, cost,
         pack::MAX_FRAMES,
         subtitle_display::{DEFAULT_SUBTITLE_LIFT, DEFAULT_SUBTITLE_SCALE},
@@ -95,7 +96,7 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg stud: --stud "Render bricks as stud cubes")
         (@arg terrain: --terrain "Render the terrain as SMOOTH micro bricks instead of flat-topped tiles: every pixel gets a sloped top chosen from Brickadia's micro wedge family (ramp, wedge corner, inner corner, and the stacked diagonal corner+triangle), fitted to the four shared vertex heights around it. Heights are sampled on a shared (w+1)x(h+1) vertex grid so neighbouring cells MEET rather than step. Replaces --tile/--smooth/--micro/--stud and the optimizers, which have no meaning once the top face is not flat")
         (@arg rampify: --rampify "Rampify the terrain with Wrapperup's rampifier: fit full-size ramps, wedges and ramp corners onto the height column surface and fill the rest with plain bricks. Coarser than --terrain (one plate of vertical resolution, runs of at most 4 studs) but uses ordinary bricks rather than micro pieces. Replaces --tile/--smooth/--micro/--stud and the optimizers")
-        (@arg wedge: --wedge "Build TERRACED wedge terrain: tops stay flat, every height is a whole terrace step, and the outlines of the terraces are cut at 45 degrees by vertical side wedges (PB_DefaultSideWedge) -- convex corners chamfered, concave corners filled, collinear staircases merged into single large wedges, flat tops greedy-merged into boxes. Unbuildable configurations (diagonal crossings, spikes) are eroded first. Unlike --terrain and --rampify, slopes are not approximated: this is the terraced 'brick terrain' look of hand-built Brickadia maps. Replaces --tile/--smooth/--micro/--stud and the optimizers")
+        (@arg wedge: --wedge "Build TERRACED wedge terrain: tops stay flat, every height is a whole terrace step, and the outlines of the terraces are cut at 45 degrees by vertical side wedges (PB_DefaultSideWedge): convex corners chamfered, concave corners filled, collinear staircases merged into single large wedges, flat tops greedy-merged into boxes. Unbuildable configurations (diagonal crossings, spikes) are eroded first. Unlike --terrain and --rampify, slopes are not approximated: this is the terraced 'brick terrain' look of hand-built Brickadia maps. Replaces --tile/--smooth/--micro/--stud and the optimizers")
         (@arg prefab: --prefab "Heightmap/image renders: write a PREFAB bundle instead of a world, so the save can be dropped in Brickadia's Prefabs folder and spawned from the prefab browser rather than loaded as a level")
         (@arg snap: --snap "Snap bricks to the brick grid")
         (@arg lrgb: --lrgb "DEPRECATED and ignored. Colormap pixels always go into the bricks without conversion, because a save file stores brick colours in the same encoding as an image")
@@ -119,33 +120,33 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg lumathreshold: --("luma-threshold") +takes_value "Braille/blocks: pixels at least this bright are drawn (default 128)")
         (@arg invert: --invert "Braille/blocks: draw dark pixels instead of bright ones")
         (@arg material: --material +takes_value "Text mode: material (unlit, graffiti, plastic, metallic, glow, translucent, glass; default unlit)")
-        (@arg audiomode: --("audio-mode") +takes_value "Audio output mode: 'bank' = Pitch-Per-Speaker (a fixed bank of ~79 speakers, each owning one pitch, only their volumes written -- best for speech and broadband material) or 'voice' = Pitch Switching (--max-voices speakers that TRACK spectral peaks, re-pitching every frame -- no band grid, so no tuning error; best for tonal material such as piano)")
+        (@arg audiomode: --("audio-mode") +takes_value "Audio output mode: 'bank' = Pitch-Per-Speaker (a fixed bank of ~79 speakers, each owning one pitch, only their volumes written; best for speech and broadband material) or 'voice' = Pitch Switching (--max-voices speakers that TRACK spectral peaks, re-pitching every frame, with no band grid and so no tuning error; best for tonal material such as piano)")
         (@arg audiotrack: --("audio-track") +takes_value "Audio: which audio stream to decode, 0 = first (default 0). Dual-audio releases commonly carry the original language first and the dub second, so which is 'first' is a container-ordering accident. Needs the ffmpeg backend")
-        (@arg audiobands: --bands +takes_value "Audio: total speakers including noise bands. Tonal bands sit on exact equal-tempered steps, so this SELECTS THE SPAN (the steps nearest A440), not the spacing. Default: every step the emitter's pitch range holds -- 79 tonal at --subdiv 12 (F#1..C8), 159 at 24")
-        (@arg audiosubdiv: --subdiv +takes_value "Audio: tonal bands per octave. MUST BE A MULTIPLE OF 12 -- only then does every band land on a real semitone, and anything else was heard in game as out of tune (14 sharp, 18 flat). 12 (default, one per semitone) is preferred; 24 (quarter-tones) halves the error on a source not tuned to A440 but splits each note across two speakers, which was heard as 'a little weird'")
-        (@arg audionoise: --("noise-bands") +takes_value "Audio: white/pink noise speakers carrying the energy off either end of the tonal range, 0-2 (default 0 -- reported worse in game on speech, piano and a pop mix alike; 2 is worth trying on percussion, which nothing else in the bank can render)")
+        (@arg audiobands: --bands +takes_value "Audio: total speakers including noise bands. Tonal bands sit on exact equal-tempered steps, so this SELECTS THE SPAN (the steps nearest A440), not the spacing. Default: every step the emitter's pitch range holds, i.e. 79 tonal at --subdiv 12 (F#1..C8), 159 at 24")
+        (@arg audiosubdiv: --subdiv +takes_value "Audio: tonal bands per octave. MUST BE A MULTIPLE OF 12: only then does every band land on a real semitone, and anything else was heard in game as out of tune (14 sharp, 18 flat). 12 (default, one per semitone) is preferred; 24 (quarter-tones) halves the error on a source not tuned to A440 but splits each note across two speakers, which was heard as 'a little weird'")
+        (@arg audionoise: --("noise-bands") +takes_value "Audio: white/pink noise speakers carrying the energy off either end of the tonal range, 0-2 (default 0, since it was reported worse in game on speech, piano and a pop mix alike; 2 is worth trying on percussion, which nothing else in the bank can render)")
         (@arg audiofps: --("audio-fps") +takes_value "Audio: analysis frames per second (default 30)")
         (@arg audiowindow: --window +takes_value "Audio: STFT (short-time Fourier transform) window size (default 4096)")
         (@arg audiogain: --gain +takes_value "Audio: post-normalization gain (default 1.0)")
         (@arg audioleveling: --leveling +takes_value "Audio: per-frame leveling, 0 = keep the track's dynamics (default), 1 = full AGC")
         (@arg audiomaxvoices: --("max-voices") +takes_value "Audio: in --audio-mode bank, an upper bound on bands sounding at once (default 12; 0 = every band); in --audio-mode voice, the number of speakers built, each sounding most frames (32 simultaneous emitters are verified to work). In bank mode, --peak-gate is usually the real limit")
-        (@arg audiopeakgate: --("peak-gate") +takes_value "Audio (Pitch-Per-Speaker, --audio-mode bank): how far above the mean of its neighbourhood a band must stand to count as a note, as an amplitude ratio (default 1.5 = 3.5 dB). THIS, not --max-voices, is what limits a dense frame -- lower it to sound more bands at once. 1.0 disables it (every local maximum), which is the pre-gate wall-of-sound behaviour")
+        (@arg audiopeakgate: --("peak-gate") +takes_value "Audio (Pitch-Per-Speaker, --audio-mode bank): how far above the mean of its neighbourhood a band must stand to count as a note, as an amplitude ratio (default 1.5 = 3.5 dB). THIS, not --max-voices, is what limits a dense frame, so lower it to sound more bands at once. 1.0 disables it (every local maximum), which is the pre-gate wall-of-sound behaviour")
         (@arg audioattack: --attack +takes_value "Audio: envelope attack in milliseconds (default 10). How fast a speaker's level RISES toward what the analysis measured. Short by design, so struck notes stay punchy")
         (@arg audiorelease: --release +takes_value "Audio: envelope release in milliseconds (default 150). How fast a speaker's level FALLS, including after its band stops being selected. THIS is what stops one-frame selections sounding like beeps. 0 for both = no smoothing, i.e. the pre-envelope renderer")
-        (@arg audiovoicerelease: --("voice-release") +takes_value "Audio (Pitch Switching, --audio-mode voice): how long a voice takes to fade to EXACTLY zero once its partial has gone, in milliseconds (default 50). Distinct from --release, which is a time constant on a voice that is still sounding and never reaches zero. THE MATERIAL DECIDES IT: a spoken phoneme is 50-100 ms long and anything near 150 smears across it (speech came back 'disembodied'), while a sustained note can afford more -- 150 restores the old behaviour. 0 clamps to one analysis frame, the shortest fade the format can express")
+        (@arg audiovoicerelease: --("voice-release") +takes_value "Audio (Pitch Switching, --audio-mode voice): how long a voice takes to fade to EXACTLY zero once its partial has gone, in milliseconds (default 50). Distinct from --release, which is a time constant on a voice that is still sounding and never reaches zero. THE MATERIAL DECIDES IT: a spoken phoneme is 50-100 ms long and anything near 150 smears across it (speech came back 'disembodied'), while a sustained note can afford more (150 restores the old behaviour). 0 clamps to one analysis frame, the shortest fade the format can express")
         (@arg audiopitchsnap: --("pitch-snap") +takes_value "Audio (Pitch Switching, --audio-mode voice): pull a continuing voice onto the nearest equal-tempered semitone when it is within this many cents (default 0 = off, max 50 = half a semitone, i.e. always). Trades vibrato and glissando for a rock-steady pitch; the frame-to-frame wobble is already smoothed without it")
         (@arg audioinner: --("inner-radius") +takes_value "Audio: speaker no-attenuation radius in units (default 15; 10 units = 1 brick). Raise it (e.g. 400) for one flat equal-level field across a large build")
         (@arg audiomaxdist: --("max-distance") +takes_value "Audio: speaker audible range in units (default 400; 10 units = 1 brick). Raise it (e.g. 4000) to be heard across a big build")
         (@arg audiospeakersinchip: --("speakers-in-chip") "Audio: place the speaker cluster INSIDE the microchip's own inner grid instead of beside it on the main grid, so the whole audio device is one portable microchip. The speakers play from the chip's ORIGIN regardless of their inner-grid layout (an AudioEmitter on a microchip inner grid emits from the chip's world position), so the layout is physical placement only, not spatial audio. Default off (speakers beside the chip)")
-        (@arg audiosynth: --synth +takes_value "Audio: the synth waveform every TONAL band plays through -- sine (default), square, triangle or sawtooth. Applies to tonal bands in BOTH modes; white/pink --noise-bands keep their own noise assets and are unaffected. Default sine renders exactly as before this flag existed")
-        (@arg midi: --midi "MIDI (midi2brick): read the input as a Standard MIDI File and build an EVENT-BASED speaker world -- each track's notes are stored as spans and played by a runtime playhead. The input is the .mid; -o is the .brz. Tones: a waveform is picked per instrument from its General MIDI program (bass/electric guitar sawtooth, lead square, piano/vocals sine, ...); --synth forces one wave for the whole file. Per-track manual tones are a GUI feature. Reuses --inner-radius, --max-distance, --gain, --no-loop, --no-control-buttons, --speakers-in-chip and --polyphony-cap")
+        (@arg audiosynth: --synth +takes_value "Audio: the synth waveform every TONAL band plays through: sine (default), square, triangle or sawtooth. Applies to tonal bands in BOTH modes; white/pink --noise-bands keep their own noise assets and are unaffected. Default sine renders exactly as before this flag existed")
+        (@arg midi: --midi "MIDI (midi2brick): read the input as a Standard MIDI File and build an EVENT-BASED speaker world: each track's notes are stored as spans and played by a runtime playhead. The input is the .mid; -o is the .brz. Tones: a waveform is picked per instrument from its General MIDI program (bass/electric guitar sawtooth, lead square, piano/vocals sine, ...); --synth forces one wave for the whole file. Per-track manual tones are a GUI feature. Reuses --inner-radius, --max-distance, --gain, --no-loop, --no-control-buttons, --speakers-in-chip and --polyphony-cap")
         (@arg midilist: --("midi-list") "MIDI: with --midi, print the discovered instruments (name, channel, note count, max polyphony) and the file's format/duration/tempo, then exit without building")
         (@arg midipolyphony: --("polyphony-cap") +takes_value "MIDI: maximum speakers per instrument, however many notes it plays at once (default 8). A busier instrument steals its oldest sounding note")
         (@arg midirate: --("playback-rate") +takes_value "MIDI: playback speed multiplier baked into the clock (default 1.0; 2.0 = double speed, 0.5 = half). The generated Rate pin still overrides it at runtime")
         (@arg nopercussion: --("no-percussion") "MIDI: skip the percussion channel (10). By default each drum note plays a oneshot sample, mapped from its General MIDI drum note through a fold table; this builds only the pitched instruments")
         (@arg animmode: --("anim-mode") +takes_value "Animation output mode (brick, text). 'brick' builds one display brick per pixel, driven by the encoding --anim-encoding selects. 'text' builds one animated Component_TextDisplay per BAND of image rows instead, roughly two orders of magnitude fewer gates (a 192x108 clip is 113 gates against 4613), at the cost of glyph-grid rendering rather than real bricks. Text mode reuses --font, --char-repeat, --width-scale, --fill-char, --empty-char, --alpha-threshold, --line-height-world and --short-hex, and adds --colors")
         (@arg animcolors: --("colors") +takes_value "Text mode: quantize to at most N colours with a median-cut palette (default 0 = full 24-bit colour). Fewer colours means longer same-colour runs and a smaller save; useful values are 16 to 64")
-        (@arg animencoding: --("anim-encoding") +takes_value "Animation pixel encoding (hex, color-array; default hex). 'hex' packs each frame into a shared RRGGBB string per chunk; 'color-array' gives each pixel its own colour array -- fewer gate evaluations and no string work, at the cost of more host RAM to build")
+        (@arg animencoding: --("anim-encoding") +takes_value "Animation pixel encoding (hex, color-array; default hex). 'hex' packs each frame into a shared RRGGBB string per chunk; 'color-array' gives each pixel its own colour array, for fewer gate evaluations and no string work, at the cost of more host RAM to build")
         (@arg animfps: --fps +takes_value "Animation output frame rate (default 10)")
         (@arg animstart: --start +takes_value "Start offset into the source, seconds")
         (@arg animduration: --duration +takes_value "Duration taken from the source, seconds")
@@ -154,14 +155,20 @@ fn cli() -> clap::App<'static, 'static> {
         (@arg animheight: --height +takes_value "Target height in pixels")
         (@arg animfit: --fit +takes_value "Fit mode (exact, contain, cover; default contain)")
         (@arg animfilter: --filter +takes_value "Resample filter (lanczos, nearest; default lanczos)")
-        (@arg subtitles: --subtitles +takes_value "Animation: render this subtitle file (.srt, .ass/.ssa) as a single wired TextDisplay overlaying the bottom of the screen -- 2 gates for the whole track, centred and outlined, at vector-glyph size rather than the screen's pixel grid. The file is read in SOURCE time, so --start is honoured. Mutually exclusive with --subtitle-track")
-        (@arg subtitletrack: --("subtitle-track") +takes_value "Animation: extract subtitles from the input container instead, 0 = the first SUBTITLE stream (not the first stream). Text tracks only -- a PGS/DVD/DVB track is an image sequence with no text in it, and is refused by name rather than rendered as an empty track. Needs ffmpeg. Mutually exclusive with --subtitles")
+        (@arg subtitles: --subtitles +takes_value "Animation: render this subtitle file (.srt, .ass/.ssa) as a single wired TextDisplay overlaying the bottom of the screen: 2 gates for the whole track, centred and outlined, at vector-glyph size rather than the screen's pixel grid. The file is read in SOURCE time, so --start is honoured. Mutually exclusive with --subtitle-track")
+        (@arg subtitletrack: --("subtitle-track") +takes_value "Animation: extract subtitles from the input container instead, 0 = the first SUBTITLE stream (not the first stream). Text tracks only: a PGS/DVD/DVB track is an image sequence with no text in it, and is refused by name rather than rendered as an empty track. Needs ffmpeg. Mutually exclusive with --subtitles")
         (@arg subtitlescale: --("subtitle-scale") +takes_value "Animation: how much bigger a subtitle line is than one row of the screen (default 6). At 192 px wide the screen is hundreds of glyph cells across while a subtitle line is 40-60 characters, so at equal size the text would occupy a seventh of the width; 6 covers about half. Ignored without --subtitles/--subtitle-track")
         (@arg subtitlelift: --("subtitle-lift") +takes_value "Animation: world units to lift the subtitle anchor toward the top of the picture (default 8, measured by eye against --anim-mode text at 192x108 with --subtitle-scale 6). --anim-mode brick/color-array lay their screen flat, so the lift there moves the OPPOSITE horizontal axis and is unverified by eye. Refused, not clamped, if it would push the anchor to a negative coordinate on a picture shorter than the lift. Ignored without --subtitles/--subtitle-track")
         (@arg externalclock: --("external-clock") "Expose Frame as a chip input instead of running a timer")
         (@arg noloop: --("no-loop") "Play through once and stop on the last frame, instead of looping forever (the default). Applies to video and audio alike. Inert with --external-clock, which builds no timer at all")
         (@arg nocontrolbuttons: --("no-control-buttons") "Do NOT pre-generate the three physical Pause/Restart/Resume BUTTON bricks on the main grid, wired into the clock's control pins (default: buttons ON, so a fresh render is pausable/restartable/resumable with no manual wiring). Video and audio alike. Adds 9 main-grid bricks and 6 wires per render; no extra microchip gate. Inert with --external-clock, which builds no timer and so exposes no control pins")
+        (@arg nomidifunctions: --("no-midi-functions") "MIDI: build each speaker's playhead as its own ~16-gate wired chain, as before, instead of a call of one shared function (the default: about 4 gates a speaker, and every note that ends inside a tick is passed in that tick)")
         (@arg animbrickstyle: --("brick-style") +takes_value "Animation display-brick style (micro, tile; default micro)")
+        (@arg driver: --("driver") +takes_value "How frames reach the screen or speakers (refs, wires; default refs). Brick mode: 'wires' spends two gates per pixel wired into each brick; 'refs' keeps the bricks bare and repaints them through brick references from a fixed ~45-gate player that loops over keyframe/delta records, so resolution no longer costs gates and the cost moves to loop iterations per frame change. Text mode: 'refs' sets every band's text from one loop through component references instead of two gates and a wire per band. Audio bank/voice modes: 'refs' sets every speaker's volume (and pitch) from one loop instead of wiring each speaker. A render too large for refs' one-array tables (over 65535 pixels or frames) is built wired, as are audio speakers placed in the chip")
+        (@arg keyframeinterval: --("keyframe-interval") +takes_value "--driver refs: store a full keyframe at least every N frames (default 60; 1 = every frame, no deltas). A seek or a loop wrap replays from the nearest keyframe, so a longer interval means smaller saves but more work per jump")
+        (@arg deltathreshold: --("delta-threshold") +takes_value "--driver refs: skip pixel changes no larger than this per channel (0-255, default 0 = lossless). The encoder tracks what is on screen, so skipped changes never drift further than this")
+        (@arg densekeyframes: --("dense-keyframes") "--driver refs, hex encoding: store each keyframe as RRGGBB per pixel in order, without the pixel index. Lossless and about a third smaller on real video")
+        (@arg hold: --("hold") +takes_value "Text mode: a pixel keeps the colour it shows until the source moves more than N on some channel (0-255, default 0 = off). Shown colours never drift further than N, and on noisy video the save shrinks a lot (bee at 64x32: 333 MB to 185 MB at --hold 8)")
         (@arg animpixelextent: --("pixel-extent") +takes_value "Animation display-brick half-extent in units (default 1; 1 = smallest, 2 units wide; tile style is always 4 units tall)")
         (@arg yesdownload: --yes "Consent to downloading ffmpeg if it is missing and a video backend needs it")
         (@arg nodownload: --("no-download") "Never download ffmpeg; error instead if it is missing")
@@ -772,6 +779,7 @@ fn midi_options(matches: &clap::ArgMatches) -> Result<MidiOptions, String> {
         tones,
         build_percussion: !matches.is_present("nopercussion"),
         drum_kit: Vec::new(),
+        functions: !matches.is_present("nomidifunctions"),
     })
 }
 
@@ -914,8 +922,8 @@ fn run_anim(
             "subtitles over --anim-mode brick lie FLAT in the screen's own plane (the \
              screen is on the ground, so they are read from above, not from the front), \
              just above its surface and centred on the image's last row. Which \
-             horizontal axis the line runs along -- and so whether that row reads as \
-             the BOTTOM of the picture -- is unverified in game; --anim-mode text, \
+             horizontal axis the line runs along (and so whether that row reads as \
+             the BOTTOM of the picture) is unverified in game; --anim-mode text, \
              whose screen is an upright wall, is the mode this was designed against"
         );
     }
@@ -958,7 +966,7 @@ fn run_anim(
     if mode == AnimMode::Brick(AnimEncoding::ColorArray) && matches.is_present("srgb2lin") {
         warn!(
             "--srgb-to-linear is implied by --anim-encoding color-array (that encoding \
-             stores linear colors, so it always converts) -- the flag changes nothing here"
+             stores linear colors, so it always converts), so the flag changes nothing here"
         );
     }
     // Third and last inert case: text mode writes colour tags straight
@@ -1680,7 +1688,7 @@ fn run_heightmap(
     // `make_prefab` calculates from the brick positions. The code thus changes
     // the completed world and does not send this option to each generator.
     if matches.is_present("prefab") {
-        data.make_prefab();
+        heightmap::prefab::make_prefab(&mut data);
     }
     if let Err(e) = write_world(&data, &out_file) {
         fail!("{e}");
@@ -1710,6 +1718,10 @@ fn log_cost(mode: AnimMode, cost: &cost::Cost, width: u32, height: u32, char_rep
         cost.banks,
         cost.frames
     );
+    info!("  {} gate run(s) in the tick a frame changes, worst case", cost.tick_gates);
+    if let Some(w) = cost.tick_warning() {
+        warn!("{w}");
+    }
     match mode {
         AnimMode::Brick(AnimEncoding::Hex) => {
             info!("  {} chunk(s), {} character(s)", cost.chunks, cost.chars)
@@ -1730,7 +1742,7 @@ fn log_cost(mode: AnimMode, cost: &cost::Cost, width: u32, height: u32, char_rep
                          {repeat} glyph char(s) per pixel, worst case every pixel starting its \
                          own run; a tag spends 13 when its channels repeat a digit, or always \
                          with --short-hex). NOT an \
-                         estimate -- real length is content-dependent, which is why no character \
+                         estimate: real length is content-dependent, which is why no character \
                          total is reported above; --colors is what shortens it",
                         plan.len(),
                     );
@@ -1824,7 +1836,7 @@ fn load_subtitles(
 
     if track.is_empty() {
         warn!(
-            "the subtitle track has no cues at all -- the render will show no subtitles, \
+            "the subtitle track has no cues at all; the render will show no subtitles, \
              which looks exactly like a correct render of a scene with no dialogue"
         );
     }
@@ -1917,6 +1929,27 @@ fn anim_options(
         1u16,
     )?
     .max(1);
+    let driver = match matches.value_of("driver").map(|s| s.to_lowercase()).as_deref() {
+        None | Some("refs") => Driver::Refs,
+        Some("wires") => Driver::Wires,
+        Some(other) => return Err(format!("unknown driver '{other}' (refs, wires)")),
+    };
+    let records = RecordOptions {
+        keyframe_interval: parse_arg(matches, "keyframeinterval", "--keyframe-interval", "an integer", 60usize)?.max(1),
+        delta_threshold: parse_arg(matches, "deltathreshold", "--delta-threshold", "an integer from 0 to 255", 0u8)?,
+        dense_keyframes: matches.is_present("densekeyframes"),
+    };
+    if driver == Driver::Wires
+        && (matches.is_present("keyframeinterval")
+            || matches.is_present("deltathreshold")
+            || matches.is_present("densekeyframes"))
+    {
+        return Err(
+            "--keyframe-interval, --delta-threshold and --dense-keyframes apply to --driver refs"
+                .into(),
+        );
+    }
+    let hold = parse_arg(matches, "hold", "--hold", "an integer from 0 to 255", 0u8)?;
     Ok(AnimOptions {
         external_clock: matches.is_present("externalclock"),
         // NEGATED: the flag is `--no-loop`, the field is "do loop". Looping is
@@ -1945,6 +1978,9 @@ fn anim_options(
         // the whole track two minutes early -- see
         // `AnimOptions::source_start_s`.
         source_start_s: start as f64,
+        driver,
+        records,
+        hold,
         ..AnimOptions::default()
     })
 }
@@ -2234,6 +2270,11 @@ fn audio_options(matches: &clap::ArgMatches) -> Result<AudioOptions, String> {
         // Parsed above, before the struct literal, so the enum error can `?`
         // out. Sine by default; reaches tonal bands only.
         tonal_synth,
+        driver: match matches.value_of("driver").map(|s| s.to_lowercase()).as_deref() {
+            None | Some("refs") => Driver::Refs,
+            Some("wires") => Driver::Wires,
+            Some(other) => return Err(format!("unknown driver '{other}' (refs, wires)")),
+        },
         // Not `matches.is_present("externalclock")`: the audio branch has
         // already refused that flag outright, because nothing in
         // `build_speaker_world` reads this field.
@@ -2251,7 +2292,7 @@ fn audio_options(matches: &clap::ArgMatches) -> Result<AudioOptions, String> {
         || !(0.0..=MAX_PITCH_SNAP_CENTS).contains(&opts.pitch_snap_cents)
     {
         return Err(format!(
-            "--pitch-snap must be between 0 (off) and {MAX_PITCH_SNAP_CENTS} cents -- half a \
+            "--pitch-snap must be between 0 (off) and {MAX_PITCH_SNAP_CENTS} cents, which is half a \
              semitone, and no pitch is ever further than that from the nearest one, so a \
              larger value cannot mean anything a listener would hear differently from \
              {MAX_PITCH_SNAP_CENTS}. Got {}",
@@ -2564,7 +2605,7 @@ mod tests {
     fn looping_is_the_default_and_no_loop_is_what_turns_it_off() {
         assert!(
             audio_options(&args(&[])).expect("valid").loop_playback,
-            "no flag must mean looping -- the pre-flag behaviour"
+            "no flag must mean looping (the pre-flag behaviour)"
         );
         assert!(
             !audio_options(&args(&["--no-loop"])).expect("valid").loop_playback,
@@ -2599,7 +2640,7 @@ mod tests {
     fn srgb_to_linear_reaches_the_options_it_is_read_from() {
         assert!(
             !anim_opts(&[]).expect("valid").srgb_to_linear,
-            "absent must mean off -- the pre-flag behaviour of every render"
+            "absent must mean off (the pre-flag behaviour of every render)"
         );
         assert!(
             anim_opts(&["--srgb-to-linear"]).expect("valid").srgb_to_linear,

@@ -691,11 +691,11 @@ fn run() -> Result<(), String> {
     println!(
         "Two quantization methods are compared at every reduced palette size below full \
          24-bit:\n\
-         - uniform: per-channel bit-depth reduction -- each channel rounds to the nearest of \
+         - uniform: per-channel bit-depth reduction: each channel rounds to the nearest of \
          2^bits evenly spaced levels (bits split R/G/B, biased toward red/green as RGB332 \
          does).\n\
          - median-cut: ONE palette built from all {n} sampled frames COMBINED (not a fresh \
-         palette per frame -- a per-frame palette would be free here but is not what a real \
+         palette per frame; a per-frame palette would be free here but is not what a real \
          encoder would necessarily ship across a whole clip); each pixel is then mapped to its \
          nearest palette entry by plain Euclidean RGB distance. No dithering (dithering would \
          improve appearance at the direct expense of the run lengths being measured here).\n\

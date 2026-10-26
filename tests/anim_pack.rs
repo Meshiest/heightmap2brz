@@ -72,7 +72,7 @@ fn slicing_recovers_every_pixel_of_every_frame() {
 }
 
 #[test]
-fn chunks_split_at_the_ten_thousand_char_limit_and_tile_the_screen() {
+fn chunks_split_at_the_char_limit_and_tile_the_screen() {
     let n = PIXELS_PER_CHUNK * 2 + 5;
     let clip = clip_from(vec![vec![[9, 9, 9, 255]; n]], n as u32, 1);
     let chunks = pack(&clip, 128).unwrap();
@@ -84,7 +84,7 @@ fn chunks_split_at_the_ten_thousand_char_limit_and_tile_the_screen() {
     for c in &chunks {
         assert_eq!(c.first_pixel, next);
         next += c.pixel_count;
-        assert!(c.frames[0].chars().count() <= 10_000);
+        assert!(c.frames[0].chars().count() <= heightmap::text::MAX_COMPONENT_CHARS);
     }
     assert_eq!(next, n);
 }

@@ -22,7 +22,7 @@ the chosen pipeline.
 | **Heightmap to bricks** | *(default)* | terrain from one or more heightmap PNG/JPGs plus a colormap |
 | **Image to bricks** | `-i` / `--img` | a flat picture, one brick per pixel |
 | **Image to text** | `--text` | `Component_TextDisplay` glyph bricks |
-| **Audio to speakers** | `--audio-mode bank\|voice` | a cluster of wired, pitched speakers that play a song |
+| **Audio to speakers** | `--audio-mode bank\|voice` | a cluster of pitched speakers that play a song |
 | **Video to display** | `--anim-mode brick\|text` | an animated display screen driven by an in-chip clock |
 | **MIDI to speakers** | `--midi` | an event-based speaker world that plays a `.mid` |
 
@@ -216,7 +216,8 @@ forces it for every colour, quantizing each channel to the nearest of 16
 levels (and merging adjacent runs that land on the same level), trading some
 colour fidelity for up to 3 fewer characters per tag. `--braille` and
 `--blocks` pack 8 or 4 pixels per character for dense monochrome output
-(`--luma-threshold`, `--invert`).
+(`--luma-threshold`, `--invert`). One `TextDisplay` holds up to 32,767
+characters, so most tiles fit in a single component.
 
 ```
 heightmap picture.png -i --text --font orbitron -o picture.brz
@@ -240,6 +241,12 @@ Key knobs: `--synth` (sine/square/triangle/sawtooth), `--bands`/`--subdiv`
 `--inner-radius`, `--max-distance` and `--speakers-in-chip`. Some formats need
 the ffmpeg backend (see *Video decoding* below).
 
+By default (`--driver refs`) one loop sets every speaker's volume (and pitch)
+through component references each frame, so more speakers cost no gates.
+`--driver wires` gives each speaker its own array, gate and wire, as before.
+Speakers placed in the chip, or a track longer than 65,535 frames, are built
+wired.
+
 ```
 heightmap song.mp3 --audio-mode bank --synth sine -o song.brz
 ```
@@ -250,10 +257,35 @@ heightmap song.mp3 --audio-mode bank --synth sine -o song.brz
 animated display driven by an in-chip clock.
 
 - `brick`: one display brick per pixel.
-- `text`: one animated `Component_TextDisplay` per band of image rows - roughly
-  two orders of magnitude fewer gates (a 192x108 clip is 113 gates versus 4613),
-  at the cost of glyph-grid rendering. Text mode reuses the `--text` glyph flags
-  and adds `--colors` (median-cut quantization).
+- `text`: one animated `Component_TextDisplay` per band of image rows, at the
+  cost of glyph-grid rendering. Text mode reuses the `--text` glyph flags and
+  adds `--colors` (median-cut quantization) and `--hold N`: a pixel keeps its
+  colour until the source moves more than N on some channel, which makes a
+  noisy video's save much smaller (a 91-minute film at 64x32: 333 MB, 185 MB
+  at `--hold 8`).
+
+`--driver` picks how frames reach the screen:
+
+- `refs` (default): the display bricks are bare. A fixed player loops over
+  each frame's changed pixels and repaints them through brick references, so a
+  192x108 screen is 61 gates rather than 41,487 and resolution no longer costs
+  gates; the cost moves to loop iterations per frame change. Frames are stored
+  as keyframes plus deltas: `--keyframe-interval` (default 60) sets how often a
+  full frame is stored, and `--delta-threshold` skips colour changes below a
+  per-channel amount (default 0, lossless). `--dense-keyframes` stores a hex
+  keyframe as a colour per pixel without the pixel index, which is lossless
+  and about a third smaller on real video. A dropped tick, a loop wrap or a
+  restart catches up from the nearest keyframe. In text mode, one loop sets
+  every band's text.
+- `wires`: two gates per pixel (or per band) wired to each target, as before.
+  A picture over 65,535 pixels, or a clip over 65,535 frames, is built wired.
+  In the GUI this is the **Loop Gates** toggle turned off.
+
+A loop is few gates but runs its body once per record inside one tick, so the
+cost estimate also gives the gate runs in the tick a frame changes, and warns
+past ~20,000, where frame drops started in game. A keyframe replays every
+pixel: 9 gate runs a pixel in hex, 15 with `--dense-keyframes` and 4 in
+colour-array, against 2 for a wired build.
 
 Timing and size: `--fps`, `--start`, `--duration`, `--width`/`--height`,
 `--fit` (`exact`/`contain`/`cover`), `--filter` (`lanczos`/`nearest`),
@@ -281,6 +313,11 @@ tool can download on demand with `--yes` (or refuse with `--no-download`).
 speaker world: each track's notes are stored as spans and replayed by a runtime
 playhead. `--midi-list` prints the discovered instruments (name, channel, note
 count, polyphony) and the file's format/duration/tempo, then exits.
+
+Each speaker's playhead is a call of one shared function: about 4 gates a
+speaker, and every note that ends inside a tick is passed in that tick.
+`--no-midi-functions` builds the older wired chain of ~16 gates per speaker
+instead.
 
 `--polyphony-cap` bounds the speakers per instrument (a busier instrument steals
 its oldest sounding note); `--playback-rate` bakes a speed multiplier into the

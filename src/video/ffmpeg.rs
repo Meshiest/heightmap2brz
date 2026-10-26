@@ -317,6 +317,9 @@ struct ProbedInfo {
     fps: f32,
     nb_frames: Option<usize>,
     duration: Option<f64>,
+    /// `r_frame_rate`: the fixed rate ffmpeg conforms a variable-rate stream
+    /// to on output, so `duration * r_fps` is about what it emits.
+    r_fps: Option<f32>,
     /// Whether `avg_frame_rate` and `r_frame_rate` disagree -- see
     /// [`frame_rates_disagree`] for the detection method and why it was
     /// chosen. Computed once here, in `probe_metadata`, rather than kept as
@@ -386,22 +389,22 @@ impl FfmpegSource {
         // refuses or allocates off this -- see
         // `FrameSource::frame_count_estimate`'s doc for that line.
         //
-        // **Not for a VFR source**, though, even though its duration is known
-        // too. `out_fps` there is the AVERAGE rate, while `open`'s default
-        // output timing conforms the stream to a fixed rate by DUPLICATING
-        // frames -- so `duration * average` is systematically low, not
-        // approximately right. Measured on the 6fps+24fps concat clip
-        // `tests::sample_vfr_clip` builds: it estimates 27 against 50 frames
-        // actually emitted, 46% short. A bar that fills at 54% of the way
-        // through and then keeps growing is a worse lie than an honest
-        // spinner that says it has no total, so this leaves VFR to the
-        // spinner.
+        // A VFR source is counted at `r_frame_rate`, not its average:
+        // `open`'s default output timing conforms the stream to that fixed
+        // rate by DUPLICATING frames, so `duration * average` is far short.
+        // Measured on the 6fps+24fps concat clip `tests::sample_vfr_clip`
+        // builds: the average gives 27 against 50 frames emitted, 46% short;
+        // `r_frame_rate` gives 48.
         let out_fps = fps.unwrap_or(probed.fps);
+        let count_fps = match fps {
+            None if probed.is_vfr => probed.r_fps,
+            _ => Some(out_fps),
+        };
         let frame_count_estimate = frame_count_hint.or_else(|| {
+            let rate = count_fps.filter(|r| r.is_finite() && *r > 0.0)?;
             probed
                 .duration
-                .filter(|_| !probed.is_vfr && out_fps.is_finite() && out_fps > 0.0)
-                .map(|d| (d * out_fps as f64).round().max(0.0) as usize)
+                .map(|d| (d * rate as f64).round().max(0.0) as usize)
         });
 
         Ok(Self {
@@ -725,10 +728,10 @@ impl Drop for FfmpegFrameStream {
 ///
 /// The reported `fps` is derived from `avg_frame_rate` alone, never
 /// `r_frame_rate` -- the latter is a guessed lowest-common-denominator base
-/// that lies on variable-frame-rate sources. `r_frame_rate` IS read here too,
-/// but only to detect that lie: compared against `avg_frame_rate` by
-/// [`frame_rates_disagree`] to decide [`ProbedInfo::is_vfr`], never folded
-/// into the `fps` value itself.
+/// that lies on variable-frame-rate sources. `r_frame_rate` IS read here too:
+/// compared against `avg_frame_rate` by [`frame_rates_disagree`] to decide
+/// [`ProbedInfo::is_vfr`], and kept as [`ProbedInfo::r_fps`] for the
+/// progress-bar estimate of a VFR source, but never folded into `fps`.
 fn probe_metadata(path: &Path) -> Result<ProbedInfo, String> {
     let ffprobe_bin = ffmpeg_sidecar::ffprobe::ffprobe_path();
     let mut cmd = std::process::Command::new(&ffprobe_bin);
@@ -797,7 +800,9 @@ fn probe_metadata(path: &Path) -> Result<ProbedInfo, String> {
         _ => true,
     };
 
-    Ok(ProbedInfo { width, height, fps, nb_frames, duration, is_vfr })
+    let r_fps = r_frame_rate.as_deref().and_then(parse_frame_rate);
+
+    Ok(ProbedInfo { width, height, fps, nb_frames, duration, r_fps, is_vfr })
 }
 
 /// Whether ffprobe's `avg_frame_rate` and `r_frame_rate` disagree -- the
@@ -960,21 +965,25 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A VFR source gets no estimate, deliberately: its duration is known,
-    /// but `out_fps` is the AVERAGE rate while `open`'s conformance
-    /// duplicates frames up to a fixed one, so `duration * average` is
-    /// systematically short of what actually gets emitted. A bar that fills
-    /// partway and then keeps growing is a worse lie than an honest spinner.
+    /// A VFR source is estimated at `r_frame_rate`, the fixed rate `open`'s
+    /// conformance duplicates frames up to, not at its average rate, which
+    /// comes out 46% short. Within a few frames of what is emitted is enough
+    /// for a progress bar.
     #[test]
-    fn a_variable_frame_rate_clip_gets_no_estimate_rather_than_a_systematically_short_one() {
-        let Some(path) = sample_vfr_clip("vfr_no_estimate") else { return };
+    fn a_variable_frame_rate_clip_is_estimated_at_the_rate_it_is_conformed_to() {
+        let Some(path) = sample_vfr_clip("vfr_estimate") else { return };
         let src = FfmpegSource::probe(&path, None, FitMode::Contain, Filter::Lanczos, None)
             .expect("probe");
         assert_eq!(src.info().frame_count_hint, None, "the VFR hint is None by design");
-        assert_eq!(
-            src.frame_count_estimate(),
-            None,
-            "an average-rate estimate is systematically short of what conformance emits"
+        let estimate = src.frame_count_estimate().expect("an estimate");
+        let mut stream = src.open().expect("open");
+        let mut actual = 0usize;
+        while stream.next().expect("next").is_some() {
+            actual += 1;
+        }
+        assert!(
+            estimate.abs_diff(actual) <= 3,
+            "estimated {estimate}, emitted {actual}"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1025,7 +1034,7 @@ pub(crate) mod tests {
         // doc), so the fix must report `None` here, not a guessed `Some`.
         assert_eq!(
             hint, None,
-            "a genuinely variable-frame-rate source cannot honestly report a Some(_) hint -- \
+            "a genuinely variable-frame-rate source cannot honestly report a Some(_) hint: \
              the post-conformance frame count isn't knowable without decoding"
         );
 
@@ -1054,7 +1063,7 @@ pub(crate) mod tests {
         assert_eq!(
             src.info().frame_count_hint,
             Some(8),
-            "1s at 8fps, genuinely constant -- VFR detection must not false-flag this"
+            "1s at 8fps, genuinely constant; VFR detection must not false-flag this"
         );
         let _ = std::fs::remove_file(&path);
     }

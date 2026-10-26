@@ -10,8 +10,9 @@ use std::sync::atomic::AtomicBool;
 use crate::{
     anim::{
         AnimEncoding, AnimMode,
-        bricks::{AnimOptions, DisplayBrickStyle},
+        bricks::{AnimOptions, Driver, DisplayBrickStyle},
         cost::Cost,
+        ref_player::RecordOptions,
         pack::{BANK_FRAMES, MAX_FRAMES},
         text_layout,
     },
@@ -290,6 +291,12 @@ pub struct VideoApp {
     alpha_threshold: u8,
     pixel_extent: u16,
     brick_style: DisplayBrickStyle,
+    /// Wires or refs ([`AnimOptions::driver`]); the two settings
+    /// below only apply to refs.
+    driver: Driver,
+    keyframe_interval: usize,
+    delta_threshold: u8,
+    dense_keyframes: bool,
     external_clock: bool,
     /// Repeat the clip forever, or stop on its last frame. See
     /// [`AnimOptions::loop_playback`] -- it becomes the clock's `Timer.Limit`
@@ -338,6 +345,8 @@ pub struct VideoApp {
     /// [`AnimOptions::colors`]; `0` means full 24-bit colour. Shown only when
     /// [`Self::shows_colours_control`] is true.
     colors: usize,
+    /// TEXT MODE ONLY. Per-pixel hold, passed through to [`AnimOptions::hold`].
+    hold: u8,
 
     /// The picked subtitle track and its file name, or `None`. Parsed once
     /// at pick time, not per frame -- the cost readout redraws every frame
@@ -404,6 +413,10 @@ impl Default for VideoApp {
             alpha_threshold: d.alpha_threshold,
             pixel_extent: d.pixel_extent,
             brick_style: d.brick_style,
+            driver: d.driver,
+            keyframe_interval: d.records.keyframe_interval,
+            delta_threshold: d.records.delta_threshold,
+            dense_keyframes: d.records.dense_keyframes,
             external_clock: d.external_clock,
             loop_playback: d.loop_playback,
             control_buttons: d.control_buttons,
@@ -420,6 +433,7 @@ impl Default for VideoApp {
             text_short_hex: text_default.short_hex,
             text_line_height: text_default.line_height,
             colors: d.colors,
+            hold: d.hold,
             subtitles: None,
             pending_pick_subtitles: None,
             subtitle_scale: d.subtitle_scale,
@@ -527,11 +541,18 @@ impl VideoApp {
             alpha_threshold: self.alpha_threshold,
             pixel_extent: self.pixel_extent,
             brick_style: self.brick_style,
+            driver: self.driver,
+            records: RecordOptions {
+                keyframe_interval: self.keyframe_interval.max(1),
+                delta_threshold: self.delta_threshold,
+                dense_keyframes: self.dense_keyframes,
+            },
             external_clock: self.external_clock,
             loop_playback: self.loop_playback,
             control_buttons: self.control_buttons,
             glow: self.glow,
             colors: self.colors,
+            hold: self.hold,
             text,
             // An `Arc` clone -- a refcount bump, not a copy of the cues --
             // which is what lets the readout below and the render thread hold
@@ -678,7 +699,7 @@ impl VideoApp {
                                     // as a video with no dialogue, which looks
                                     // exactly like a correct render of a
                                     // silent scene.
-                                    error!("{name} parsed to 0 subtitle cues -- nothing will be shown");
+                                    error!("{name} parsed to 0 subtitle cues, so nothing will be shown");
                                 }
                                 info!("Selected subtitles: {name} ({} cue(s))", track.len());
                                 self.subtitles = Some((name, Arc::new(track)));
@@ -862,7 +883,7 @@ impl VideoApp {
     /// only tunes the picture lives in [`Self::draw_advanced_sections`].
     fn draw_settings(&mut self, ui: &mut Ui, shared: &mut SharedOptions) {
         ui.label(
-            "Convert an animated image or frame sequence into wired, animated display bricks.",
+            "Convert an animated image or frame sequence into animated display bricks.",
         );
 
         widgets::settings_table(ui, |ui, t| {
@@ -873,9 +894,9 @@ impl VideoApp {
                 ui,
                 "Render Mode",
                 Some(
-                    "Bricks: one display brick per pixel -- dense, and the most expensive at \
+                    "Bricks: one display brick per pixel: dense, and the most expensive at \
                      large screen sizes. Text: a stack of animated TextDisplay bricks, ~2 gates \
-                     per BAND of image rows instead of per pixel -- two-plus orders of magnitude \
+                     per BAND of image rows instead of per pixel, making it two-plus orders of magnitude \
                      cheaper on gates at typical sizes. \"Brick Style\"/\"Pixel Extent\"/\"Glow\" \
                      in the sections below only apply to Bricks; the Text Options/Colours \
                      controls there only apply to Text.",
@@ -943,7 +964,7 @@ impl VideoApp {
                 "Playback",
                 Some(
                     "Loop: repeat the clip forever (the default). Off: play through once and \
-                     stop on the last frame -- the timer is given a limit of \
+                     stop on the last frame: the timer is given a limit of \
                      (frames - 0.5) / fps, which expires halfway through the final frame. \
                      Costs nothing either way, and does nothing with an external clock.",
                 ),
@@ -951,6 +972,28 @@ impl VideoApp {
                     ui.add_enabled_ui(!self.external_clock, |ui| {
                         widgets::toggle(ui,&mut self.loop_playback, "Loop");
                     });
+                },
+            );
+
+            // On the main grid, not in Picture: it decides how much work a
+            // tick does, which the cost readout warns about.
+            t.row_hover(
+                ui,
+                "Loop Gates",
+                Some(
+                    "On: a fixed player of about 40 gates runs a loop over each frame's \
+                     changes, so the gate count stays small at any size, but every change \
+                     runs its loop body inside one tick. Servers limit how many times a loop \
+                     may run, so a large picture can stop partway through a frame and leave \
+                     stale pixels; the brick-mode chip then shows a warning naming the frame. \
+                     Off (wires): two gates per pixel, or per text band, wired \
+                     into each brick, with no loop to limit. The cost readout shows the gate \
+                     runs in the tick a frame changes.",
+                ),
+                |ui| {
+                    let mut loops = self.driver == Driver::Refs;
+                    widgets::toggle(ui, &mut loops, "Use loops");
+                    self.driver = if loops { Driver::Refs } else { Driver::Wires };
                 },
             );
         });
@@ -1016,6 +1059,9 @@ impl VideoApp {
                 n => format!("{n} colours"),
             },
         ];
+        if self.hold > 0 {
+            chips.push(format!("hold {}", self.hold));
+        }
         // Only the non-default state earns a chip, as in `picture_chips`, so
         // the row carries no permanent "off" entry per toggle.
         if self.text_short_hex {
@@ -1037,7 +1083,8 @@ impl VideoApp {
                 || self.text_width_scale != d.text.width_scale
                 || self.text_short_hex != d.text.short_hex
                 || self.text_line_height != d.text.line_height
-                || self.colors != d.colors)
+                || self.colors != d.colors
+                || self.hold != d.hold)
     }
 
     fn subtitle_chips(&self) -> Vec<String> {
@@ -1101,6 +1148,9 @@ impl VideoApp {
         let d = AnimOptions::default();
         self.alpha_threshold != d.alpha_threshold
             || self.brick_style != d.brick_style
+            || self.keyframe_interval != d.records.keyframe_interval
+            || self.delta_threshold != d.records.delta_threshold
+            || self.dense_keyframes != d.records.dense_keyframes
             || self.pixel_extent != d.pixel_extent
             || self.external_clock != d.external_clock
             || self.control_buttons != d.control_buttons
@@ -1123,7 +1173,7 @@ impl VideoApp {
             "Font",
             Some(
                 "Text mode only. Reuses the Image2Text pane's font, glyph and geometry \
-                 controls -- see the Image2Text tab for the full calibration set.",
+                 controls; see the Image2Text tab for the full calibration set.",
             ),
             |ui| {
                 if text_mode {
@@ -1176,7 +1226,7 @@ impl VideoApp {
                         .on_hover_text(
                             "Component WidthScale: stretches each glyph and its advance \
                              horizontally, so one character covers a square pixel without \
-                             doubling it up. Pure geometry -- it sends no extra characters, \
+                             doubling it up. Pure geometry: it sends no extra characters, \
                              so the bound below does not move",
                         );
                         widgets::toggle(ui,&mut self.text_short_hex, "3-digit color")
@@ -1218,6 +1268,23 @@ impl VideoApp {
                 }
             },
         );
+        t.row_hover(
+            ui,
+            "Hold",
+            Some(
+                "Text mode only: a pixel keeps the colour it shows until the source moves more \
+                 than this on some channel (0 = off). Shown colours never drift further than \
+                 this, and consecutive frames share long runs the save compresses well: a noisy \
+                 video's save shrinks by a third or more at 4 to 8.",
+            ),
+            |ui| {
+                if self.shows_colours_control() {
+                    widgets::slider(ui, egui::Slider::new(&mut self.hold, 0..=32));
+                } else {
+                    note(ui, "(Text mode only)");
+                }
+            },
+        );
     }
 
     fn draw_subtitle_rows(&mut self, t: &mut widgets::SettingsTable, ui: &mut Ui) {
@@ -1226,12 +1293,12 @@ impl VideoApp {
             "Subtitles",
             Some(
                 "Render an .srt/.ass subtitle file as ONE wired TextDisplay overlaying \
-                 the bottom of the screen -- 2 gates for the whole track, centred and \
+                 the bottom of the screen: 2 gates for the whole track, centred and \
                  outlined, drawn as vector glyphs at their own size rather than on the \
                  screen's pixel grid. The file is read in SOURCE time, so the Start \
                  control is honoured. Works in every render mode; over Bricks the \
                  subtitle lies flat in the screen's plane (the screen is on the ground), \
-                 which is unverified by eye -- Text mode is the one it was designed \
+                 which is unverified by eye; Text mode is the one it was designed \
                  against.",
             ),
             |ui| {
@@ -1249,7 +1316,7 @@ impl VideoApp {
                     match &self.subtitles {
                         Some((name, track)) => {
                             clear = widgets::danger_icon(ui, icons::XMARK).clicked();
-                            ui.label(format!("{name} -- {} cue(s)", track.len()));
+                            ui.label(format!("{name}: {} cue(s)", track.len()));
                         }
                         None => {
                             note(ui, "(none)");
@@ -1289,7 +1356,7 @@ impl VideoApp {
             Some(
                 "World units to lift the subtitle anchor toward the top of the picture \
                  (default 8). Measured by eye against Text mode at 192x108 with Subtitle \
-                 Scale 6 -- Bricks/Color Array lay their screen flat, so the lift there \
+                 Scale 6. Bricks/Color Array lay their screen flat, so the lift there \
                  moves the opposite horizontal axis and is unverified by eye. A lift too \
                  big for the picture's own height is refused rather than silently clamped.",
             ),
@@ -1383,7 +1450,7 @@ impl VideoApp {
         t.row_hover(
             ui,
             "Max Frames",
-            Some("Hard cap on emitted frames -- frames past 65535 spill into extra wire arrays"),
+            Some("Hard cap on emitted frames; frames past 65535 spill into extra wire arrays"),
             |ui| {
                 widgets::slider(ui, egui::Slider::new(&mut self.max_frames, 1..=MAX_FRAMES as u32).logarithmic(true));
             },
@@ -1404,6 +1471,39 @@ impl VideoApp {
                 widgets::slider(ui, egui::Slider::new(&mut self.alpha_threshold, 0..=255));
             },
         );
+
+        if self.driver == Driver::Refs {
+            t.row_hover(
+                ui,
+                "Keyframes",
+                Some(
+                    "A full frame at least this often (1 = every frame). A seek or loop wrap replays from the nearest keyframe, so longer means a smaller save but more work per jump.",
+                ),
+                |ui| {
+                    widgets::slider(ui, egui::Slider::new(&mut self.keyframe_interval, 1..=600).text("frames"));
+                },
+            );
+            t.row_hover(
+                ui,
+                "Delta Threshold",
+                Some(
+                    "Skip pixel changes no larger than this per channel (0 = lossless). The encoder tracks what is on screen, so errors never drift past it.",
+                ),
+                |ui| {
+                    widgets::slider(ui, egui::Slider::new(&mut self.delta_threshold, 0..=64));
+                },
+            );
+            t.row_hover(
+                ui,
+                "Dense Keyframes",
+                Some(
+                    "Store each keyframe as a colour per pixel in order, without the pixel index. Lossless and about a third smaller on real video.",
+                ),
+                |ui| {
+                    widgets::checkbox(ui, &mut self.dense_keyframes, "");
+                },
+            );
+        }
 
         t.row_hover(
             ui,
@@ -1427,7 +1527,7 @@ impl VideoApp {
             Some(
                 "Half-extent of each display pixel, in units (1 = smallest: a 2-unit-wide \
                  brick). Adjacent pixels always tile flush at twice this value, so every \
-                 value here is legal -- no size/style combination can overlap.",
+                 value here is legal: no size/style combination can overlap.",
             ),
             |ui| {
                 widgets::slider(ui, egui::Slider::new(&mut self.pixel_extent, MIN_PIXEL_EXTENT..=50).text("units"));
@@ -1548,7 +1648,7 @@ impl VideoApp {
                         }
                         thumb(ui, preview);
                         ui.label(format!(
-                            "{name} -- {}x{}, {} frame(s), {:.2} fps",
+                            "{name}: {}x{}, {} frame(s), {:.2} fps",
                             clip.width,
                             clip.height,
                             clip.frames.len(),
@@ -1583,7 +1683,7 @@ impl VideoApp {
                     if widgets::danger_icon(ui, icons::XMARK).clicked() {
                         clear_input = true;
                     }
-                    ui.label(format!("{name} -- video source ({})", path.display()));
+                    ui.label(format!("{name}: video source ({})", path.display()));
                 });
             }
             #[cfg(target_arch = "wasm32")]
@@ -1592,7 +1692,7 @@ impl VideoApp {
                     if widgets::danger_icon(ui, icons::XMARK).clicked() {
                         clear_input = true;
                     }
-                    ui.label(format!("{name} -- video source"));
+                    ui.label(format!("{name}: video source"));
                 });
             }
         }
@@ -1609,7 +1709,7 @@ impl VideoApp {
         // as "nothing picked yet" and would be misleading here.
         if matches!(self.input, Input::Video { .. }) {
             ui.label(
-                "Video source selected -- cost is measured once Generate opens the file.",
+                "Video source selected; cost is measured once Generate opens the file.",
             );
             return;
         }
@@ -1632,10 +1732,22 @@ impl VideoApp {
                 if cost.gates > 6000 {
                     ui.colored_label(
                         Color32::from_rgb(255, 140, 60),
-                        format!("{text} (large build -- may be slow to paste in-game)"),
+                        format!("{text} (large build: may be slow to paste in-game)"),
                     );
                 } else {
                     ui.label(text);
+                }
+                match cost.tick_warning() {
+                    Some(w) => {
+                        ui.colored_label(Color32::from_rgb(255, 140, 60), w);
+                    }
+                    None => {
+                        ui.label(format!(
+                            "{} gate runs in the tick a frame changes (budget ~{})",
+                            cost.tick_gates,
+                            crate::anim::cost::TICK_GATE_BUDGET
+                        ));
+                    }
                 }
 
                 // Text mode's `Cost::chars` is 0 BY DESIGN (see
@@ -1908,10 +2020,20 @@ impl VideoApp {
                     // short-circuits every consent variant to `Ok`, so
                     // `Never` here can't newly refuse anything `Ready`
                     // didn't already clear.
+                    // The target size goes to the decoder, as the CLI's
+                    // `preset_size` does, so the ffmpeg backend scales in its
+                    // own filtergraph instead of piping every native-size
+                    // frame for `ResizeStream` to shrink: for a 424x320 source
+                    // at 64x32 that is 6x faster in release, and far more in
+                    // a debug build. `AdaptedSource` below still applies the
+                    // same size (a matching frame passes through untouched),
+                    // so the builtin backend, which ignores the hint, gives
+                    // the same output. fps stays `None` for the CLI's reason:
+                    // it would change which frames are selected.
                     backend::open_video_ensuring(
                         &path,
                         backend,
-                        None,
+                        resize.then_some((width, height)),
                         fit,
                         filter,
                         None,
@@ -2087,7 +2209,7 @@ mod tests {
         assert!(
             brdb_bytes.starts_with(b"SQLite format 3"),
             "a .brdb destination must hold a brdb (SQLite) database, not BRZ bytes under a \
-             .brdb name -- got {:02x?}",
+             .brdb name (got {:02x?})",
             &brdb_bytes[..brdb_bytes.len().min(16)]
         );
 
@@ -2189,6 +2311,9 @@ mod tests {
         // reports back exactly the 300 frames the clip carries, with no
         // resampling to account for.
         app.input = picked_clip(192, 108, 10.0, 300);
+        // Wired: the order of magnitude is a property of the wired drivers;
+        // under refs both modes are a few dozen gates.
+        app.driver = Driver::Wires;
 
         app.mode = AnimMode::Brick(AnimEncoding::Hex);
         let brick = app
@@ -2260,7 +2385,7 @@ mod tests {
         let mut app = VideoApp::default();
         assert!(
             app.anim_opts().subtitles.is_none(),
-            "no picked file means no track at all -- the hard gate every renderer applies"
+            "no picked file means no track at all: the hard gate every renderer applies"
         );
         assert_eq!(
             app.subtitle_scale,
