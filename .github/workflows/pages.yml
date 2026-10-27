@@ -31,6 +31,16 @@ jobs:
         with:
           version: "latest"
 
+      # trunk downloads wasm-bindgen from GitHub releases on every build, and
+      # a 504 there failed a deploy. Keep the download between runs; the key
+      # changes when Cargo.lock (and so the wasm-bindgen version) does.
+      - name: Cache trunk tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trunk
+          key: trunk-tools-${{ hashFiles('Cargo.lock') }}
+          restore-keys: trunk-tools-
+
       - name: Setup Pages
         id: pages
         uses: actions/configure-pages@v5
