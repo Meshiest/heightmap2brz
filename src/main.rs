@@ -1675,6 +1675,12 @@ fn run_heightmap(
         }
         Err(e) => warn!("no save preview embedded: {e}"),
     }
+    // The prefab browser shows `Thumbnail.png` and not the screenshot, thus
+    // the save gets the same picture in that shape too.
+    match save_thumbnail(colormap.image()) {
+        Ok(thumbnail) => data.meta.thumbnail = Some(thumbnail),
+        Err(e) => warn!("no save thumbnail embedded: {e}"),
+    }
     // The game names its own bundles, and the browser tile shows this name.
     // Use the output file name: `-o "Big Island.brz"` gives "Big Island".
     if data.meta.bundle.name.is_empty() {

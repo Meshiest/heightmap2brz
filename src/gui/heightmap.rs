@@ -378,6 +378,13 @@ impl HeightmapApp {
                         Ok(screenshot) => data.meta.screenshot = Some(screenshot),
                         Err(e) => error!("no save preview embedded: {e}"),
                     }
+                    // The prefab browser shows `Thumbnail.png` and not the
+                    // screenshot, thus the save gets the same picture in
+                    // that shape too.
+                    match save_thumbnail(source) {
+                        Ok(thumbnail) => data.meta.thumbnail = Some(thumbnail),
+                        Err(e) => error!("no save thumbnail embedded: {e}"),
+                    }
                 }
                 if !save_name.is_empty() {
                     data.meta.bundle.name = save_name.clone();

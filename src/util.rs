@@ -557,34 +557,69 @@ const SCREENSHOT_QUALITY: u8 = 85;
 /// The function keeps the shape of the map. It does not pad the map into the
 /// 16:9 shape of a game screenshot, because a heightmap is usually square.
 pub fn save_screenshot(source: &image::RgbaImage) -> Result<Vec<u8>, String> {
-    use image::{DynamicImage, codecs::jpeg::JpegEncoder, imageops};
-
-    let (w, h) = (source.width().max(1), source.height().max(1));
-    let scale = (SCREENSHOT_EDGE as f32 / w as f32).min(SCREENSHOT_EDGE as f32 / h as f32);
-    let fitted = if scale >= 1.0 {
-        // Use Nearest to enlarge. A heightmap is pixel art, and a smooth
-        // filter removes the pixel grid.
-        DynamicImage::ImageRgba8(source.clone()).resize_exact(
-            (w as f32 * scale).round().max(1.0) as u32,
-            (h as f32 * scale).round().max(1.0) as u32,
-            imageops::FilterType::Nearest,
-        )
-    } else {
-        DynamicImage::ImageRgba8(source.clone()).resize(
-            SCREENSHOT_EDGE,
-            SCREENSHOT_EDGE,
-            imageops::FilterType::Lanczos3,
-        )
-    };
+    use image::codecs::jpeg::JpegEncoder;
 
     // JPEG has no alpha channel. An RGBA image causes an encode error, thus
     // remove the alpha channel here.
-    let rgb = fitted.to_rgb8();
+    let rgb = fit_preview(source, SCREENSHOT_EDGE).to_rgb8();
     let mut out = std::io::Cursor::new(Vec::new());
     JpegEncoder::new_with_quality(&mut out, SCREENSHOT_QUALITY)
         .encode_image(&rgb)
         .map_err(|e| format!("failed to encode the save preview: {e}"))?;
     Ok(out.into_inner())
+}
+
+/// The edge of the square `Meta/Thumbnail.png` of a save. The game writes
+/// prefab thumbnails of 1024x1024 pixels.
+const THUMBNAIL_EDGE: u32 = 1024;
+
+/// Encode the `Meta/Thumbnail.png` of a generated save.
+///
+/// The prefab browser shows this picture and not `Screenshot.jpg`. A prefab
+/// the game writes has the thumbnail only: a square RGBA PNG of the build on
+/// a transparent background. The source map takes the place of that render,
+/// as it does in `save_screenshot`.
+///
+/// The map keeps its shape. It is centered in the square, and the rest of the
+/// square stays transparent. The transparent pixels of the map stay
+/// transparent too, because the build has no bricks there.
+pub fn save_thumbnail(source: &image::RgbaImage) -> Result<Vec<u8>, String> {
+    use image::{ImageFormat, RgbaImage, imageops};
+
+    let fitted = fit_preview(source, THUMBNAIL_EDGE).to_rgba8();
+    let mut canvas = RgbaImage::new(THUMBNAIL_EDGE, THUMBNAIL_EDGE);
+    imageops::replace(
+        &mut canvas,
+        &fitted,
+        ((THUMBNAIL_EDGE - fitted.width()) / 2) as i64,
+        ((THUMBNAIL_EDGE - fitted.height()) / 2) as i64,
+    );
+
+    let mut out = std::io::Cursor::new(Vec::new());
+    canvas
+        .write_to(&mut out, ImageFormat::Png)
+        .map_err(|e| format!("failed to encode the save thumbnail: {e}"))?;
+    Ok(out.into_inner())
+}
+
+/// Scale `source` so that its longest edge is `edge` pixels, with its shape
+/// kept.
+fn fit_preview(source: &image::RgbaImage, edge: u32) -> image::DynamicImage {
+    use image::{DynamicImage, imageops};
+
+    let (w, h) = (source.width().max(1), source.height().max(1));
+    let scale = (edge as f32 / w as f32).min(edge as f32 / h as f32);
+    if scale >= 1.0 {
+        // Use Nearest to enlarge. A heightmap is pixel art, and a smooth
+        // filter removes the pixel grid.
+        DynamicImage::ImageRgba8(source.clone()).resize_exact(
+            ((w as f32 * scale).round() as u32).clamp(1, edge),
+            ((h as f32 * scale).round() as u32).clamp(1, edge),
+            imageops::FilterType::Nearest,
+        )
+    } else {
+        DynamicImage::ImageRgba8(source.clone()).resize(edge, edge, imageops::FilterType::Lanczos3)
+    }
 }
 
 /// Create a save from an array of bricks.
@@ -789,6 +824,36 @@ mod tests {
         let small = image::RgbaImage::from_pixel(64, 64, image::Rgba([9, 9, 9, 255]));
         let shot = image::load_from_memory(&save_screenshot(&small).expect("encodes")).unwrap();
         assert_eq!((shot.width(), shot.height()), (1280, 1280));
+    }
+
+    /// `Meta/Thumbnail.png` must be a 1024x1024 RGBA PNG, the shape of the
+    /// thumbnail in a prefab the game writes. The map is centered in it with
+    /// its shape kept, on a transparent background.
+    #[test]
+    fn a_save_thumbnail_is_a_square_png_with_the_map_centered() {
+        let source = image::RgbaImage::from_pixel(2048, 1024, image::Rgba([10, 20, 30, 255]));
+        let png = save_thumbnail(&source).expect("encodes");
+        assert_eq!(&png[..4], b"\x89PNG", "Thumbnail.png must be a PNG");
+
+        let thumb = image::load_from_memory(&png).expect("the game must decode it").to_rgba8();
+        assert_eq!((thumb.width(), thumb.height()), (1024, 1024));
+        // The 2:1 map fills rows 256 to 767. The bands above and below it
+        // stay transparent.
+        assert_eq!(thumb.get_pixel(512, 100).0[3], 0);
+        assert_eq!(thumb.get_pixel(512, 255).0[3], 0);
+        assert_eq!(thumb.get_pixel(512, 256).0, [10, 20, 30, 255]);
+        assert_eq!(thumb.get_pixel(0, 767).0, [10, 20, 30, 255]);
+        assert_eq!(thumb.get_pixel(512, 768).0[3], 0);
+
+        // A transparent pixel of the map has no bricks, thus it stays
+        // transparent. A small map is enlarged with its pixel grid kept.
+        let mut sprite = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 0, 0, 255]));
+        sprite.put_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let thumb = image::load_from_memory(&save_thumbnail(&sprite).expect("encodes"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(thumb.get_pixel(511, 511).0, [200, 0, 0, 255]);
+        assert_eq!(thumb.get_pixel(512, 512).0[3], 0);
     }
 
     /// The game shows the bundle description next to the preview. The

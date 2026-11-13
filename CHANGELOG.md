@@ -7,6 +7,13 @@ release body, so **the heading is the release title**: write it as
 version this file does not mention.
 
 
+## 0.21.1 - Prefab Thumbnails
+
+- Image and heightmap saves embed the source image as the prefab thumbnail,
+  so they show a picture in the game's prefab list.
+- Fixed: on a system or browser set to a light theme, the app drew light
+  gray buttons and cards with unreadable text.
+
 ## 0.21.0 - Loops and Brick Refs
 
 Saves now use the current game's format (brdb 1.0), so they load only on the

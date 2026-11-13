@@ -139,11 +139,18 @@ const GLACIAL_BOLD: &[u8] = include_bytes!("../../../assets/fonts/GlacialIndiffe
 pub fn install(ctx: &Context) {
     ctx.set_fonts(fonts());
 
+    // The theme is dark-only. egui keeps one style per theme and follows the
+    // system theme by default, and `set_style` only fills the active slot, so
+    // a light OS/browser theme would swap in egui's stock light style on the
+    // first frame. Pin dark and fill both slots.
+    ctx.set_theme(egui::Theme::Dark);
     let mut style: Style = (*ctx.style()).clone();
     style.visuals = visuals();
     apply_text_styles(&mut style);
     apply_spacing(&mut style);
-    ctx.set_style(style);
+    let style = Arc::new(style);
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
 }
 
 /// Build the font set: Glacial Indifference as the proportional face, Font
@@ -317,5 +324,24 @@ mod tests {
             !out.textures_delta.set.is_empty(),
             "expected a font texture to be rasterized"
         );
+    }
+
+    /// The theme is dark-only: a light OS/browser theme (reported by the
+    /// backend from the first frame on, after `install` has run) must not swap
+    /// in egui's stock light style.
+    #[test]
+    fn light_system_theme_keeps_the_theme() {
+        let ctx = Context::default();
+        install(&ctx);
+        let input = egui::RawInput {
+            system_theme: Some(egui::Theme::Light),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            let v = &ctx.style().visuals;
+            assert!(v.dark_mode);
+            assert_eq!(v.panel_fill, SURFACE_PAGE);
+            assert_eq!(v.widgets.inactive.bg_fill, ELEMENT);
+        });
     }
 }
